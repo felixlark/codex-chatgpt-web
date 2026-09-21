@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  COOLDOWN_MS,
   ADMISSION_FLOOR,
   ADMISSION_SEED,
   ChatGptAdmission,
@@ -90,18 +91,58 @@ describe("ChatGPT account admission", () => {
     expect(order).toEqual(["b1", "q1", "b2"]);
   });
 
-  test("a throttle cools the account down, tightens the budget, and doubles on a repeat", async () => {
+  test("a throttle cools down briefly and tightens the budget; the retry waits, it does not fail", async () => {
     const { admission, advance } = harness();
     admission.noteThrottle();
     const cut = admission.snapshot();
     expect(cut.budget.req10).toBe(Math.max(ADMISSION_FLOOR.req10, Math.floor(ADMISSION_SEED.req10 * 0.7)));
+    expect(cut.cooldownUntil).toBe(1_000_000 + COOLDOWN_MS);
     const waiting = admission.acquire("a", "retry");
-    expect(await admittedKeys([waiting])).toEqual([false]);           // the retry waits, it does not fail
-    advance(20 * 60_000 + 100);
+    expect(await admittedKeys([waiting])).toEqual([false]);
+    advance(COOLDOWN_MS + 100);
     expect(await admittedKeys([waiting])).toEqual([true]);
-    (await waiting)();
-    admission.noteThrottle();                                          // within two hours
-    expect(admission.snapshot().cooldownUntil).toBeGreaterThanOrEqual(1_000_000 + 20 * 60_000 + 40 * 60_000);
+  });
+
+  test("after the cooldown exactly one probe runs; its success reopens the gate", async () => {
+    const { admission, advance, logs } = harness();
+    admission.noteThrottle();
+    const turns = [admission.acquire("a", "probe"), admission.acquire("b", "b1"), admission.acquire("c", "c1")];
+    advance(COOLDOWN_MS + 100);
+    expect(await admittedKeys(turns)).toEqual([true, false, false]);   // half-open: one probe only
+    (await turns[0]!)();                                                // probe succeeded
+    expect(await admittedKeys(turns)).toEqual([true, true, true]);
+    expect(logs.some(line => line.includes("probe probe succeeded"))).toBe(true);
+    admission.noteThrottle();                                           // a later, separate throttle
+    expect(admission.snapshot().cooldownUntil).toBe(1_000_000 + COOLDOWN_MS + 100 + COOLDOWN_MS);
+  });
+
+  test("a throttled probe doubles the cooldown; a non-throttle failure lets the next waiter probe", async () => {
+    const { admission, advance } = harness();
+    admission.noteThrottle();
+    const first = admission.acquire("a", "p1");
+    const second = admission.acquire("b", "p2");
+    advance(COOLDOWN_MS + 100);
+    const releaseFirst = await first;
+    admission.noteThrottle();                                           // the probe hit the wall again
+    releaseFirst("ChatGPT rate limit: too many requests");
+    const doubled = admission.snapshot().cooldownUntil - (1_000_000 + COOLDOWN_MS + 100);
+    expect(doubled).toBe(2 * COOLDOWN_MS);
+    expect(await admittedKeys([second])).toEqual([false]);
+    advance(2 * COOLDOWN_MS + 100);
+    const releaseSecond = await second;                                 // the next probe
+    const third = admission.acquire("c", "p3");
+    releaseSecond("ChatGPT stopped responding");                        // not a throttle: proves nothing
+    expect(await admittedKeys([third])).toEqual([true]);                // becomes the next probe
+  });
+
+  test("a turn already running when the throttle hit is not a probe", async () => {
+    const { admission, advance } = harness();
+    const inFlight = await admission.acquire("a", "old");
+    admission.noteThrottle();
+    advance(COOLDOWN_MS + 100);
+    inFlight();                                                         // succeeds, but proves nothing
+    const next = [admission.acquire("b", "p"), admission.acquire("c", "q")];
+    expect(await admittedKeys(next)).toEqual([true, false]);            // still half-open: one probe
   });
 
   test("the budget never drops below its floor", () => {

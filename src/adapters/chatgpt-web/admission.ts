@@ -15,6 +15,12 @@ import { atomicWriteFile } from "../../config";
  * heartbeating while it waits, so Codex sees a slow turn, never an error. A throttle observed by the
  * browser starts a cooldown and tightens the budget; retries of the throttled turn then wait out
  * the cooldown here instead of spending Codex's retry budget against a closed door.
+ *
+ * ChatGPT's throttle is short ("try again in a few minutes"; on Mars turns already in flight kept
+ * completing 2-4 minutes after one), so the cooldown is short too and ends half-open: exactly one
+ * probe turn runs, everyone else keeps waiting. The probe succeeding reopens the gate and resets the
+ * cooldown; the probe being throttled doubles it. Only a turn admitted after the cooldown counts as
+ * a probe, never one that was already running when the throttle hit.
  */
 
 export interface AdmissionBudget {
@@ -29,9 +35,8 @@ export const ADMISSION_FLOOR: AdmissionBudget = { req10: 6, req30: 15 };
 export const ADMISSION_CEILING: AdmissionBudget = { req10: 24, req30: 60 };
 const TEN_MINUTES = 10 * 60_000;
 const THIRTY_MINUTES = 30 * 60_000;
-const COOLDOWN_MS = 20 * 60_000;
-const COOLDOWN_CAP_MS = 2 * 60 * 60_000;
-const REPEAT_THROTTLE_MS = 2 * 60 * 60_000;
+export const COOLDOWN_MS = 3 * 60_000;
+const COOLDOWN_CAP_MS = 60 * 60_000;
 const LOOSEN_AFTER_MS = 30 * 60_000;
 const RECENT_MS = 24 * 60 * 60_000;
 const RECENT_CAP = 500;
@@ -59,6 +64,8 @@ interface AdmissionState {
   budget: AdmissionBudget;
   cooldownUntil: number;
   cooldownMs: number;
+  /** Set by a throttle, cleared by the first successful turn admitted after the cooldown. */
+  halfOpen: boolean;
   lastThrottleAt: number;
   lastAdjustAt: number;
   admitted: number[];
@@ -88,6 +95,8 @@ export interface AdmissionOptions {
 export class ChatGptAdmission {
   private state: AdmissionState;
   private running = 0;
+  /** The single half-open probe is running; nothing else is admitted until it ends. */
+  private probeInFlight = false;
   /** Waiters per task, served round-robin so one busy task cannot starve the others. */
   private readonly queues = new Map<string, Waiter[]>();
   private readonly order: string[] = [];
@@ -141,8 +150,10 @@ export class ChatGptAdmission {
   /** The browser saw ChatGPT refuse a prompt for rate: cool down and tighten. */
   noteThrottle(): void {
     const now = this.now();
-    const repeat = this.state.lastThrottleAt > 0 && now - this.state.lastThrottleAt < REPEAT_THROTTLE_MS;
+    // A throttle before the gate reopened (probe or cooldown) means the account is still closed.
+    const repeat = this.state.halfOpen;
     this.state.cooldownMs = repeat ? Math.min(COOLDOWN_CAP_MS, this.state.cooldownMs * 2) : COOLDOWN_MS;
+    this.state.halfOpen = true;
     this.state.cooldownUntil = now + this.state.cooldownMs;
     this.state.lastThrottleAt = now;
     this.state.lastAdjustAt = now;
@@ -176,6 +187,8 @@ export class ChatGptAdmission {
     while (this.canAdmit(now)) {
       const waiter = this.next();
       if (!waiter) break;
+      const probe = this.state.halfOpen;
+      if (probe) this.probeInFlight = true;
       this.running += 1;
       this.state.admitted.push(now);
       const record: AdmissionTurnRecord = {
@@ -197,6 +210,16 @@ export class ChatGptAdmission {
         this.running -= 1;
         record.endedAt = this.now();
         if (error) record.error = error.slice(0, 200);
+        if (probe) {
+          this.probeInFlight = false;
+          // A throttled probe already went through noteThrottle; any other failure proves nothing
+          // about the account, so the next waiter becomes the probe.
+          if (!error && this.state.halfOpen) {
+            this.state.halfOpen = false;
+            this.state.cooldownMs = COOLDOWN_MS;
+            this.log(`[chatgpt-web] admission probe ${waiter.traceId} succeeded: gate reopened`);
+          }
+        }
         this.write();
         this.pump();
       });
@@ -213,6 +236,7 @@ export class ChatGptAdmission {
 
   private canAdmit(now: number): boolean {
     if (this.running >= this.options.maxConcurrent || now < this.state.cooldownUntil) return false;
+    if (this.state.halfOpen && this.probeInFlight) return false;
     const recent10 = this.state.admitted.filter(at => at > now - TEN_MINUTES).length;
     return recent10 < this.state.budget.req10 && this.state.admitted.length < this.state.budget.req30;
   }
@@ -251,6 +275,7 @@ export class ChatGptAdmission {
     if (this.timer) this.clearTimer(this.timer);
     this.timer = undefined;
     if (!this.queues.size || this.running >= this.options.maxConcurrent) return;
+    if (this.state.halfOpen && this.probeInFlight) return;   // the probe's release pumps
     const now = this.now();
     const candidates: number[] = [];
     if (now < this.state.cooldownUntil) candidates.push(this.state.cooldownUntil);
@@ -288,7 +313,7 @@ export class ChatGptAdmission {
 
   private read(): AdmissionState {
     const fresh: AdmissionState = {
-      version: 1, budget: { ...ADMISSION_SEED }, cooldownUntil: 0, cooldownMs: COOLDOWN_MS,
+      version: 1, budget: { ...ADMISSION_SEED }, cooldownUntil: 0, cooldownMs: COOLDOWN_MS, halfOpen: false,
       lastThrottleAt: 0, lastAdjustAt: this.now(), admitted: [], recent: [],
     };
     const path = this.options.statePath;
@@ -302,7 +327,9 @@ export class ChatGptAdmission {
         version: 1,
         budget: { req10: clamp(parsed.budget.req10, "req10"), req30: clamp(parsed.budget.req30, "req30") },
         cooldownUntil: typeof parsed.cooldownUntil === "number" ? parsed.cooldownUntil : 0,
-        cooldownMs: typeof parsed.cooldownMs === "number" ? parsed.cooldownMs : COOLDOWN_MS,
+        cooldownMs: typeof parsed.cooldownMs === "number"
+          ? Math.min(COOLDOWN_CAP_MS, Math.max(COOLDOWN_MS, parsed.cooldownMs)) : COOLDOWN_MS,
+        halfOpen: parsed.halfOpen === true,
         lastThrottleAt: typeof parsed.lastThrottleAt === "number" ? parsed.lastThrottleAt : 0,
         lastAdjustAt: typeof parsed.lastAdjustAt === "number" ? parsed.lastAdjustAt : this.now(),
         admitted: Array.isArray(parsed.admitted)
