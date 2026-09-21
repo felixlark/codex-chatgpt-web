@@ -193,6 +193,13 @@ export function setSharedAdmissionForTests(admission: ChatGptAdmission | undefin
 
 /** Throttles a single turn may wait out in the gate before the error goes back to Codex. */
 const MAX_THROTTLE_REQUEUES = 12;
+/** Signed-out or missing ChatGPT surfaces a turn may retry before the error goes back to Codex. */
+const MAX_SURFACE_RETRIES = 2;
+
+function isChatGptSurfaceUnavailableError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /login is expired or the Temporary Chat surface is unavailable/i.test(message);
+}
 
 /**
  * One admission gate per bridge process: the account, not a client instance, is what throttles.
@@ -271,6 +278,7 @@ export class LauncherBrowserHelperClient {
     // gate and waits out the cooldown there. Codex keeps receiving heartbeats and only sees a slow
     // turn; surfacing the error instead spends Codex's few retries in seconds and leaves goals
     // blocked for the rest of the throttle.
+    let surfaceRetries = 0;
     for (let requeues = 0; ; requeues += 1) {
       const release = await admission.acquire(turn.conversationKey ?? turn.traceId, turn.traceId, turn.abortSignal, {
         ...(turn.threadId ? { threadId: turn.threadId } : {}),
@@ -282,16 +290,22 @@ export class LauncherBrowserHelperClient {
         return await this.runAdmitted(observed, host => admission.noteHost(turn.traceId, host));
       } catch (error) {
         failure = error;
+        const unsent = !submitted && !turn.abortSignal?.aborted;
         if (isChatGptRateLimitError(error)) {
           admission.noteThrottle();
-          requeue = !submitted && !turn.abortSignal?.aborted && requeues < MAX_THROTTLE_REQUEUES;
+          requeue = unsent && requeues < MAX_THROTTLE_REQUEUES;
+        } else if (isChatGptSurfaceUnavailableError(error)) {
+          // A freshly (re)started host sometimes renders its first ChatGPT load signed out and is
+          // fine on the next one; the turn never reached ChatGPT, so run it again (no cooldown).
+          surfaceRetries += 1;
+          requeue = unsent && surfaceRetries <= MAX_SURFACE_RETRIES;
         }
         if (!requeue) throw error;
       } finally {
         release(failure === undefined ? undefined : failure instanceof Error ? failure.message : String(failure));
       }
-      console.info(`[chatgpt-web] admission turn ${turn.traceId} throttled before ChatGPT accepted it: `
-        + `back in the queue (${requeues + 1}/${MAX_THROTTLE_REQUEUES})`);
+      console.info(`[chatgpt-web] admission turn ${turn.traceId} failed before ChatGPT accepted it `
+        + `(${failure instanceof Error ? failure.message.slice(0, 80) : "error"}): back in the queue`);
     }
   }
 
