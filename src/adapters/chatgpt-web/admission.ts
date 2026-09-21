@@ -20,7 +20,9 @@ import { atomicWriteFile } from "../../config";
  * completing 2-4 minutes after one), so the cooldown is short too and ends half-open: exactly one
  * probe turn runs, everyone else keeps waiting. The probe succeeding reopens the gate and resets the
  * cooldown; the probe being throttled doubles it. Only a turn admitted after the cooldown counts as
- * a probe, never one that was already running when the throttle hit.
+ * a probe, never one that was already running when the throttle hit. ChatGPT accepting the probe's
+ * prompt is already the proof, so the gate reopens then rather than after the (possibly long,
+ * tool-heavy) turn finishes.
  */
 
 export interface AdmissionBudget {
@@ -97,6 +99,7 @@ export class ChatGptAdmission {
   private running = 0;
   /** The single half-open probe is running; nothing else is admitted until it ends. */
   private probeInFlight = false;
+  private probeTraceId?: string;
   /** Waiters per task, served round-robin so one busy task cannot starve the others. */
   private readonly queues = new Map<string, Waiter[]>();
   private readonly order: string[] = [];
@@ -137,6 +140,21 @@ export class ChatGptAdmission {
       this.write();
       this.pump();
     });
+  }
+
+  /** ChatGPT accepted a turn's prompt. For the half-open probe that is proof enough to reopen. */
+  noteAccepted(traceId: string): void {
+    if (traceId !== this.probeTraceId) return;
+    this.reopen(traceId, "accepted");
+    this.write();
+    this.pump();
+  }
+
+  private reopen(traceId: string, how: string): void {
+    if (!this.state.halfOpen) return;
+    this.state.halfOpen = false;
+    this.state.cooldownMs = COOLDOWN_MS;
+    this.log(`[chatgpt-web] admission probe ${traceId} ${how}: gate reopened`);
   }
 
   /** Record which pool host an admitted turn landed on. */
@@ -188,7 +206,10 @@ export class ChatGptAdmission {
       const waiter = this.next();
       if (!waiter) break;
       const probe = this.state.halfOpen;
-      if (probe) this.probeInFlight = true;
+      if (probe) {
+        this.probeInFlight = true;
+        this.probeTraceId = waiter.traceId;
+      }
       this.running += 1;
       this.state.admitted.push(now);
       const record: AdmissionTurnRecord = {
@@ -212,13 +233,10 @@ export class ChatGptAdmission {
         if (error) record.error = error.slice(0, 200);
         if (probe) {
           this.probeInFlight = false;
+          this.probeTraceId = undefined;
           // A throttled probe already went through noteThrottle; any other failure proves nothing
           // about the account, so the next waiter becomes the probe.
-          if (!error && this.state.halfOpen) {
-            this.state.halfOpen = false;
-            this.state.cooldownMs = COOLDOWN_MS;
-            this.log(`[chatgpt-web] admission probe ${waiter.traceId} succeeded: gate reopened`);
-          }
+          if (!error) this.reopen(waiter.traceId, "succeeded");
         }
         this.write();
         this.pump();

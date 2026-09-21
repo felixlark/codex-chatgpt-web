@@ -135,6 +135,18 @@ describe("ChatGPT account admission", () => {
     expect(await admittedKeys([third])).toEqual([true]);                // becomes the next probe
   });
 
+  test("the probe's prompt being accepted reopens the gate before the probe turn ends", async () => {
+    const { admission, advance } = harness();
+    admission.noteThrottle();
+    const turns = [admission.acquire("a", "probe"), admission.acquire("b", "b1")];
+    advance(COOLDOWN_MS + 100);
+    expect(await admittedKeys(turns)).toEqual([true, false]);
+    admission.noteAccepted("b1");                                       // not the probe: ignored
+    expect(await admittedKeys(turns)).toEqual([true, false]);
+    admission.noteAccepted("probe");                                    // still running, but accepted
+    expect(await admittedKeys(turns)).toEqual([true, true]);
+  });
+
   test("a turn already running when the throttle hit is not a probe", async () => {
     const { admission, advance } = harness();
     const inFlight = await admission.acquire("a", "old");

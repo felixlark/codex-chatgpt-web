@@ -255,8 +255,15 @@ export class LauncherBrowserHelperClient {
       model: turn.modelId,
     });
     let failure: unknown;
+    const observed: BrowserTurn = {
+      ...turn,
+      onSubmitted: () => {
+        admission.noteAccepted(turn.traceId);
+        turn.onSubmitted?.();
+      },
+    };
     try {
-      return await this.runAdmitted(turn, host => admission.noteHost(turn.traceId, host));
+      return await this.runAdmitted(observed, host => admission.noteHost(turn.traceId, host));
     } catch (error) {
       failure = error;
       if (isChatGptRateLimitError(error)) admission.noteThrottle();
