@@ -137,6 +137,17 @@ describe("ChatGPT account admission", () => {
     expect(await admittedKeys([turns[2]!])).toEqual([true]);
   });
 
+  test("turns refused together are one throttle episode, not one per turn", async () => {
+    const { admission } = harness();
+    admission.noteThrottle();
+    const first = admission.snapshot();
+    admission.noteThrottle();
+    admission.noteThrottle();
+    const after = admission.snapshot();
+    expect(after.cooldownUntil).toBe(first.cooldownUntil);   // no doubling
+    expect(after.budget).toEqual(first.budget);               // no second cut
+  });
+
   test("a probe that fails for another reason hands the probe to the next waiter", async () => {
     const { admission, advance } = harness();
     admission.noteThrottle();
@@ -168,8 +179,11 @@ describe("ChatGPT account admission", () => {
   });
 
   test("the budget never drops below its floor", () => {
-    const { admission } = harness();
-    for (let index = 0; index < 20; index += 1) admission.noteThrottle();
+    const { admission, advance } = harness();
+    for (let index = 0; index < 20; index += 1) {
+      admission.noteThrottle();
+      advance(61 * 60_000);                            // past even the capped cooldown
+    }
     expect(admission.snapshot().budget).toEqual(ADMISSION_FLOOR);
   });
 

@@ -169,6 +169,12 @@ export class ChatGptAdmission {
   /** The browser saw ChatGPT refuse a prompt for rate: cool down and tighten. */
   noteThrottle(): void {
     const now = this.now();
+    if (now < this.state.cooldownUntil) {
+      // Turns sent together are refused together: one episode, not one per turn. Only a throttle
+      // after the cooldown (i.e. during the probes) says the account is still closed.
+      this.log("[chatgpt-web] admission throttled again during the cooldown: same episode");
+      return;
+    }
     // A throttle before the gate opened fully (cooldown or probes) means the account is still closed.
     const repeat = this.state.probesNeeded > 0;
     this.state.cooldownMs = repeat ? Math.min(COOLDOWN_CAP_MS, this.state.cooldownMs * 2) : COOLDOWN_MS;
