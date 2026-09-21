@@ -16,13 +16,14 @@ import { atomicWriteFile } from "../../config";
  * browser starts a cooldown and tightens the budget; retries of the throttled turn then wait out
  * the cooldown here instead of spending Codex's retry budget against a closed door.
  *
- * ChatGPT's throttle is short ("try again in a few minutes"; on Mars turns already in flight kept
- * completing 2-4 minutes after one), so the cooldown is short too and ends half-open: exactly one
- * probe turn runs, everyone else keeps waiting. The probe succeeding reopens the gate and resets the
- * cooldown; the probe being throttled doubles it. Only a turn admitted after the cooldown counts as
- * a probe, never one that was already running when the throttle hit. ChatGPT accepting the probe's
- * prompt is already the proof, so the gate reopens then rather than after the (possibly long,
- * tool-heavy) turn finishes.
+ * After a throttle the gate cools down briefly and then reopens by slow start: turns go one at a
+ * time, each admitted only once ChatGPT has accepted the previous one's prompt, and the gate opens
+ * fully after PROBES_TO_REOPEN acceptances in a row. ChatGPT's own message is "try again in a few
+ * minutes", but on Mars (2026-09-22) the first prompt after a cooldown got through while the two
+ * sent right behind it were refused, so one acceptance is not enough. Any throttle during the
+ * probes doubles the cooldown (cap 60 minutes) and restarts the count. Acceptance, not completion,
+ * is the evidence: a probe turn can then run for minutes of tool calls without holding the queue.
+ * Only turns admitted after the latest throttle count; one already running when it hit never does.
  */
 
 export interface AdmissionBudget {
@@ -38,6 +39,7 @@ export const ADMISSION_CEILING: AdmissionBudget = { req10: 24, req30: 60 };
 const TEN_MINUTES = 10 * 60_000;
 const THIRTY_MINUTES = 30 * 60_000;
 export const COOLDOWN_MS = 3 * 60_000;
+export const PROBES_TO_REOPEN = 3;
 const COOLDOWN_CAP_MS = 60 * 60_000;
 const LOOSEN_AFTER_MS = 30 * 60_000;
 const RECENT_MS = 24 * 60 * 60_000;
@@ -66,8 +68,8 @@ interface AdmissionState {
   budget: AdmissionBudget;
   cooldownUntil: number;
   cooldownMs: number;
-  /** Set by a throttle, cleared by the first successful turn admitted after the cooldown. */
-  halfOpen: boolean;
+  /** Accepted prompts still needed, one at a time, before the gate opens fully; 0 = open. */
+  probesNeeded: number;
   lastThrottleAt: number;
   lastAdjustAt: number;
   admitted: number[];
@@ -97,8 +99,7 @@ export interface AdmissionOptions {
 export class ChatGptAdmission {
   private state: AdmissionState;
   private running = 0;
-  /** The single half-open probe is running; nothing else is admitted until it ends. */
-  private probeInFlight = false;
+  /** The current probe, admitted but not yet accepted by ChatGPT; nothing else is admitted meanwhile. */
   private probeTraceId?: string;
   /** Waiters per task, served round-robin so one busy task cannot starve the others. */
   private readonly queues = new Map<string, Waiter[]>();
@@ -142,19 +143,19 @@ export class ChatGptAdmission {
     });
   }
 
-  /** ChatGPT accepted a turn's prompt. For the half-open probe that is proof enough to reopen. */
+  /** ChatGPT accepted a turn's prompt: during slow start that is the probe's evidence. */
   noteAccepted(traceId: string): void {
     if (traceId !== this.probeTraceId) return;
-    this.reopen(traceId, "accepted");
+    this.probeTraceId = undefined;
+    this.state.probesNeeded = Math.max(0, this.state.probesNeeded - 1);
+    if (this.state.probesNeeded === 0) {
+      this.state.cooldownMs = COOLDOWN_MS;
+      this.log(`[chatgpt-web] admission probe ${traceId} accepted: gate open`);
+    } else {
+      this.log(`[chatgpt-web] admission probe ${traceId} accepted: ${this.state.probesNeeded} more before the gate opens`);
+    }
     this.write();
     this.pump();
-  }
-
-  private reopen(traceId: string, how: string): void {
-    if (!this.state.halfOpen) return;
-    this.state.halfOpen = false;
-    this.state.cooldownMs = COOLDOWN_MS;
-    this.log(`[chatgpt-web] admission probe ${traceId} ${how}: gate reopened`);
   }
 
   /** Record which pool host an admitted turn landed on. */
@@ -168,10 +169,11 @@ export class ChatGptAdmission {
   /** The browser saw ChatGPT refuse a prompt for rate: cool down and tighten. */
   noteThrottle(): void {
     const now = this.now();
-    // A throttle before the gate reopened (probe or cooldown) means the account is still closed.
-    const repeat = this.state.halfOpen;
+    // A throttle before the gate opened fully (cooldown or probes) means the account is still closed.
+    const repeat = this.state.probesNeeded > 0;
     this.state.cooldownMs = repeat ? Math.min(COOLDOWN_CAP_MS, this.state.cooldownMs * 2) : COOLDOWN_MS;
-    this.state.halfOpen = true;
+    this.state.probesNeeded = PROBES_TO_REOPEN;
+    this.probeTraceId = undefined;   // whatever was probing is now stale
     this.state.cooldownUntil = now + this.state.cooldownMs;
     this.state.lastThrottleAt = now;
     this.state.lastAdjustAt = now;
@@ -205,11 +207,7 @@ export class ChatGptAdmission {
     while (this.canAdmit(now)) {
       const waiter = this.next();
       if (!waiter) break;
-      const probe = this.state.halfOpen;
-      if (probe) {
-        this.probeInFlight = true;
-        this.probeTraceId = waiter.traceId;
-      }
+      if (this.state.probesNeeded > 0) this.probeTraceId = waiter.traceId;
       this.running += 1;
       this.state.admitted.push(now);
       const record: AdmissionTurnRecord = {
@@ -231,12 +229,11 @@ export class ChatGptAdmission {
         this.running -= 1;
         record.endedAt = this.now();
         if (error) record.error = error.slice(0, 200);
-        if (probe) {
-          this.probeInFlight = false;
-          this.probeTraceId = undefined;
-          // A throttled probe already went through noteThrottle; any other failure proves nothing
-          // about the account, so the next waiter becomes the probe.
-          if (!error) this.reopen(waiter.traceId, "succeeded");
+        if (this.probeTraceId === waiter.traceId) {
+          // Ended without an acceptance event. Success still proves the prompt got through; any
+          // other failure proves nothing, so the next waiter becomes the probe.
+          if (error) this.probeTraceId = undefined;
+          else this.noteAccepted(waiter.traceId);
         }
         this.write();
         this.pump();
@@ -254,7 +251,7 @@ export class ChatGptAdmission {
 
   private canAdmit(now: number): boolean {
     if (this.running >= this.options.maxConcurrent || now < this.state.cooldownUntil) return false;
-    if (this.state.halfOpen && this.probeInFlight) return false;
+    if (this.state.probesNeeded > 0 && this.probeTraceId !== undefined) return false;
     const recent10 = this.state.admitted.filter(at => at > now - TEN_MINUTES).length;
     return recent10 < this.state.budget.req10 && this.state.admitted.length < this.state.budget.req30;
   }
@@ -293,7 +290,7 @@ export class ChatGptAdmission {
     if (this.timer) this.clearTimer(this.timer);
     this.timer = undefined;
     if (!this.queues.size || this.running >= this.options.maxConcurrent) return;
-    if (this.state.halfOpen && this.probeInFlight) return;   // the probe's release pumps
+    if (this.state.probesNeeded > 0 && this.probeTraceId !== undefined) return;   // acceptance or release pumps
     const now = this.now();
     const candidates: number[] = [];
     if (now < this.state.cooldownUntil) candidates.push(this.state.cooldownUntil);
@@ -331,7 +328,7 @@ export class ChatGptAdmission {
 
   private read(): AdmissionState {
     const fresh: AdmissionState = {
-      version: 1, budget: { ...ADMISSION_SEED }, cooldownUntil: 0, cooldownMs: COOLDOWN_MS, halfOpen: false,
+      version: 1, budget: { ...ADMISSION_SEED }, cooldownUntil: 0, cooldownMs: COOLDOWN_MS, probesNeeded: 0,
       lastThrottleAt: 0, lastAdjustAt: this.now(), admitted: [], recent: [],
     };
     const path = this.options.statePath;
@@ -347,7 +344,9 @@ export class ChatGptAdmission {
         cooldownUntil: typeof parsed.cooldownUntil === "number" ? parsed.cooldownUntil : 0,
         cooldownMs: typeof parsed.cooldownMs === "number"
           ? Math.min(COOLDOWN_CAP_MS, Math.max(COOLDOWN_MS, parsed.cooldownMs)) : COOLDOWN_MS,
-        halfOpen: parsed.halfOpen === true,
+        probesNeeded: typeof parsed.probesNeeded === "number"
+          ? Math.min(PROBES_TO_REOPEN, Math.max(0, Math.floor(parsed.probesNeeded)))
+          : (parsed as { halfOpen?: unknown }).halfOpen === true ? PROBES_TO_REOPEN : 0,
         lastThrottleAt: typeof parsed.lastThrottleAt === "number" ? parsed.lastThrottleAt : 0,
         lastAdjustAt: typeof parsed.lastAdjustAt === "number" ? parsed.lastAdjustAt : this.now(),
         admitted: Array.isArray(parsed.admitted)

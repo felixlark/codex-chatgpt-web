@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   COOLDOWN_MS,
+  PROBES_TO_REOPEN,
   ADMISSION_FLOOR,
   ADMISSION_SEED,
   ChatGptAdmission,
@@ -103,47 +104,55 @@ describe("ChatGPT account admission", () => {
     expect(await admittedKeys([waiting])).toEqual([true]);
   });
 
-  test("after the cooldown exactly one probe runs; its success reopens the gate", async () => {
-    const { admission, advance, logs } = harness();
+  test("after the cooldown turns go one at a time until three prompts in a row are accepted", async () => {
+    const { admission, advance, logs } = harness({ maxConcurrent: 5 });
     admission.noteThrottle();
-    const turns = [admission.acquire("a", "probe"), admission.acquire("b", "b1"), admission.acquire("c", "c1")];
+    const turns = ["p1", "p2", "p3", "x1", "x2"].map(id => admission.acquire(id, id));
     advance(COOLDOWN_MS + 100);
-    expect(await admittedKeys(turns)).toEqual([true, false, false]);   // half-open: one probe only
-    (await turns[0]!)();                                                // probe succeeded
-    expect(await admittedKeys(turns)).toEqual([true, true, true]);
-    expect(logs.some(line => line.includes("probe probe succeeded"))).toBe(true);
-    admission.noteThrottle();                                           // a later, separate throttle
-    expect(admission.snapshot().cooldownUntil).toBe(1_000_000 + COOLDOWN_MS + 100 + COOLDOWN_MS);
+    expect(await admittedKeys(turns)).toEqual([true, false, false, false, false]);
+    admission.noteAccepted("p1");                      // still running, but its prompt got through
+    expect(await admittedKeys(turns)).toEqual([true, true, false, false, false]);
+    admission.noteAccepted("p2");
+    expect(await admittedKeys(turns)).toEqual([true, true, true, false, false]);
+    admission.noteAccepted("p3");                      // third acceptance: fully open
+    expect(await admittedKeys(turns)).toEqual([true, true, true, true, true]);
+    expect(logs.some(line => line.includes("probe p3 accepted: gate open"))).toBe(true);
+    expect(PROBES_TO_REOPEN).toBe(3);
   });
 
-  test("a throttled probe doubles the cooldown; a non-throttle failure lets the next waiter probe", async () => {
+  test("a throttle during slow start doubles the cooldown and restarts the count", async () => {
     const { admission, advance } = harness();
     admission.noteThrottle();
-    const first = admission.acquire("a", "p1");
-    const second = admission.acquire("b", "p2");
+    const turns = ["p1", "p2", "p3"].map(id => admission.acquire(id, id));
     advance(COOLDOWN_MS + 100);
-    const releaseFirst = await first;
-    admission.noteThrottle();                                           // the probe hit the wall again
-    releaseFirst("ChatGPT rate limit: too many requests");
-    const doubled = admission.snapshot().cooldownUntil - (1_000_000 + COOLDOWN_MS + 100);
-    expect(doubled).toBe(2 * COOLDOWN_MS);
-    expect(await admittedKeys([second])).toEqual([false]);
+    const releaseP1 = await turns[0]!;
+    admission.noteAccepted("p1");
+    const releaseP2 = await turns[1]!;
+    admission.noteThrottle();                          // p2 was refused
+    releaseP2("ChatGPT rate limit: too many requests");
+    expect(admission.snapshot().cooldownUntil - (1_000_000 + COOLDOWN_MS + 100)).toBe(2 * COOLDOWN_MS);
+    releaseP1();                                       // p1 finishing now is stale evidence
+    expect(await admittedKeys([turns[2]!])).toEqual([false]);
     advance(2 * COOLDOWN_MS + 100);
-    const releaseSecond = await second;                                 // the next probe
-    const third = admission.acquire("c", "p3");
-    releaseSecond("ChatGPT stopped responding");                        // not a throttle: proves nothing
-    expect(await admittedKeys([third])).toEqual([true]);                // becomes the next probe
+    expect(await admittedKeys([turns[2]!])).toEqual([true]);
   });
 
-  test("the probe's prompt being accepted reopens the gate before the probe turn ends", async () => {
+  test("a probe that fails for another reason hands the probe to the next waiter", async () => {
     const { admission, advance } = harness();
     admission.noteThrottle();
-    const turns = [admission.acquire("a", "probe"), admission.acquire("b", "b1")];
+    const turns = ["p1", "p2"].map(id => admission.acquire(id, id));
     advance(COOLDOWN_MS + 100);
-    expect(await admittedKeys(turns)).toEqual([true, false]);
-    admission.noteAccepted("b1");                                       // not the probe: ignored
-    expect(await admittedKeys(turns)).toEqual([true, false]);
-    admission.noteAccepted("probe");                                    // still running, but accepted
+    (await turns[0]!)("ChatGPT stopped responding");  // not a throttle: proves nothing
+    expect(await admittedKeys(turns)).toEqual([true, true]);
+    expect(admission.snapshot().cooldownUntil).toBe(1_000_000 + COOLDOWN_MS);   // no new cooldown
+  });
+
+  test("a probe that completes without an acceptance event still counts once", async () => {
+    const { admission, advance } = harness();
+    admission.noteThrottle();
+    const turns = ["p1", "p2"].map(id => admission.acquire(id, id));
+    advance(COOLDOWN_MS + 100);
+    (await turns[0]!)();
     expect(await admittedKeys(turns)).toEqual([true, true]);
   });
 
@@ -152,9 +161,10 @@ describe("ChatGPT account admission", () => {
     const inFlight = await admission.acquire("a", "old");
     admission.noteThrottle();
     advance(COOLDOWN_MS + 100);
-    inFlight();                                                         // succeeds, but proves nothing
+    admission.noteAccepted("old");
+    inFlight();                                         // succeeds, but proves nothing
     const next = [admission.acquire("b", "p"), admission.acquire("c", "q")];
-    expect(await admittedKeys(next)).toEqual([true, false]);            // still half-open: one probe
+    expect(await admittedKeys(next)).toEqual([true, false]);   // still slow start: one probe
   });
 
   test("the budget never drops below its floor", () => {
