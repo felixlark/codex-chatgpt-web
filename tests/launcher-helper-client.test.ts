@@ -1,10 +1,11 @@
 import { selectedSkillFile } from "../src/adapters/chatgpt-web/skill-attachments";
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
-import { LauncherBrowserHelperClient } from "../src/adapters/chatgpt-web/launcher-helper-client";
+import { LauncherBrowserHelperClient, setSharedAdmissionForTests } from "../src/adapters/chatgpt-web/launcher-helper-client";
+import { ChatGptAdmission, COOLDOWN_MS } from "../src/adapters/chatgpt-web/admission";
 import type { BrowserTurn, ResolvedBrowserConfig } from "../src/adapters/chatgpt-web/browser-worker";
 import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
 
@@ -444,4 +445,64 @@ test("an older helper cannot silently drop selected skill files and releases the
   })).rejects.toThrow("does not support skill attachments");
   expect(sent).toEqual(["run", "abort"]);
   expect(released).toBe(true);
+});
+
+describe("admission requeue on a throttle", () => {
+  function gatedClient() {
+    let now = 5_000_000;
+    let timer: (() => void) | undefined;
+    const admission = new ChatGptAdmission({
+      maxConcurrent: 3, now: () => now, log: () => {},
+      setTimer: callback => { timer = callback; return 0 as unknown as ReturnType<typeof setTimeout>; },
+      clearTimer: () => { timer = undefined; },
+    });
+    setSharedAdmissionForTests(admission);
+    const client = new LauncherBrowserHelperClient({
+      appName: "Codex Native2", browserHost: "launcher", browserHostDescriptorPath: "/durable/launcher.json",
+      storageStatePath: "/durable/unused.json", chromeExecutablePath: "/durable/chrome", headed: true, autoApproveToolCalls: false,
+    });
+    const internal = client as unknown as {
+      ensureChild(): Promise<void>;
+      runAdmitted(turn: { onSubmitted?: () => void }, onHost?: (host: string) => void): Promise<string>;
+    };
+    internal.ensureChild = async () => {};
+    return {
+      client, internal, admission,
+      advance(ms: number) { now += ms; const fire = timer; timer = undefined; fire?.(); },
+    };
+  }
+  const turn = () => ({
+    traceId: "t-throttle", modelId: "chatgpt-web/high",
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+    prepare: async () => ({ text: "x", images: [], release() {} }),
+    onTextDelta() {},
+  });
+  const rateLimited = () => new Error("ChatGPT rate limit: too many requests. Try again in a few minutes.");
+  afterEach(() => setSharedAdmissionForTests(undefined));
+
+  test("a throttle before ChatGPT accepted the prompt waits in the gate and runs again", async () => {
+    const { client, internal, admission, advance } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async () => {
+      attempts += 1;
+      if (attempts === 1) throw rateLimited();
+      return "done";
+    };
+    const result = client.run(turn() as never);
+    await Bun.sleep(5);
+    expect(attempts).toBe(1);
+    expect(admission.snapshot().cooldownUntil).toBeGreaterThan(5_000_000);   // cooling down, not failed
+    advance(COOLDOWN_MS + 100);
+    expect(await result).toBe("done");
+    expect(attempts).toBe(2);
+  });
+
+  test("a throttle after ChatGPT accepted the prompt still goes back to Codex", async () => {
+    const { client, internal } = gatedClient();
+    internal.runAdmitted = async submittedTurn => {
+      submittedTurn.onSubmitted?.();
+      throw rateLimited();
+    };
+    await expect(client.run(turn() as never)).rejects.toThrow("too many requests");
+  });
 });

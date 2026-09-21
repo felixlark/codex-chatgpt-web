@@ -186,6 +186,14 @@ function parseHelperMessage(line: string): HelperMessage {
 
 let admissionSingleton: ChatGptAdmission | undefined;
 
+/** Tests only: swap in a gate with a controllable clock (undefined restores the default). */
+export function setSharedAdmissionForTests(admission: ChatGptAdmission | undefined): void {
+  admissionSingleton = admission;
+}
+
+/** Throttles a single turn may wait out in the gate before the error goes back to Codex. */
+const MAX_THROTTLE_REQUEUES = 12;
+
 /**
  * One admission gate per bridge process: the account, not a client instance, is what throttles.
  * CODEX_CHATGPT_WEB_ADMISSION=off bypasses it without a rollback; tests never persist its state.
@@ -250,26 +258,40 @@ export class LauncherBrowserHelperClient {
     // Every pool host drives the same ChatGPT account; pace the account before picking a host.
     const admission = sharedAdmission(this.config);
     if (!admission) return await this.runAdmitted(turn);
-    const release = await admission.acquire(turn.conversationKey ?? turn.traceId, turn.traceId, turn.abortSignal, {
-      ...(turn.threadId ? { threadId: turn.threadId } : {}),
-      model: turn.modelId,
-    });
-    let failure: unknown;
+    let submitted = false;
     const observed: BrowserTurn = {
       ...turn,
       onSubmitted: () => {
+        submitted = true;
         admission.noteAccepted(turn.traceId);
         turn.onSubmitted?.();
       },
     };
-    try {
-      return await this.runAdmitted(observed, host => admission.noteHost(turn.traceId, host));
-    } catch (error) {
-      failure = error;
-      if (isChatGptRateLimitError(error)) admission.noteThrottle();
-      throw error;
-    } finally {
-      release(failure === undefined ? undefined : failure instanceof Error ? failure.message : String(failure));
+    // A throttle before ChatGPT accepted the prompt consumed nothing, so the turn goes back to the
+    // gate and waits out the cooldown there. Codex keeps receiving heartbeats and only sees a slow
+    // turn; surfacing the error instead spends Codex's few retries in seconds and leaves goals
+    // blocked for the rest of the throttle.
+    for (let requeues = 0; ; requeues += 1) {
+      const release = await admission.acquire(turn.conversationKey ?? turn.traceId, turn.traceId, turn.abortSignal, {
+        ...(turn.threadId ? { threadId: turn.threadId } : {}),
+        model: turn.modelId,
+      });
+      let failure: unknown;
+      let requeue = false;
+      try {
+        return await this.runAdmitted(observed, host => admission.noteHost(turn.traceId, host));
+      } catch (error) {
+        failure = error;
+        if (isChatGptRateLimitError(error)) {
+          admission.noteThrottle();
+          requeue = !submitted && !turn.abortSignal?.aborted && requeues < MAX_THROTTLE_REQUEUES;
+        }
+        if (!requeue) throw error;
+      } finally {
+        release(failure === undefined ? undefined : failure instanceof Error ? failure.message : String(failure));
+      }
+      console.info(`[chatgpt-web] admission turn ${turn.traceId} throttled before ChatGPT accepted it: `
+        + `back in the queue (${requeues + 1}/${MAX_THROTTLE_REQUEUES})`);
     }
   }
 
