@@ -502,7 +502,8 @@ describe("admission requeue on a throttle", () => {
     let attempts = 0;
     internal.runAdmitted = async () => {
       attempts += 1;
-      if (attempts <= 2) throw new Error("ChatGPT web login is expired or the Temporary Chat surface is unavailable");
+      if (attempts === 1) throw new Error("ChatGPT web login is expired or the Temporary Chat surface is unavailable");
+      if (attempts === 2) throw new Error("ChatGPT could not load the account subscription. Reload ChatGPT inside the launcher and retry");
       return "done";
     };
     expect(await client.run(turn() as never)).toBe("done");

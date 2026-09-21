@@ -193,12 +193,16 @@ export function setSharedAdmissionForTests(admission: ChatGptAdmission | undefin
 
 /** Throttles a single turn may wait out in the gate before the error goes back to Codex. */
 const MAX_THROTTLE_REQUEUES = 12;
-/** Signed-out or missing ChatGPT surfaces a turn may retry before the error goes back to Codex. */
+/**
+ * First-load failures of a freshly started host (signed-out render, subscription not loaded; both
+ * cleared by the next load) a turn may retry before the error goes back to Codex.
+ */
 const MAX_SURFACE_RETRIES = 2;
 
 function isChatGptSurfaceUnavailableError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /login is expired or the Temporary Chat surface is unavailable/i.test(message);
+  return /login is expired or the Temporary Chat surface is unavailable|could not load the account subscription/i
+    .test(message);
 }
 
 /**
