@@ -425,14 +425,14 @@ test("an abort during localized connector proof restores the exact preflight per
     undefined,
     async () => {
       proofCalls += 1;
-      if (proofCalls === 1) return false;
+      if (proofCalls <= 2) return false;               // first look, and the second look after settling
       controller.abort();
       throw new DOMException("proof aborted", "AbortError");
     },
     controller.signal,
   );
   await expect(preflight).rejects.toMatchObject({ name: "AbortError" });
-  expect(proofCalls).toBe(2);
+  expect(proofCalls).toBe(3);
   expect(choiceClicks).toEqual([1, 0]);
   expect(personalized).toBeFalse();
   await new Promise(resolve => setTimeout(resolve, 20));
@@ -659,7 +659,7 @@ test("an absolute deadline never hides a failed personalization rollback", async
         undefined,
         async () => {
           proofCalls += 1;
-          if (proofCalls === 1) return false;
+          if (proofCalls <= 2) return false;               // first look, and the second look after settling
           now += 30_001;
           return false;
         },
@@ -687,4 +687,21 @@ test("ambiguous personalization controls fail before connector selection", async
     code: "connector_not_found",
     retryable: false,
   });
+});
+
+test("a late @ menu is caught by a second look instead of toggling personalization", async () => {
+  const diagnostics: string[] = [];
+  const absent = visibleLocator(() => 0);
+  let proofCalls = 0;
+  const page = {
+    getByRole: () => absent,
+    locator: () => { throw new Error("the personalization menu must not be touched"); },
+  } as any;
+  expect(await ensureChatGptPersonalizedConnectorAccess(
+    page,
+    async checkpoint => { diagnostics.push(checkpoint); },
+    async () => { proofCalls += 1; return proofCalls === 2; },   // the menu shows up on the second look
+  )).toBe("already-personalized");
+  expect(proofCalls).toBe(2);
+  expect(diagnostics).toEqual(["personalization-already-enabled-on-second-look"]);
 });

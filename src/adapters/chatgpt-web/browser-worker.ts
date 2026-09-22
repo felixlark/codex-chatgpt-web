@@ -583,6 +583,14 @@ async function ensureChatGptPersonalizedConnectorAccessWithinDeadline(
         await capture("personalization-already-enabled");
         return "already-personalized";
       }
+      // On a busy page the @ menu can open after the proof's short wait; on Mars that alone sent
+      // turns down the toggle path until the 30s preflight deadline, and the next attempt found the
+      // menu at once. Look once more after the UI settles before treating the account as unpersonalized.
+      await runChatGptPersonalizationStep(settleChatGptUi, deadline, abortSignal);
+      if (await proveConnectorAccess()) {
+        await capture("personalization-already-enabled-on-second-look");
+        return "already-personalized";
+      }
       await capture("personalization-unpersonalized");
       const toggleReceipt = await toggleChatGptPersonalizationChoice(page, deadline, abortSignal);
       try {
