@@ -537,6 +537,20 @@ describe("admission requeue on a throttle", () => {
     expect(admission.snapshot().recent60).toBe(1);
   });
 
+  test("a page that does not load before submission is retried instead of blocking the goal", async () => {
+    // Seen on Mars at 01:39: both errors went back to Codex and blocked two goals.
+    const { client, internal } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("ChatGPT browser stage timed out: browser_page");
+      if (attempts === 2) throw new Error("page.goto: Timeout 60000ms exceeded.\nCall log:\n  - navigating to \"https://chatgpt.com/?temporary-chat=true\"");
+      return "done";
+    };
+    expect(await client.run(turn() as never)).toBe("done");
+    expect(attempts).toBe(3);
+  });
+
   test("a throttle after Send was pressed is not run again, even before ChatGPT confirmed it", async () => {
     const { client, internal } = gatedClient();
     let attempts = 0;
