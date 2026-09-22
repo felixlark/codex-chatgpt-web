@@ -827,6 +827,46 @@ export async function throwIfChatGptTerminalErrorAlert(scope: ChatGptTextScope):
   );
 }
 
+/**
+ * Hold the requested model item ("Latest" or "GPT-5.6 Sol") in the open intelligence picker.
+ * ChatGPT remembers the last choice, so the default Latest is enforced too: otherwise one Sol run
+ * would leave every later turn on Sol. Returns true when it had to change the selection.
+ */
+export async function holdChatGptPickerModel(
+  menu: Locator,
+  webModel: "latest" | "sol",
+  captureDiagnostic?: (checkpoint: string) => Promise<void>,
+): Promise<boolean> {
+  const label = webModel === "sol" ? /^GPT-5\.6 Sol\b/ : /^Latest\b/;
+  const items = menu.locator(CHATGPT_EFFORT_ITEM_SELECTOR);
+  const count = await Promise.resolve().then(() => items.count()).catch(() => 0);
+  let target: Locator | undefined;
+  for (let index = 0; index < count; index += 1) {
+    const text = (await Promise.resolve().then(() => items.nth(index).innerText()).catch(() => ""))
+      .replace(/\s+/g, " ").trim();
+    if (label.test(text)) {
+      target = items.nth(index);
+      break;
+    }
+  }
+  if (!target) {
+    // Accounts without a model list keep working on the default; an explicit Sol request cannot.
+    if (webModel === "latest") return false;
+    throw chatGptModelControlUnavailableError("ChatGPT's model picker does not offer GPT-5.6 Sol");
+  }
+  if (await target.getAttribute("aria-checked") === "true") return false;
+  await target.click({ timeout: 5_000 });
+  await captureDiagnostic?.(`picker-model-${webModel}-selected`);
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (await target.getAttribute("aria-checked").catch(() => null) === "true") return true;
+    if (!await target.isVisible().catch(() => false)) return true;   // the picker closed on selection
+    await new Promise(resolveSleep => setTimeout(resolveSleep, 50));
+  }
+  throw chatGptModelControlUnavailableError(`ChatGPT did not select the ${webModel} model item`);
+}
+
+
 export async function resolveChatGptToolConfirmation(
   page: Page,
   appName: string,
@@ -2480,9 +2520,14 @@ export class ChatGptBrowserWorker {
     await throwIfChatGptRateLimitDialog(page);
     await captureDiagnostic?.("effort-control-ready");
     await throwIfChatGptRateLimitDialog(page);
-    const activation = await activateChatGptEffortMenu(page, currentEffort);
+    let activation = await activateChatGptEffortMenu(page, currentEffort);
     if (activation.method === "pointerdown") {
       await captureDiagnostic?.("effort-menu-pointerdown-fallback");
+    }
+    if (mode.webModel && await holdChatGptPickerModel(activation.menu, mode.webModel, captureDiagnostic)) {
+      // Picking a model item can close the picker or rebuild its slider; open it afresh.
+      await settleChatGptUi();
+      activation = await activateChatGptEffortMenu(page, currentEffort);
     }
     await captureDiagnostic?.("effort-menu-open-requested");
     const effortSlider = activation.slider;

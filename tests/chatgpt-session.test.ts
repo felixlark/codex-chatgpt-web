@@ -244,7 +244,12 @@ function reasoningPicker(options: { max?: string; delay?: number; missing?: bool
     getAttribute: async (name: string) => name === "aria-expanded" ? "true" : null,
   };
   const composer = { filter() { return this; }, last() { return this; }, locator: () => ({ locator: () => control }) };
-  const modelRows = { count: async () => 3, first() { return this; }, waitFor: async () => {}, nth: () => { throw new Error("Model rows are not effort choices"); } };
+  // Model rows may be read (to confirm Latest is held) but never clicked: they are not effort choices.
+  const modelRows = { count: async () => 3, first() { return this; }, waitFor: async () => {}, nth: (index: number) => ({
+    innerText: async () => ["Latest", "GPT-5.6 Sol", "GPT-5.5"][index]!,
+    getAttribute: async (name: string) => (name === "aria-checked" ? String(index === 0) : null),
+    click: async () => { throw new Error("Model rows are not effort choices"); },
+  }) };
   const menu = { filter() { return this; }, last() { return this; }, isVisible: async () => true, locator: () => modelRows };
   const page = {
     locator: (selector: string) => {

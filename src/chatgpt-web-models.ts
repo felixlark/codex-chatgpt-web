@@ -107,9 +107,11 @@ function contextLimits(
 /** Resolve the product limit for the selected visible ChatGPT mode. */
 export function resolveChatGptWebContextLimits(
   backendModel: ChatGptWebBackendModel,
-  effort: ChatGptWebAdapterEffort,
+  routeEffort: ChatGptWebAdapterEffort | `${ChatGptWebAdapterEffort}@sol`,
   capabilities: ChatGptWebAccountCapabilities,
 ): ChatGptWebContextLimits {
+  // The picker model does not change the browser limits; only the effort does.
+  const effort = routeEffort.split("@")[0] as ChatGptWebAdapterEffort;
   if (isChatGptWebZeroRiskBackendModel(backendModel)) {
     if (capabilities.experimentalBiggerContext) {
       throw new Error("Zero Risk does not support Bigger Context");
@@ -228,7 +230,8 @@ interface ChatGptWebModelRouteBase {
 export interface ChatGptWebAutomaticModelRoute extends ChatGptWebModelRouteBase {
   interactionMode: "automatic";
   backendModel: ChatGptWebAutomaticBackendModel;
-  adapterEffort: ChatGptWebAdapterEffort;
+  /** `<effort>` holds the picker's Latest model; `<effort>@sol` holds GPT-5.6 Sol. */
+  adapterEffort: ChatGptWebAdapterEffort | `${ChatGptWebAdapterEffort}@sol`;
 }
 
 export interface ChatGptWebZeroRiskModelRoute extends ChatGptWebModelRouteBase {
@@ -361,12 +364,62 @@ export const CHATGPT_WEB_MODEL_ROUTES: readonly ChatGptWebAutomaticModelRoute[] 
   },
 ];
 
+/**
+ * The same efforts with GPT-5.6 Sol held in the ChatGPT picker instead of Latest. Routable by slug
+ * (e.g. `codex exec -m chatgpt-web/sol-high`) for model comparisons, but not advertised in the
+ * model catalog, so the Codex picker keeps its fixed list.
+ */
+export const CHATGPT_WEB_SOL_MODEL_ROUTES: readonly ChatGptWebAutomaticModelRoute[] = [
+  {
+    slug: "chatgpt-web/sol-medium",
+    displayName: "ChatGPT Web — 5.6 Sol Medium",
+    description: "ChatGPT Web GPT-5.6 Sol at Medium through the native Codex harness.",
+    interactionMode: "automatic",
+    backendModel: CHATGPT_WEB_BACKEND_MODEL,
+    codexEffort: "medium",
+    adapterEffort: "medium@sol",
+    requiresPro: false,
+  },
+  {
+    slug: "chatgpt-web/sol-high",
+    displayName: "ChatGPT Web — 5.6 Sol High",
+    description: "ChatGPT Web GPT-5.6 Sol at High through the native Codex harness.",
+    interactionMode: "automatic",
+    backendModel: CHATGPT_WEB_BACKEND_MODEL,
+    codexEffort: "high",
+    adapterEffort: "high@sol",
+    requiresPro: false,
+  },
+  {
+    slug: "chatgpt-web/sol-extra-high",
+    displayName: "ChatGPT Web — 5.6 Sol Extra High",
+    description: "Account-gated ChatGPT Web GPT-5.6 Sol at Extra High through the native Codex harness.",
+    interactionMode: "automatic",
+    backendModel: CHATGPT_WEB_BACKEND_MODEL,
+    codexEffort: "xhigh",
+    adapterEffort: "xhigh@sol",
+    requiresPro: false,
+    requiresExtraHigh: true,
+  },
+  {
+    slug: "chatgpt-web/sol-pro",
+    displayName: "ChatGPT Web — 5.6 Sol Pro",
+    description: "Account-gated ChatGPT GPT-5.6 Sol Pro through the native Codex harness.",
+    interactionMode: "automatic",
+    backendModel: CHATGPT_WEB_BACKEND_MODEL,
+    codexEffort: "ultra",
+    adapterEffort: "max@sol",
+    requiresPro: true,
+  },
+];
+
 const routesBySlug = new Map(
   [
     CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE,
     CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE,
     ...CHATGPT_WEB_LUNA_MODEL_ROUTES,
     ...CHATGPT_WEB_MODEL_ROUTES,
+    ...CHATGPT_WEB_SOL_MODEL_ROUTES,
   ]
     .map(route => [route.slug, route]),
 );
