@@ -338,7 +338,10 @@ export class ChatGptAdmission {
   /** After 30 quiet minutes spent near the limit without a throttle, allow 10% more. */
   private loosen(now: number): void {
     if (now - this.state.lastAdjustAt < LOOSEN_AFTER_MS) return;
-    const busy = this.admittedWithin(now, THIRTY_MINUTES) >= 0.6 * this.state.budget.req30;
+    // Busy when any window ran at 60% of its own budget. Checking only the 30-minute window meant
+    // a budget pinned by the 60-minute window (10/h caps 30 minutes well below 60% of 15) could
+    // never loosen again after a throttle.
+    const busy = WINDOWS.some(([key, span]) => this.admittedWithin(now, span) >= 0.6 * this.state.budget[key]);
     this.state.lastAdjustAt = now;
     if (!busy) return;
     this.state.budget = scaleBudget(this.state.budget, 1.1);

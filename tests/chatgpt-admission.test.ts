@@ -171,15 +171,34 @@ describe("ChatGPT account admission", () => {
     const { admission, advance } = harness({ maxConcurrent: 100 });
     for (let index = 0; index < ADMISSION_SEED.req60; index += 1) {
       (await admission.acquire(`h${index}`, `h${index}`))();
-      advance(2.5 * 60_000);                                       // 20 turns over 50 minutes
+      advance(1.45 * 60_000);                                      // 20 turns in 29 minutes
     }
     const snapshot = admission.snapshot();
     expect(snapshot.recent10).toBeLessThan(ADMISSION_SEED.req10);
     expect(snapshot.recent30).toBeLessThan(snapshot.budget.req30);
     const late = admission.acquire("late", "late");
     expect(await admittedKeys([late])).toEqual([false]);
-    advance(10 * 60_000 + 100);                                    // the first turn leaves the hour
+    advance(31 * 60_000 + 100);                                    // the first turn leaves the hour
     expect(await admittedKeys([late])).toEqual([true]);
+  });
+
+  test("a budget held down by the 60-minute window loosens once that window runs busy", async () => {
+    const { admission, advance } = harness({ maxConcurrent: 100 });
+    admission.noteThrottle();                                       // cuts every window, 60m to 14
+    advance(COOLDOWN_MS + 100);
+    for (const id of ["p1", "p2", "p3"]) {                          // slow start
+      const release = await admission.acquire(id, id);
+      admission.noteAccepted(id);
+      release();
+    }
+    const cut = admission.snapshot().budget.req60;
+    for (let index = 0; index < 6; index += 1) {                    // 9 in the hour: busy for 60m only
+      (await admission.acquire(`b${index}`, `b${index}`))();
+      advance(3 * 60_000);
+    }
+    advance(15 * 60_000);                                           // past the 30-minute adjust interval
+    (await admission.acquire("next", "next"))();
+    expect(admission.snapshot().budget.req60).toBeGreaterThan(cut);
   });
 
   test("a refunded turn does not count against the budget", async () => {
