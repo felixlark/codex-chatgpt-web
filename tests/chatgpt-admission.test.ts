@@ -167,6 +167,13 @@ describe("ChatGPT account admission", () => {
     expect(await admittedKeys(turns)).toEqual([true, true]);
   });
 
+  test("a refunded turn does not count against the budget", async () => {
+    const { admission } = harness({ maxConcurrent: 100 });
+    for (let index = 0; index < 5; index += 1) (await admission.acquire(`r${index}`, `r${index}`))("page failed", true);
+    (await admission.acquire("kept", "kept"))();
+    expect(admission.snapshot().recent10).toBe(1);
+  });
+
   test("a turn already running when the throttle hit is not a probe", async () => {
     const { admission, advance } = harness();
     const inFlight = await admission.acquire("a", "old");

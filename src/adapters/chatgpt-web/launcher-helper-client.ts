@@ -211,7 +211,7 @@ const SURFACE_RETRY_DELAY_MS = 60_000;
 
 function isChatGptSurfaceUnavailableError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /login is expired or the Temporary Chat surface is unavailable|could not load the account subscription|personalization preflight exceeded its readiness deadline/i
+  return /login is expired or the Temporary Chat surface is unavailable|could not load the account subscription|personalization preflight exceeded its readiness deadline|retained conversation lost its connector/i
     .test(message);
 }
 
@@ -347,6 +347,7 @@ export class LauncherBrowserHelperClient {
       });
       let failure: unknown;
       let requeue = false;
+      let refund = false;
       try {
         return await this.runAdmitted(observed, host => admission.noteHost(turn.traceId, host));
       } catch (error) {
@@ -359,10 +360,11 @@ export class LauncherBrowserHelperClient {
           // The turn never reached ChatGPT, so run it again (no account cooldown).
           surfaceRetries += 1;
           requeue = unsent && surfaceRetries <= MAX_SURFACE_RETRIES;
+          refund = unsent;                  // nothing reached ChatGPT: give the slot back
         }
         if (!requeue) throw error;
       } finally {
-        release(failure === undefined ? undefined : failure instanceof Error ? failure.message : String(failure));
+        release(failure === undefined ? undefined : failure instanceof Error ? failure.message : String(failure), refund);
       }
       console.info(`[chatgpt-web] admission turn ${turn.traceId} failed before ChatGPT accepted it `
         + `(${failure instanceof Error ? failure.message.slice(0, 80) : "error"}): back in the queue`);

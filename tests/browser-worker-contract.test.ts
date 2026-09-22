@@ -2402,7 +2402,7 @@ test("an abort while inserting a connector prompt clears the selected pill and p
   expect(connectorSelected).toBeFalse();
 });
 
-test("retained tool turns keep a connector that is still selected and select a missing one again", async () => {
+test("retained tool turns keep a connector that is still selected and fail before sending when it is gone", async () => {
   const attachPrompt = (ChatGptBrowserWorker.prototype as unknown as {
     attachPrompt(
       page: unknown,
@@ -2431,21 +2431,20 @@ test("retained tool turns keep a connector that is still selected and select a m
   expect(calls).toEqual(["fill", "focus", "insert", "assert"]);
 
   // ChatGPT binds a connector to one message: after a send the retained composer has none, and a
-  // follow-up without it reaches a model with no tools.
+  // follow-up without it reaches a model with no tools. It cannot be selected again there, so the
+  // turn fails before anything is sent and runs again on a fresh chat.
   const checkpoints: string[] = [];
-  let reselected = 0;
-  const selectedComposer = { ...composer, press: async () => {} };
-  await attachPrompt.call({
+  let inserted = 0;
+  await expect(attachPrompt.call({
     activeComposer: async () => composer,
     connectorIsSelected: async () => false,
-    selectConnector: async () => { reselected += 1; return selectedComposer; },
-    clearChatGptComposerState: async () => {},
-    insertPromptText: async () => {},
+    selectConnector: async () => { throw new Error("must not try to select in a retained chat"); },
+    insertPromptText: async () => { inserted += 1; },
     assertPromptAttached: async () => {},
   }, {}, "retained context", true, async (checkpoint: string) => { checkpoints.push(checkpoint); },
-  undefined, false, undefined, true);
-  expect(reselected).toBe(1);
-  expect(checkpoints).toContain("retained-connector-reselected");
+  undefined, false, undefined, true)).rejects.toThrow("retained conversation lost its connector");
+  expect(inserted).toBe(0);
+  expect(checkpoints).toContain("retained-connector-missing");
 });
 
 test("image attachment readiness uses exact file tiles and not localized remove-button text", async () => {
@@ -2640,17 +2639,19 @@ test("Think attachment runs after fresh connector selection and rechecks retaine
       insertPromptText: async () => { submitted.push(ui.state.pressed); },
       assertPromptAttached: async () => {}, clearChatGptComposerState: async () => { ui.state.draft = ""; ui.state.connectors = []; },
     };
+    // A retained tool turn needs its connector still in the composer; this fixture starts with one.
+    if (retained && localTools) ui.state.connectors = ["Codex Native2"];
     await attach.call(worker, ui.page, "requested task", localTools, undefined, undefined, false, undefined, retained, true);
     expect(submitted).toEqual([true]);
-    // A retained composer starts without a connector here, so it is selected once there too.
-    expect(connectorSelections).toBe(localTools ? 1 : 0);
-    if (localTools) expect(ui.state.connectors).toEqual(["Codex Native2"]);
+    expect(connectorSelections).toBe(localTools && !retained ? 1 : 0);
+    if (localTools && !retained) expect(ui.state.connectors).toEqual(["Codex Native2"]);
     if (retained) {
       ui.state.pressed = false;
+      if (localTools) ui.state.connectors = ["Codex Native2"];
       await attach.call(worker, ui.page, "follow-up task", localTools, undefined, undefined, false, undefined, retained, true);
       expect(submitted).toEqual([true, true]);
       expect(ui.state.commands).toEqual(["/think", "/think"]);
-      expect(connectorSelections).toBe(1);                 // still selected: not selected again
+      expect(connectorSelections).toBe(0);                 // still selected: never selected again
     }
   }
 });

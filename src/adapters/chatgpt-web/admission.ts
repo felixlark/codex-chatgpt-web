@@ -81,7 +81,7 @@ interface Waiter {
   traceId: string;
   enqueuedAt: number;
   info?: AdmissionTurnInfo;
-  admit: (release: (error?: string) => void) => void;
+  admit: (release: (error?: string, refund?: boolean) => void) => void;
   reject: (error: unknown) => void;
   signal?: AbortSignal;
   onAbort?: () => void;
@@ -120,9 +120,15 @@ export class ChatGptAdmission {
 
   /**
    * Resolve with a release function once the turn may run; reject if its signal aborts first.
-   * Pass the turn's error message to release when it failed, so the status record shows it.
+   * Pass the turn's error message to release when it failed, so the status record shows it, and
+   * refund=true when nothing reached ChatGPT so the slot does not count against the budget.
    */
-  acquire(key: string, traceId: string, signal?: AbortSignal, info?: AdmissionTurnInfo): Promise<(error?: string) => void> {
+  acquire(
+    key: string,
+    traceId: string,
+    signal?: AbortSignal,
+    info?: AdmissionTurnInfo,
+  ): Promise<(error?: string, refund?: boolean) => void> {
     if (signal?.aborted) return Promise.reject(new DOMException("ChatGPT web turn aborted", "AbortError"));
     return new Promise((resolve, reject) => {
       const waiter: Waiter = { key, traceId, enqueuedAt: this.now(), info, admit: resolve, reject, signal };
@@ -216,6 +222,7 @@ export class ChatGptAdmission {
       if (this.state.probesNeeded > 0) this.probeTraceId = waiter.traceId;
       this.running += 1;
       this.state.admitted.push(now);
+      const admittedAt = now;
       const record: AdmissionTurnRecord = {
         traceId: waiter.traceId, key: waiter.key, queuedAt: waiter.enqueuedAt, startedAt: now,
         ...(waiter.info?.threadId ? { threadId: waiter.info.threadId } : {}),
@@ -229,10 +236,15 @@ export class ChatGptAdmission {
         this.log(`[chatgpt-web] admission turn ${waiter.traceId} admitted after ${Math.round(waited / 1_000)}s`);
       }
       let released = false;
-      waiter.admit(error => {
+      waiter.admit((error, refund) => {
         if (released) return;
         released = true;
         this.running -= 1;
+        if (refund) {
+          // The turn failed before any prompt reached ChatGPT: it must not count against the budget.
+          const at = this.state.admitted.lastIndexOf(admittedAt);
+          if (at >= 0) this.state.admitted.splice(at, 1);
+        }
         record.endedAt = this.now();
         if (error) record.error = error.slice(0, 200);
         if (this.probeTraceId === waiter.traceId) {
