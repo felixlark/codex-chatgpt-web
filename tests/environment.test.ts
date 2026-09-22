@@ -808,6 +808,45 @@ describe("trusted Codex task environment continuity", () => {
     });
   });
 
+  // Seen on Mars at midnight: Codex re-sent a cwd-less envelope (only the date changed) after the
+  // turn's tool calls, and the bridge rejected every retry with "missing cwd", blocking the goal.
+  const midTurnDiff = (threadId: string, workspaceRoot: string, extra = ""): CodexParsedRequest => {
+    const next = currentWire();
+    next._rawBody = {
+      client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: "turn_mid" }) },
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "Keep going" }] },
+        { type: "function_call", name: "exec_command", call_id: "call_1", arguments: "{}" },
+        { type: "function_call_output", call_id: "call_1", output: "ok" },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: `<environment_context>
+  <current_date>2026-09-23</current_date>
+  <filesystem><workspace_roots><root>${workspaceRoot}</root></workspace_roots>${extra || dangerFullAccessProfileXml}</filesystem>
+</environment_context>` }],
+        },
+      ],
+    };
+    return next;
+  };
+
+  test("a mid-turn envelope diff that restates the thread's authority keeps it", () => {
+    const store = new ChatGptThreadEnvironmentStore();
+    store.resolve(currentWire());                        // caches thread_current
+    expect(store.resolve(midTurnDiff("thread_current", root))).toMatchObject({
+      cwd: root, roots: [root], sandboxPolicy: { type: "dangerFullAccess" },
+    });
+  });
+
+  test("a mid-turn envelope diff never changes or creates authority", () => {
+    const store = new ChatGptThreadEnvironmentStore();
+    store.resolve(currentWire());
+    expect(() => store.resolve(midTurnDiff("thread_current", tmpdir()))).toThrow("missing cwd");
+    expect(() => store.resolve(midTurnDiff("thread_current", root, readOnlyProfileXml))).toThrow("missing cwd");
+    expect(() => store.resolve(midTurnDiff("thread_uncached", root))).toThrow("missing cwd");
+  });
+
   test("does not borrow authority across threads or hide an invalid trusted update", () => {
     const store = new ChatGptThreadEnvironmentStore();
     store.resolve(currentWire());

@@ -742,6 +742,34 @@ function matchesPath(root: string, path: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
+/**
+ * Codex re-sends <environment_context> in the middle of a running turn when part of it changes
+ * (seen on Mars: the date rolled over at midnight, after the turn's tool calls). That diff is the
+ * last input item, after the active instruction, so the before-the-instruction lookup never sees
+ * it. Parse it only when it is exactly that shape: a pure envelope, last in the input, owned by
+ * the current turn (or untagged), with the turn's instruction earlier. The caller still decides
+ * whether it may be trusted; this never grants authority by itself.
+ */
+export function extractChatGptTrailingEnvironmentUpdate(parsed: CodexParsedRequest): ChatGptTurnEnvironment | undefined {
+  const body = record(parsed._rawBody);
+  const input = Array.isArray(body?.input) ? body.input : [];
+  const last = record(input[input.length - 1]);
+  if (last?.type !== "message" || last.role !== "user") return undefined;
+  const text = rawMessageText(last).trim();
+  if (!/^<environment_context>[\s\S]*<\/environment_context>$/.test(text)) return undefined;
+  if ((text.match(/<environment_context>/g) ?? []).length !== 1) return undefined;
+  const turnId = extractChatGptTurnIdentity(parsed).turnId;
+  const owner = itemTurnId(last);
+  if (owner !== undefined && owner !== turnId) return undefined;
+  const metadata = clientTurnMetadata(parsed);
+  if (!input.slice(0, -1).some(value => isUserOrParentInstruction(record(value), metadata))) return undefined;
+  try {
+    return parseChatGptEnvironmentText(parsed, text);
+  } catch {
+    return undefined;
+  }
+}
+
 export function extractChatGptTurnEnvironment(parsed: CodexParsedRequest): ChatGptTurnEnvironment {
   return parseChatGptEnvironmentText(parsed, trustedEnvironmentText(parsed));
 }

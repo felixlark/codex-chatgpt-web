@@ -5,6 +5,7 @@ import { getCodexHome } from "../../codex-integration-shared";
 import type { CodexParsedRequest } from "../../types";
 import {
   extractChatGptTurnEnvironment,
+  extractChatGptTrailingEnvironmentUpdate,
   extractChatGptCompactionSourceRevision,
   extractChatGptContinuationEnvironmentClaim,
   extractChatGptTurnIdentity,
@@ -162,6 +163,20 @@ export class ChatGptThreadEnvironmentStore {
       const historicalMessages = hasCurrentContext && !currentCompaction && lineage
         ? unattributedChatGptEnvironmentMessages(parsed) : undefined;
       if (hasCurrentContext && !currentCompaction && !historicalMessages) {
+        // A mid-turn envelope diff (e.g. only the date changed) that restates exactly the authority
+        // this thread already holds is not an update to hide: keep the thread's trusted authority.
+        // Anything that differs, or a thread with nothing cached, still fails closed.
+        const update = extractChatGptTrailingEnvironmentUpdate(parsed);
+        const cached = update ? this.get(identity.threadId) : undefined;
+        if (update && cached && sameAuthority(update, { ...cached, tools: [] })) {
+          return {
+            cwd: cached.cwd,
+            roots: cached.roots,
+            writableRoots: cached.writableRoots,
+            sandboxPolicy: cached.sandboxPolicy,
+            tools: parsed.context.tools ?? [],
+          };
+        }
         throw this.rejected(parsed, identity, { reason: "current-envelope-unparsed", hasCurrentContext, currentCompaction }, error);
       }
       const currentClaim = currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed) : undefined;
