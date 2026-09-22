@@ -3403,7 +3403,17 @@ export class ChatGptBrowserWorker {
     requireThink = false,
   ): Promise<void> {
     throwIfPromptAttachmentAborted(abortSignal);
-    const connectorMode = chatGptConnectorAttachmentMode(localTools, reuseConnector);
+    let connectorMode = chatGptConnectorAttachmentMode(localTools, reuseConnector);
+    if (connectorMode === "retained") {
+      // ChatGPT attaches a connector to one message, not to the conversation: a retained follow-up
+      // sent without it reaches a model that has no tools and answers "no local Codex tools" turn
+      // after turn (seen on Mars for every goal continuation). Select it again when it is missing.
+      const composer = await this.activeComposer(page, 30_000, abortSignal);
+      if (!await this.connectorIsSelected(composer, abortSignal)) {
+        await captureDiagnostic?.("retained-connector-reselected");
+        connectorMode = "mention";
+      }
+    }
     let composerMutationStarted = false;
     try {
       if (connectorMode !== "mention") {
