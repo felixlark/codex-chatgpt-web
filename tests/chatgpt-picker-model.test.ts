@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { holdChatGptPickerModel } from "../src/adapters/chatgpt-web/browser-worker";
-import { resolveChatGptWebModelMode, splitChatGptWebReasoning } from "../src/adapters/chatgpt-web/model";
+import { chatGptWebReasoningFor, resolveChatGptWebModelMode, splitChatGptWebReasoning } from "../src/adapters/chatgpt-web/model";
 import { CHATGPT_WEB_MODEL_ROUTES, CHATGPT_WEB_SOL_MODEL_ROUTES, requireChatGptWebModelRoute } from "../src/chatgpt-web-models";
 
 function picker(labels: string[], checkedIndex: number) {
@@ -25,8 +25,12 @@ describe("ChatGPT picker model", () => {
     expect(splitChatGptWebReasoning("high")).toEqual({ effort: "high", webModel: "latest" });
     expect(splitChatGptWebReasoning("max@sol")).toEqual({ effort: "max", webModel: "sol" });
     expect(() => splitChatGptWebReasoning("high@luna")).toThrow("variant");
-    expect(resolveChatGptWebModelMode("gpt-5.6-sol", "xhigh@sol", capabilities as never))
-      .toMatchObject({ effort: "xhigh", uiEffortIndex: 3, webModel: "sol" });
+    const mode = resolveChatGptWebModelMode("gpt-5.6-sol", "xhigh@sol", capabilities as never);
+    expect(mode).toMatchObject({ effort: "xhigh", uiEffortIndex: 3, webModel: "sol" });
+    // The worker re-resolves the mode from effort + picker model; the pair must round-trip.
+    expect(resolveChatGptWebModelMode("gpt-5.6-sol", chatGptWebReasoningFor(mode.effort, mode.webModel), capabilities as never))
+      .toMatchObject({ effort: "xhigh", webModel: "sol" });
+    expect(chatGptWebReasoningFor("high", "latest")).toBe("high");
   });
 
   test("Sol routes are routable by slug but not in the advertised catalog", () => {

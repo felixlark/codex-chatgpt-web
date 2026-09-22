@@ -26,6 +26,7 @@ import {
 import {
   CHATGPT_WEB_LUNA_MODEL_ID,
   CHATGPT_WEB_MODEL_ID,
+  chatGptWebReasoningFor,
   resolveChatGptWebModelMode,
   type ChatGptWebCapabilities,
   type ChatGptWebModelMode,
@@ -4819,7 +4820,8 @@ export class ChatGptBrowserWorker {
         this.selectModelAndEffort(
           page,
           turn.modelId,
-          stagingMode.effort,
+          // Carry the picker model with the effort: the bare effort would always select Latest.
+          chatGptWebReasoningFor(stagingMode.effort, requestedMode.webModel),
           browserCapabilities,
           checkpoint => diagnostics.capture(page, checkpoint),
         )
@@ -4919,7 +4921,7 @@ export class ChatGptBrowserWorker {
             () => this.selectModelAndEffort(
               page,
               turn.modelId,
-              requestedMode.effort,
+              chatGptWebReasoningFor(requestedMode.effort, requestedMode.webModel),
               browserCapabilities,
               checkpoint => diagnostics.capture(page, `final-part-${checkpoint}`),
             ),

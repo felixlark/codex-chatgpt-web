@@ -39,6 +39,11 @@ export function splitChatGptWebReasoning(reasoning: string | undefined): { effor
   return { effort: reasoning.slice(0, at), webModel: "sol" };
 }
 
+/** The reasoning string that asks for `effort` with the given picker model (inverse of the split). */
+export function chatGptWebReasoningFor(effort: string, webModel: ChatGptWebPickerModel | undefined): string {
+  return webModel === "sol" ? `${effort}@sol` : effort;
+}
+
 export function resolveChatGptWebModelMode(
   modelId: string,
   reasoning: string | undefined,
