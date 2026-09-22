@@ -327,8 +327,13 @@ export class LauncherBrowserHelperClient {
     const admission = sharedAdmission(this.config);
     if (!admission) return await this.runAdmitted(turn);
     let submitted = false;
+    let sendActivated = false;
     const observed: BrowserTurn = {
       ...turn,
+      onSendActivated: () => {
+        sendActivated = true;
+        return turn.onSendActivated?.();
+      },
       onSubmitted: () => {
         submitted = true;
         admission.noteAccepted(turn.traceId);
@@ -356,7 +361,10 @@ export class LauncherBrowserHelperClient {
         });
       } catch (error) {
         failure = error;
-        const unsent = !submitted && !turn.abortSignal?.aborted;
+        // Once Send was pressed the prompt may already be on its way even when ChatGPT then shows a
+        // rate-limit dialog (seen on Mars: a tool call for the "failed" turn arrived two seconds
+        // later). Running it again could deliver the prompt twice, so only unsent turns go back.
+        const unsent = !submitted && !sendActivated && !turn.abortSignal?.aborted;
         if (isChatGptRateLimitError(error)) {
           admission.noteThrottle();
           requeue = unsent && requeues < MAX_THROTTLE_REQUEUES;
@@ -364,7 +372,11 @@ export class LauncherBrowserHelperClient {
           // The turn never reached ChatGPT, so run it again (no account cooldown).
           surfaceRetries += 1;
           requeue = unsent && surfaceRetries <= MAX_SURFACE_RETRIES;
-          if (lastHost && this.config.browserHostPool?.length) {
+          // A retained chat losing its connector is ChatGPT's per-message binding, not a host fault.
+          const hostFault = !/retained conversation lost its connector/i.test(
+            error instanceof Error ? error.message : String(error),
+          );
+          if (hostFault && lastHost && this.config.browserHostPool?.length) {
             quarantineLauncherHost(lastHost);
             console.warn(`[chatgpt-web] launcher host ${lastHost} failed before submission; `
               + "left out of new turns for 10 minutes");

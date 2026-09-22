@@ -520,6 +520,18 @@ describe("admission requeue on a throttle", () => {
     expect(always).toBe(13);                             // first try + 12 retries
   });
 
+  test("a throttle after Send was pressed is not run again, even before ChatGPT confirmed it", async () => {
+    const { client, internal } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async sentTurn => {
+      attempts += 1;
+      await (sentTurn as { onSendActivated?: () => unknown }).onSendActivated?.();
+      throw rateLimited();
+    };
+    await expect(client.run(turn() as never)).rejects.toThrow("too many requests");
+    expect(attempts).toBe(1);
+  });
+
   test("a throttle after ChatGPT accepted the prompt still goes back to Codex", async () => {
     const { client, internal } = gatedClient();
     internal.runAdmitted = async submittedTurn => {
