@@ -22,6 +22,8 @@ interface PendingTurn {
   reject: (error: Error) => void;
   abortListener?: () => void;
   sent?: boolean;
+  /** Last message of any kind (heartbeats included) from the helper for this turn. */
+  lastHelperEventAt?: number;
   prepared?: CompiledChatGptWebPrompt & { release: () => void };
   localFailure?: Error;
   progressForwarding?: AbortController;
@@ -191,6 +193,9 @@ export function setSharedAdmissionForTests(admission: ChatGptAdmission | undefin
   admissionSingleton = admission;
 }
 
+/** Helper silence (no heartbeat either) after which a sent turn counts as stuck. */
+const HELPER_UNRESPONSIVE_MS = 5 * 60_000;
+
 /** Throttles a single turn may wait out in the gate before the error goes back to Codex. */
 const MAX_THROTTLE_REQUEUES = 12;
 /**
@@ -226,7 +231,40 @@ export class LauncherBrowserHelperClient {
   private readonly pending = new Map<string, PendingTurn>();
   private helperFeatures = new Set<string>();
 
-  constructor(private readonly config: ResolvedBrowserConfig) {}
+  private unresponsiveWatch?: ReturnType<typeof setInterval>;
+
+  constructor(
+    private readonly config: ResolvedBrowserConfig,
+    private readonly unresponsiveAfterMs = HELPER_UNRESPONSIVE_MS,
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  /**
+   * The helper heartbeats every 10s from inside its observation loop, also while Codex runs a tool.
+   * Silence for minutes means that loop is stuck on a page that stopped responding (seen on Mars:
+   * a tab frozen on "Loading" for 30 minutes while Codex waited on the bridge's own heartbeats).
+   * Such a turn is aborted with a retryable error so Codex starts it again on a fresh surface.
+   */
+  checkUnresponsiveTurns(): void {
+    const now = this.now();
+    for (const [id, pending] of this.pending) {
+      if (!pending.sent || pending.lastHelperEventAt === undefined) continue;
+      if (now - pending.lastHelperEventAt < this.unresponsiveAfterMs) continue;
+      console.warn(`[chatgpt-web] browser turn ${id} unresponsive for `
+        + `${Math.round((now - pending.lastHelperEventAt) / 1000)}s on ${pending.host ?? "the browser host"}: aborting`);
+      void this.send({ type: "abort", id }).catch(() => {});
+      this.finishWithError(id, new ChatGptWebAdapterError(
+        "The ChatGPT page stopped responding during the turn. It was stopped so it can run again.",
+        { status: 504, errorType: "server_error", code: "chatgpt_page_unresponsive", retryable: true },
+      ));
+    }
+  }
+
+  private watchUnresponsiveTurns(): void {
+    if (this.unresponsiveWatch) return;
+    this.unresponsiveWatch = setInterval(() => this.checkUnresponsiveTurns(), 30_000);
+    this.unresponsiveWatch.unref?.();
+  }
 
   /**
    * The helper that shipped with this daemon, when one sits beside its own entrypoint.
@@ -364,6 +402,8 @@ export class LauncherBrowserHelperClient {
         // Setting this before the synchronous write call makes an abort either prevent dispatch or
         // queue an `abort` after the `run` frame; it can never overtake the run frame in the pipe.
         pending.sent = true;
+        pending.lastHelperEventAt = this.now();
+        this.watchUnresponsiveTurns();
         const progressForwarding = new AbortController();
         pending.progressForwarding = progressForwarding;
         void this.send({
@@ -515,6 +555,7 @@ export class LauncherBrowserHelperClient {
     }
     const pending = this.pending.get(message.id);
     if (!pending) return;
+    pending.lastHelperEventAt = this.now();
     if (message.type === "event") {
       if (message.event === "heartbeat") pending.turn.onHeartbeat?.();
       else if (message.event === "tool_batch_observed") {

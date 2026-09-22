@@ -309,7 +309,12 @@ function submittedTurnFailure(session: ChatGptTurnSession, error: unknown): Erro
       status: 502,
       errorType: "server_error",
       code: ambiguous ? "chatgpt_submission_ambiguous" : "chatgpt_submitted_turn_failed",
-      retryable: false,
+      // A turn that failed after ChatGPT accepted it is retryable: the browser session is retired and
+      // Codex's retry, which carries the whole conversation, starts a fresh surface. Non-retryable
+      // made every Codex retry replay this same failure and left long-running goals blocked. The
+      // cost is that a tool call the lost turn had already made may run again. An ambiguous send
+      // stays non-retryable: resending could deliver the same prompt twice.
+      retryable: !ambiguous,
       cause: normalized,
     },
   );

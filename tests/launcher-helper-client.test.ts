@@ -527,3 +527,59 @@ describe("admission requeue on a throttle", () => {
     await expect(client.run(turn() as never)).rejects.toThrow("too many requests");
   });
 });
+
+describe("unresponsive helper watchdog", () => {
+  function client(now: { value: number }) {
+    const created = new LauncherBrowserHelperClient({
+      appName: "Codex Native2", browserHost: "launcher", browserHostDescriptorPath: "/durable/launcher.json",
+      storageStatePath: "/durable/unused.json", chromeExecutablePath: "/durable/chrome", headed: true, autoApproveToolCalls: false,
+    }, 5 * 60_000, () => now.value);
+    const internal = created as unknown as {
+      pending: Map<string, unknown>;
+      send(message: Record<string, unknown>): Promise<void>;
+      handleLine(child: unknown, line: string): void;
+      child: unknown;
+    };
+    const sent: Record<string, unknown>[] = [];
+    internal.send = async message => { sent.push(message); };
+    return { created, internal, sent };
+  }
+  const pendingTurn = (resolve: (v: string) => void, reject: (e: Error) => void, lastHelperEventAt: number) => ({
+    turn: {
+      traceId: "stuck-1", modelId: "chatgpt-web/high",
+      capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+      prepare: async () => ({ text: "x", images: [], release() {} }),
+      onTextDelta() {},
+    },
+    resolve, reject, sent: true, lastHelperEventAt,
+  });
+
+  test("a sent turn whose helper goes silent for five minutes is aborted with a retryable error", async () => {
+    const now = { value: 1_000_000 };
+    const { created, internal, sent } = client(now);
+    const result = new Promise<string>((resolve, reject) => internal.pending.set("stuck-1", pendingTurn(resolve, reject, now.value)));
+    now.value += 4 * 60_000;
+    created.checkUnresponsiveTurns();
+    expect(internal.pending.has("stuck-1")).toBe(true);           // four minutes: still waiting
+    now.value += 61_000;
+    created.checkUnresponsiveTurns();
+    const error = await result.then(() => undefined, failure => failure);
+    expect(error).toBeInstanceOf(ChatGptWebAdapterError);
+    expect(error).toMatchObject({ code: "chatgpt_page_unresponsive", retryable: true });
+    expect(sent).toContainEqual({ type: "abort", id: "stuck-1" });
+  });
+
+  test("helper heartbeats keep a long turn alive", () => {
+    const now = { value: 1_000_000 };
+    const { created, internal } = client(now);
+    const child = {};
+    internal.child = child;
+    internal.pending.set("stuck-1", pendingTurn(() => {}, () => {}, now.value));
+    for (let minute = 0; minute < 12; minute += 1) {
+      now.value += 60_000;
+      internal.handleLine(child, JSON.stringify({ type: "event", id: "stuck-1", event: "heartbeat" }));
+      created.checkUnresponsiveTurns();
+    }
+    expect(internal.pending.has("stuck-1")).toBe(true);
+  });
+});
