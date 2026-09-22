@@ -49,6 +49,25 @@ describe("ChatGPT picker model", () => {
     expect(latest.state.clicks).toEqual([]);
   });
 
+  test("a row that refuses a plain click is selected with a forced click", async () => {
+    const state = { checked: 0, attempts: [] as string[] };
+    const items = {
+      count: async () => 2,
+      nth: (index: number) => ({
+        innerText: async () => ["Latest", "GPT-5.6 Sol"][index]!,
+        getAttribute: async (name: string) => (name === "aria-checked" ? String(state.checked === index) : null),
+        isVisible: async () => true,
+        click: async (options?: { force?: boolean }) => {
+          state.attempts.push(options?.force ? "force" : "plain");
+          if (!options?.force) throw new Error("locator.click: Timeout 1500ms exceeded.");
+          state.checked = index;
+        },
+      }),
+    };
+    expect(await holdChatGptPickerModel({ locator: () => items } as never, "sol")).toBe(true);
+    expect(state.attempts).toEqual(["plain", "force"]);
+  });
+
   test("a default turn moves the picker back to Latest after a Sol run", async () => {
     const back = picker(LABELS, 1);
     expect(await holdChatGptPickerModel(back.menu, "latest")).toBe(true);

@@ -856,7 +856,19 @@ export async function holdChatGptPickerModel(
     throw chatGptModelControlUnavailableError("ChatGPT's model picker does not offer GPT-5.6 Sol");
   }
   if (await target.getAttribute("aria-checked") === "true") return false;
-  await target.click({ timeout: 5_000 });
+  // The picker animates in and keeps the effort slider in the same menu, so Playwright's
+  // actionability wait can time out on a row that is already usable (seen on Mars: a plain click
+  // timed out every time). Try a plain click briefly, then a forced one, then the keyboard.
+  try {
+    await target.click({ timeout: 1_500 });
+  } catch {
+    try {
+      await target.click({ force: true, timeout: 1_500 });
+    } catch {
+      await target.focus({ timeout: 1_500 });
+      await target.press("Enter", { timeout: 1_500 });
+    }
+  }
   await captureDiagnostic?.(`picker-model-${webModel}-selected`);
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
