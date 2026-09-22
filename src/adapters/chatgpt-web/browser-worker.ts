@@ -857,17 +857,13 @@ export async function holdChatGptPickerModel(
   }
   if (await target.getAttribute("aria-checked") === "true") return false;
   // The picker animates in and keeps the effort slider in the same menu, so Playwright's
-  // actionability wait can time out on a row that is already usable (seen on Mars: a plain click
-  // timed out every time). Try a plain click briefly, then a forced one, then the keyboard.
+  // actionability wait timed out on this row every time on Mars, and a forced pointer click at its
+  // centre did not register either. The row's own DOM click selects it (verified on the live
+  // picker: the row turns checked and the menu stays open), so fall back to that.
   try {
     await target.click({ timeout: 1_500 });
   } catch {
-    try {
-      await target.click({ force: true, timeout: 1_500 });
-    } catch {
-      await target.focus({ timeout: 1_500 });
-      await target.press("Enter", { timeout: 1_500 });
-    }
+    await target.evaluate(element => (element as HTMLElement).click());
   }
   await captureDiagnostic?.(`picker-model-${webModel}-selected`);
   const deadline = Date.now() + 5_000;
