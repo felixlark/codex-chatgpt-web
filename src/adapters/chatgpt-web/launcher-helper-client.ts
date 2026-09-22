@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { readAnyLauncherBrowserHostDescriptor, rememberLauncherHostAffinity, selectLauncherHost } from "./launcher-host-pool";
+import { quarantineLauncherHost, readAnyLauncherBrowserHostDescriptor, rememberLauncherHostAffinity, selectLauncherHost } from "./launcher-host-pool";
 import { existsSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -211,7 +211,7 @@ const SURFACE_RETRY_DELAY_MS = 60_000;
 
 function isChatGptSurfaceUnavailableError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /login is expired or the Temporary Chat surface is unavailable|could not load the account subscription|personalization preflight exceeded its readiness deadline|retained conversation lost its connector/i
+  return /login is expired or the Temporary Chat surface is unavailable|could not load the account subscription|personalization preflight exceeded its readiness deadline|retained conversation lost its connector|page\.goto: net::ERR_ABORTED/i
     .test(message);
 }
 
@@ -340,6 +340,7 @@ export class LauncherBrowserHelperClient {
     // turn; surfacing the error instead spends Codex's few retries in seconds and leaves goals
     // blocked for the rest of the throttle.
     let surfaceRetries = 0;
+    let lastHost: string | undefined;
     for (let requeues = 0; ; requeues += 1) {
       const release = await admission.acquire(turn.conversationKey ?? turn.traceId, turn.traceId, turn.abortSignal, {
         ...(turn.threadId ? { threadId: turn.threadId } : {}),
@@ -349,7 +350,10 @@ export class LauncherBrowserHelperClient {
       let requeue = false;
       let refund = false;
       try {
-        return await this.runAdmitted(observed, host => admission.noteHost(turn.traceId, host));
+        return await this.runAdmitted(observed, host => {
+          lastHost = host;
+          admission.noteHost(turn.traceId, host);
+        });
       } catch (error) {
         failure = error;
         const unsent = !submitted && !turn.abortSignal?.aborted;
@@ -360,6 +364,11 @@ export class LauncherBrowserHelperClient {
           // The turn never reached ChatGPT, so run it again (no account cooldown).
           surfaceRetries += 1;
           requeue = unsent && surfaceRetries <= MAX_SURFACE_RETRIES;
+          if (lastHost && this.config.browserHostPool?.length) {
+            quarantineLauncherHost(lastHost);
+            console.warn(`[chatgpt-web] launcher host ${lastHost} failed before submission; `
+              + "left out of new turns for 10 minutes");
+          }
           refund = unsent;                  // nothing reached ChatGPT: give the slot back
         }
         if (!requeue) throw error;

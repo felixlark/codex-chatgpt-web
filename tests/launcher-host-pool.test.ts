@@ -4,6 +4,7 @@ import {
   readAnyLauncherBrowserHostDescriptor,
   clearLauncherHostAffinity,
   launcherHostForConversation,
+  quarantineLauncherHost,
   rememberLauncherHostAffinity,
   selectLauncherHost,
 } from "../src/adapters/chatgpt-web/launcher-host-pool";
@@ -87,4 +88,21 @@ test("the browser helper starts from any live launcher, not only the primary", (
     .toEqual({ host: "/hosts/beta.json" });
   expect(() => readAnyLauncherBrowserHostDescriptor("/hosts/dead-primary.json", ["/hosts/dead.json"], descriptors))
     .toThrow("descriptor is not live: /hosts/dead-primary.json");
+});
+
+test("a quarantined host is skipped, even by a conversation that stuck to it, until every host is", () => {
+  clearLauncherHostAffinity();
+  const read = () => ({});
+  const idle = () => 0;
+  rememberLauncherHostAffinity("conv", "/gamma");
+  quarantineLauncherHost("/gamma");
+  expect(selectLauncherHost({ primary: "/alpha", pool: ["/beta", "/gamma"], activeTurns: idle, conversationKey: "conv", read }))
+    .toBe("/alpha");
+  quarantineLauncherHost("/alpha");
+  expect(selectLauncherHost({ primary: "/alpha", pool: ["/beta", "/gamma"], activeTurns: idle, read })).toBe("/beta");
+  quarantineLauncherHost("/beta");
+  // Nothing healthy is left: fall back to every live host instead of failing.
+  expect(selectLauncherHost({ primary: "/alpha", pool: ["/beta", "/gamma"], activeTurns: idle, conversationKey: "conv", read }))
+    .toBe("/gamma");
+  clearLauncherHostAffinity();
 });

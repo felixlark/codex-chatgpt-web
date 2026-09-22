@@ -34,6 +34,28 @@ export function launcherHostForConversation(conversationKey: string | undefined,
 /** Test hook: forget every conversation affinity. */
 export function clearLauncherHostAffinity(): void {
   affinity.clear();
+  quarantine.clear();
+}
+
+/**
+ * A launcher whose page failed before a prompt could be sent (signed out, subscription not loaded,
+ * navigation aborted) is left out of new turns for a while. Selection alone would keep choosing it:
+ * an idle signed-out host always has the fewest turns, and a conversation that first landed there
+ * sticks to it (on Mars one run's six attempts all went to the signed-out gamma).
+ */
+const LAUNCHER_HOST_QUARANTINE_MS = 10 * 60_000;
+const quarantine = new Map<string, number>();
+
+export function quarantineLauncherHost(host: string, now = Date.now()): void {
+  quarantine.set(host, now + LAUNCHER_HOST_QUARANTINE_MS);
+}
+
+function quarantined(host: string, now: number): boolean {
+  const until = quarantine.get(host);
+  if (until === undefined) return false;
+  if (until > now) return true;
+  quarantine.delete(host);
+  return false;
 }
 
 type DescriptorReader = (path: string) => unknown;
@@ -93,7 +115,11 @@ export function selectLauncherHost(options: {
   conversationKey?: string;
   read?: DescriptorReader;
 }): string {
-  const hosts = availableLauncherHosts(options.primary, options.pool, options.read);
+  const live = availableLauncherHosts(options.primary, options.pool, options.read);
+  const now = Date.now();
+  const healthy = live.filter(host => !quarantined(host, now));
+  // With every host quarantined, fall back to all of them rather than failing outright.
+  const hosts = healthy.length > 0 ? healthy : live;
   const sticky = launcherHostForConversation(options.conversationKey);
   if (sticky && hosts.includes(sticky)) return sticky;
   let best = hosts[0]!;
