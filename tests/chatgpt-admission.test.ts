@@ -167,6 +167,21 @@ describe("ChatGPT account admission", () => {
     expect(await admittedKeys(turns)).toEqual([true, true]);
   });
 
+  test("the 60-minute window holds turns the 10- and 30-minute windows would still admit", async () => {
+    const { admission, advance } = harness({ maxConcurrent: 100 });
+    for (let index = 0; index < ADMISSION_SEED.req60; index += 1) {
+      (await admission.acquire(`h${index}`, `h${index}`))();
+      advance(2.5 * 60_000);                                       // 20 turns over 50 minutes
+    }
+    const snapshot = admission.snapshot();
+    expect(snapshot.recent10).toBeLessThan(ADMISSION_SEED.req10);
+    expect(snapshot.recent30).toBeLessThan(snapshot.budget.req30);
+    const late = admission.acquire("late", "late");
+    expect(await admittedKeys([late])).toEqual([false]);
+    advance(10 * 60_000 + 100);                                    // the first turn leaves the hour
+    expect(await admittedKeys([late])).toEqual([true]);
+  });
+
   test("a refunded turn does not count against the budget", async () => {
     const { admission } = harness({ maxConcurrent: 100 });
     for (let index = 0; index < 5; index += 1) (await admission.acquire(`r${index}`, `r${index}`))("page failed", true);

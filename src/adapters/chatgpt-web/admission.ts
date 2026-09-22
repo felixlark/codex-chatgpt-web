@@ -31,13 +31,22 @@ export interface AdmissionBudget {
   req10: number;
   /** Maximum turns admitted in any 30-minute window. */
   req30: number;
+  /**
+   * Maximum turns admitted in any 60-minute window. On Mars (2026-09-22) the long throttles came
+   * after about 20 accepted prompts within an hour, which the 10/30-minute windows still allowed.
+   */
+  req60: number;
 }
 
-export const ADMISSION_SEED: AdmissionBudget = { req10: 14, req30: 30 };
-export const ADMISSION_FLOOR: AdmissionBudget = { req10: 6, req30: 15 };
-export const ADMISSION_CEILING: AdmissionBudget = { req10: 24, req30: 60 };
+export const ADMISSION_SEED: AdmissionBudget = { req10: 14, req30: 30, req60: 20 };
+export const ADMISSION_FLOOR: AdmissionBudget = { req10: 6, req30: 15, req60: 10 };
+export const ADMISSION_CEILING: AdmissionBudget = { req10: 24, req30: 60, req60: 40 };
 const TEN_MINUTES = 10 * 60_000;
 const THIRTY_MINUTES = 30 * 60_000;
+const SIXTY_MINUTES = 60 * 60_000;
+const WINDOWS: Array<[keyof AdmissionBudget, number]> = [
+  ["req10", TEN_MINUTES], ["req30", THIRTY_MINUTES], ["req60", SIXTY_MINUTES],
+];
 export const COOLDOWN_MS = 3 * 60_000;
 export const PROBES_TO_REOPEN = 3;
 const COOLDOWN_CAP_MS = 60 * 60_000;
@@ -189,17 +198,17 @@ export class ChatGptAdmission {
     this.state.cooldownUntil = now + this.state.cooldownMs;
     this.state.lastThrottleAt = now;
     this.state.lastAdjustAt = now;
-    this.state.budget = {
-      req10: Math.max(ADMISSION_FLOOR.req10, Math.floor(this.state.budget.req10 * 0.7)),
-      req30: Math.max(ADMISSION_FLOOR.req30, Math.floor(this.state.budget.req30 * 0.7)),
-    };
+    this.state.budget = scaleBudget(this.state.budget, 0.7);
     this.write();
     this.log(`[chatgpt-web] admission throttled: cooldown ${Math.round(this.state.cooldownMs / 60_000)}m, `
-      + `budget ${this.state.budget.req10}/10m ${this.state.budget.req30}/30m`);
+      + `budget ${this.state.budget.req10}/10m ${this.state.budget.req30}/30m ${this.state.budget.req60}/60m`);
     this.schedule();
   }
 
-  snapshot(): { budget: AdmissionBudget; running: number; queued: number; cooldownUntil: number; recent10: number; recent30: number } {
+  snapshot(): {
+    budget: AdmissionBudget; running: number; queued: number; cooldownUntil: number;
+    recent10: number; recent30: number; recent60: number;
+  } {
     const now = this.now();
     this.prune(now);
     return {
@@ -207,8 +216,9 @@ export class ChatGptAdmission {
       running: this.running,
       queued: [...this.queues.values()].reduce((sum, queue) => sum + queue.length, 0),
       cooldownUntil: this.state.cooldownUntil,
-      recent10: this.state.admitted.filter(at => at > now - TEN_MINUTES).length,
-      recent30: this.state.admitted.length,
+      recent10: this.admittedWithin(now, TEN_MINUTES),
+      recent30: this.admittedWithin(now, THIRTY_MINUTES),
+      recent60: this.state.admitted.length,
     };
   }
 
@@ -270,8 +280,11 @@ export class ChatGptAdmission {
   private canAdmit(now: number): boolean {
     if (this.running >= this.options.maxConcurrent || now < this.state.cooldownUntil) return false;
     if (this.state.probesNeeded > 0 && this.probeTraceId !== undefined) return false;
-    const recent10 = this.state.admitted.filter(at => at > now - TEN_MINUTES).length;
-    return recent10 < this.state.budget.req10 && this.state.admitted.length < this.state.budget.req30;
+    return WINDOWS.every(([key, span]) => this.admittedWithin(now, span) < this.state.budget[key]);
+  }
+
+  private admittedWithin(now: number, span: number): number {
+    return this.state.admitted.filter(at => at > now - span).length;
   }
 
   private next(): Waiter | undefined {
@@ -312,10 +325,10 @@ export class ChatGptAdmission {
     const now = this.now();
     const candidates: number[] = [];
     if (now < this.state.cooldownUntil) candidates.push(this.state.cooldownUntil);
-    const recent10 = this.state.admitted.filter(at => at > now - TEN_MINUTES);
-    if (recent10.length >= this.state.budget.req10) candidates.push(recent10[recent10.length - this.state.budget.req10]! + TEN_MINUTES);
-    if (this.state.admitted.length >= this.state.budget.req30) {
-      candidates.push(this.state.admitted[this.state.admitted.length - this.state.budget.req30]! + THIRTY_MINUTES);
+    for (const [key, span] of WINDOWS) {
+      const inWindow = this.state.admitted.filter(at => at > now - span);
+      const limit = this.state.budget[key];
+      if (inWindow.length >= limit) candidates.push(inWindow[inWindow.length - limit]! + span);
     }
     if (!candidates.length) return;
     const at = Math.max(...candidates);
@@ -325,18 +338,15 @@ export class ChatGptAdmission {
   /** After 30 quiet minutes spent near the limit without a throttle, allow 10% more. */
   private loosen(now: number): void {
     if (now - this.state.lastAdjustAt < LOOSEN_AFTER_MS) return;
-    const busy = this.state.admitted.length >= 0.6 * this.state.budget.req30;
+    const busy = this.admittedWithin(now, THIRTY_MINUTES) >= 0.6 * this.state.budget.req30;
     this.state.lastAdjustAt = now;
     if (!busy) return;
-    this.state.budget = {
-      req10: Math.min(ADMISSION_CEILING.req10, Math.ceil(this.state.budget.req10 * 1.1)),
-      req30: Math.min(ADMISSION_CEILING.req30, Math.ceil(this.state.budget.req30 * 1.1)),
-    };
+    this.state.budget = scaleBudget(this.state.budget, 1.1);
     this.write();
   }
 
   private prune(now: number): void {
-    const cutoff = now - THIRTY_MINUTES;
+    const cutoff = now - SIXTY_MINUTES;
     while (this.state.admitted.length && this.state.admitted[0]! <= cutoff) this.state.admitted.shift();
     const recentCutoff = now - RECENT_MS;
     this.state.recent = this.state.recent
@@ -358,7 +368,11 @@ export class ChatGptAdmission {
         ? Math.min(ADMISSION_CEILING[key], Math.max(ADMISSION_FLOOR[key], Math.floor(value))) : ADMISSION_SEED[key];
       return {
         version: 1,
-        budget: { req10: clamp(parsed.budget.req10, "req10"), req30: clamp(parsed.budget.req30, "req30") },
+        budget: {
+          req10: clamp(parsed.budget.req10, "req10"),
+          req30: clamp(parsed.budget.req30, "req30"),
+          req60: clamp((parsed.budget as Partial<AdmissionBudget>).req60, "req60"),
+        },
         cooldownUntil: typeof parsed.cooldownUntil === "number" ? parsed.cooldownUntil : 0,
         cooldownMs: typeof parsed.cooldownMs === "number"
           ? Math.min(COOLDOWN_CAP_MS, Math.max(COOLDOWN_MS, parsed.cooldownMs)) : COOLDOWN_MS,
@@ -410,6 +424,16 @@ export class ChatGptAdmission {
       // Losing persistence only resets learning; it must never fail a turn.
     }
   }
+}
+
+/** Scale every window by the same factor, within its floor and ceiling. */
+function scaleBudget(budget: AdmissionBudget, factor: number): AdmissionBudget {
+  const round = factor < 1 ? Math.floor : Math.ceil;
+  const scaled = {} as AdmissionBudget;
+  for (const [key] of WINDOWS) {
+    scaled[key] = Math.min(ADMISSION_CEILING[key], Math.max(ADMISSION_FLOOR[key], round(budget[key] * factor)));
+  }
+  return scaled;
 }
 
 export function isChatGptRateLimitError(error: unknown): boolean {
