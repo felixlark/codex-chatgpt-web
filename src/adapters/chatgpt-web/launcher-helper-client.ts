@@ -211,7 +211,7 @@ const SURFACE_RETRY_DELAY_MS = 60_000;
 
 function isChatGptSurfaceUnavailableError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /login is expired or the Temporary Chat surface is unavailable|could not load the account subscription|personalization preflight exceeded its readiness deadline|retained conversation lost its connector|page\.goto: net::ERR_ABORTED/i
+  return /login is expired or the Temporary Chat surface is unavailable|could not load the account subscription|personalization preflight exceeded its readiness deadline|retained conversation lost its connector|page\.goto: net::ERR_ABORTED|browser is busy with session refresh/i
     .test(message);
 }
 
@@ -373,7 +373,8 @@ export class LauncherBrowserHelperClient {
           surfaceRetries += 1;
           requeue = unsent && surfaceRetries <= MAX_SURFACE_RETRIES;
           // A retained chat losing its connector is ChatGPT's per-message binding, not a host fault.
-          const hostFault = !/retained conversation lost its connector/i.test(
+          // A host refreshing its session after a restart is busy for seconds, not broken.
+          const hostFault = !/retained conversation lost its connector|browser is busy with session refresh/i.test(
             error instanceof Error ? error.message : String(error),
           );
           if (hostFault && lastHost && this.config.browserHostPool?.length) {

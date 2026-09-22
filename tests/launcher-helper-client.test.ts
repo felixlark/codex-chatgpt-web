@@ -520,6 +520,23 @@ describe("admission requeue on a throttle", () => {
     expect(always).toBe(13);                             // first try + 12 retries
   });
 
+  test("a host still refreshing its session after a bridge restart is retried with the slot refunded", async () => {
+    // Seen on Mars right after a restart: four turns failed with this before any prompt was sent,
+    // were not retried, and each kept its admission slot, filling the 60-minute window.
+    const { client, internal, admission } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new Error("Launcher browser control channel failed: HTTP 400: ChatGPT browser is busy with session refresh");
+      }
+      return "done";
+    };
+    expect(await client.run(turn() as never)).toBe("done");
+    expect(attempts).toBe(2);
+    expect(admission.snapshot().recent60).toBe(1);
+  });
+
   test("a throttle after Send was pressed is not run again, even before ChatGPT confirmed it", async () => {
     const { client, internal } = gatedClient();
     let attempts = 0;
