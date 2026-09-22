@@ -199,15 +199,33 @@ const HELPER_UNRESPONSIVE_MS = 5 * 60_000;
 /** Throttles a single turn may wait out in the gate before the error goes back to Codex. */
 const MAX_THROTTLE_REQUEUES = 12;
 /**
- * First-load failures of a freshly started host (signed-out render, subscription not loaded; both
- * cleared by the next load) a turn may retry before the error goes back to Codex.
+ * Page failures before submission a turn may retry before the error goes back to Codex. A freshly
+ * (re)started host's first load (signed-out render, subscription not loaded) clears on the next
+ * load, so the first retries are immediate. A Cloudflare check in front of ChatGPT (seen on Mars:
+ * "Verifying..." for minutes, personalization preflight timing out behind it) needs time or a person,
+ * so later retries wait SURFACE_RETRY_DELAY_MS each: about ten minutes in all.
  */
-const MAX_SURFACE_RETRIES = 2;
+const MAX_SURFACE_RETRIES = 12;
+const IMMEDIATE_SURFACE_RETRIES = 2;
+const SURFACE_RETRY_DELAY_MS = 60_000;
 
 function isChatGptSurfaceUnavailableError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /login is expired or the Temporary Chat surface is unavailable|could not load the account subscription/i
+  return /login is expired or the Temporary Chat surface is unavailable|could not load the account subscription|personalization preflight exceeded its readiness deadline/i
     .test(message);
+}
+
+function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0 || signal?.aborted) return Promise.resolve();
+  return new Promise(resolve => {
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    }
+    signal?.addEventListener("abort", done, { once: true });
+  });
 }
 
 /**
@@ -237,6 +255,7 @@ export class LauncherBrowserHelperClient {
     private readonly config: ResolvedBrowserConfig,
     private readonly unresponsiveAfterMs = HELPER_UNRESPONSIVE_MS,
     private readonly now: () => number = Date.now,
+    private readonly surfaceRetryDelayMs = SURFACE_RETRY_DELAY_MS,
   ) {}
 
   /**
@@ -337,8 +356,7 @@ export class LauncherBrowserHelperClient {
           admission.noteThrottle();
           requeue = unsent && requeues < MAX_THROTTLE_REQUEUES;
         } else if (isChatGptSurfaceUnavailableError(error)) {
-          // A freshly (re)started host sometimes renders its first ChatGPT load signed out and is
-          // fine on the next one; the turn never reached ChatGPT, so run it again (no cooldown).
+          // The turn never reached ChatGPT, so run it again (no account cooldown).
           surfaceRetries += 1;
           requeue = unsent && surfaceRetries <= MAX_SURFACE_RETRIES;
         }
@@ -348,6 +366,9 @@ export class LauncherBrowserHelperClient {
       }
       console.info(`[chatgpt-web] admission turn ${turn.traceId} failed before ChatGPT accepted it `
         + `(${failure instanceof Error ? failure.message.slice(0, 80) : "error"}): back in the queue`);
+      if (surfaceRetries > IMMEDIATE_SURFACE_RETRIES && isChatGptSurfaceUnavailableError(failure)) {
+        await sleepUnlessAborted(this.surfaceRetryDelayMs, turn.abortSignal);
+      }
     }
   }
 

@@ -460,7 +460,7 @@ describe("admission requeue on a throttle", () => {
     const client = new LauncherBrowserHelperClient({
       appName: "Codex Native2", browserHost: "launcher", browserHostDescriptorPath: "/durable/launcher.json",
       storageStatePath: "/durable/unused.json", chromeExecutablePath: "/durable/chrome", headed: true, autoApproveToolCalls: false,
-    });
+    }, undefined, undefined, 0);
     const internal = client as unknown as {
       ensureChild(): Promise<void>;
       runAdmitted(turn: { onSubmitted?: () => void }, onHost?: (host: string) => void): Promise<string>;
@@ -497,25 +497,27 @@ describe("admission requeue on a throttle", () => {
     expect(attempts).toBe(2);
   });
 
-  test("a signed-out surface before submission is retried at most twice, without a cooldown", async () => {
+  test("page failures before submission are retried (twelve times at most), without a cooldown", async () => {
     const { client, internal, admission } = gatedClient();
     let attempts = 0;
     internal.runAdmitted = async () => {
       attempts += 1;
       if (attempts === 1) throw new Error("ChatGPT web login is expired or the Temporary Chat surface is unavailable");
       if (attempts === 2) throw new Error("ChatGPT could not load the account subscription. Reload ChatGPT inside the launcher and retry");
+      if (attempts === 3) throw new Error("ChatGPT personalization preflight exceeded its readiness deadline");
       return "done";
     };
     expect(await client.run(turn() as never)).toBe("done");
-    expect(attempts).toBe(3);
+    expect(attempts).toBe(4);
     expect(admission.snapshot().cooldownUntil).toBe(0);
+    const fresh = gatedClient();                          // its own budget: 13 more admissions
     let always = 0;
-    internal.runAdmitted = async () => {
+    fresh.internal.runAdmitted = async () => {
       always += 1;
       throw new Error("ChatGPT web login is expired or the Temporary Chat surface is unavailable");
     };
-    await expect(client.run(turn() as never)).rejects.toThrow("login is expired");
-    expect(always).toBe(3);                              // first try + 2 retries
+    await expect(fresh.client.run(turn() as never)).rejects.toThrow("login is expired");
+    expect(always).toBe(13);                             // first try + 12 retries
   });
 
   test("a throttle after ChatGPT accepted the prompt still goes back to Codex", async () => {
