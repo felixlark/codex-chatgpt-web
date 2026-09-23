@@ -3689,6 +3689,7 @@ export class ChatGptBrowserWorker {
     submissionLifecycle?: Pick<BrowserTurn, "onSendActivated" | "onSubmitted">,
     completionTracker?: ChatGptCompletionTracker,
     recoverObservation?: ChatGptObservationRecovery,
+    requireConnector = false,
   ): Promise<ChatGptSubmissionEvidence> {
     const composer = await this.activeComposer(page);
     const sendButton = composer
@@ -3708,6 +3709,13 @@ export class ChatGptBrowserWorker {
         throw new Error("ChatGPT send button remained disabled after the complete prompt was attached");
       }
       await settleChatGptUi();
+    }
+    // ChatGPT can drop the connector chip between attaching the prompt and enabling Send; the
+    // message then reaches a model with no tools and the turn comes back as an apology. Check here,
+    // where nothing has been sent yet, so the turn is refunded and run again on a fresh chat.
+    if (requireConnector && !await this.connectorIsSelected(composer, abortSignal)) {
+      await captureDiagnostic?.("connector-dropped-before-send");
+      throw new Error("ChatGPT dropped the connector before the prompt was sent");
     }
     await captureDiagnostic?.("send-ready");
     const initialToolBatchRevision = externalProgress?.snapshot().lastToolBatchRevision ?? 0;
@@ -5141,6 +5149,7 @@ export class ChatGptBrowserWorker {
               return recovered;
             }
             : undefined,
+          mode.localTools,
         ),
       );
       console.info(`[chatgpt-web] browser turn ${turn.traceId} submission accepted evidence=${finalSubmissionEvidence}`);

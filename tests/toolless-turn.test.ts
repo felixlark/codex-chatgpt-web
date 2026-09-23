@@ -18,3 +18,14 @@ test("ordinary answers are left alone", () => {
   expect(chatGptAnsweredWithoutTools("The build passed and I committed the fix.")).toBe(false);
   expect(chatGptAnsweredWithoutTools("本地 Codex 工具运行正常，已执行 npm test。")).toBe(false);
 });
+
+test("a connector dropped before Send is a pre-submission failure, so the turn is refunded", async () => {
+  const worker = await Bun.file("src/adapters/chatgpt-web/browser-worker.ts").text();
+  expect(worker).toContain("dropped the connector before the prompt was sent");
+  // The check must sit before Send is activated, or the turn could not be run again.
+  const check = worker.indexOf("dropped the connector before the prompt was sent");
+  const sendActivated = worker.indexOf("submissionLifecycle?.onSendActivated?.()");
+  expect(check).toBeLessThan(sendActivated);
+  const client = await Bun.file("src/adapters/chatgpt-web/launcher-helper-client.ts").text();
+  expect(client).toContain("dropped the connector before the prompt was sent");
+});
