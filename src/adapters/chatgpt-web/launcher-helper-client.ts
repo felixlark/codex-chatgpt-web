@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { noteChatGptRetainedConnectorLost } from "./retained-conversation-health";
 import { quarantineLauncherHost, readAnyLauncherBrowserHostDescriptor, rememberLauncherHostAffinity, selectLauncherHost } from "./launcher-host-pool";
 import { existsSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -209,6 +210,7 @@ const MAX_SURFACE_RETRIES = 12;
 const IMMEDIATE_SURFACE_RETRIES = 2;
 const SURFACE_RETRY_DELAY_MS = 60_000;
 
+
 function isChatGptSurfaceUnavailableError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /login is expired or the Temporary Chat surface is unavailable|could not load the account subscription|personalization preflight exceeded its readiness deadline|retained conversation lost its connector|page\.goto: net::ERR_ABORTED|page\.goto: Timeout \d+ms exceeded|browser stage timed out: (?:browser_page|temporary_chat_preparation)\b|browser is busy with session refresh/i
@@ -369,6 +371,9 @@ export class LauncherBrowserHelperClient {
           admission.noteThrottle();
           requeue = unsent && requeues < MAX_THROTTLE_REQUEUES;
         } else if (isChatGptSurfaceUnavailableError(error)) {
+          if (/retained conversation lost its connector/i.test(
+            error instanceof Error ? error.message : String(error),
+          )) noteChatGptRetainedConnectorLost(turn.threadId);
           // The turn never reached ChatGPT, so run it again (no account cooldown).
           surfaceRetries += 1;
           requeue = unsent && surfaceRetries <= MAX_SURFACE_RETRIES;

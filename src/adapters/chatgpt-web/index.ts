@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { chatGptRetainedConversationUsable } from "./retained-conversation-health";
 import { launcherHostForConversation } from "./launcher-host-pool";
 import { resolve } from "node:path";
 import { isChatGptWebZeroRiskBackendModel } from "../../chatgpt-web-models";
@@ -429,6 +430,7 @@ export function createChatGptWebAdapter(
     const conversationKey = !parsed._compactionRequest
       && parsed.modelId !== CHATGPT_WEB_LUNA_MODEL_ID
       && mode.localTools
+      && chatGptRetainedConversationUsable(identity.threadId)
       && retainedLauncherDescriptor
       ? chatGptConversationKey(checkpointInput.parsed, executionNamespace)
       : undefined;
