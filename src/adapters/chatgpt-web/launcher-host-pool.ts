@@ -118,10 +118,18 @@ export function selectLauncherHost(options: {
   const live = availableLauncherHosts(options.primary, options.pool, options.read);
   const now = Date.now();
   const healthy = live.filter(host => !quarantined(host, now));
-  // With every host quarantined, fall back to all of them rather than failing outright.
-  const hosts = healthy.length > 0 ? healthy : live;
+  // With every host quarantined, fall back to all of them rather than failing outright — but in
+  // order of when each was quarantined, oldest first. Picking the least busy one instead sent every
+  // turn to the hosts that fail in a second (a signed-out host is always the idlest), which is how
+  // three signed-out-or-aborting hosts starved the working one on Mars.
+  const hosts = healthy.length > 0
+    ? healthy
+    : [...live].sort((left, right) => (quarantine.get(left) ?? 0) - (quarantine.get(right) ?? 0));
   const sticky = launcherHostForConversation(options.conversationKey);
   if (sticky && hosts.includes(sticky)) return sticky;
+  // Nothing healthy: the order above is the answer. Load says nothing here, because the hosts that
+  // fail fastest look the idlest.
+  if (healthy.length === 0) return hosts[0]!;
   let best = hosts[0]!;
   for (const host of hosts.slice(1)) {
     if (options.activeTurns(host) < options.activeTurns(best)) best = host;

@@ -106,3 +106,16 @@ test("a quarantined host is skipped, even by a conversation that stuck to it, un
     .toBe("/gamma");
   clearLauncherHostAffinity();
 });
+
+test("with every host quarantined the oldest quarantine is tried first, not the idlest host", () => {
+  clearLauncherHostAffinity();
+  const read = () => ({});
+  // A signed-out host fails in a second, so it is always the idlest: choosing by load sent every
+  // turn back to the broken hosts while the working one carried a turn (Mars, 2026-09-23 09:21).
+  const busy = (host: string) => (host === "/beta" ? 1 : 0);
+  quarantineLauncherHost("/beta", Date.now() - 9 * 60_000);
+  quarantineLauncherHost("/alpha", Date.now() - 60_000);
+  quarantineLauncherHost("/gamma", Date.now());
+  expect(selectLauncherHost({ primary: "/alpha", pool: ["/beta", "/gamma"], activeTurns: busy, read })).toBe("/beta");
+  clearLauncherHostAffinity();
+});
