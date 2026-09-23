@@ -28,6 +28,17 @@ function exhaustedError(entry: RetryBudgetEntry): ChatGptWebAdapterError {
 }
 
 /**
+ * Codex ending its own request retires the turn binding here, and that is also how Codex retries:
+ * counting those against the budget let three Codex-side disconnects exhaust it and block a goal
+ * (crowd-verse, twice on 2026-09-23). They say nothing about whether a fresh attempt can work, so
+ * they stay retryable without spending the budget; Codex's own retry limit still bounds the loop.
+ */
+export function chatGptWebFailureSpendsRetryBudget(error: { message: string }): boolean {
+  return !/retired the turn binding before its tool work completed|could not observe Codex Native turn retirement/i
+    .test(error.message);
+}
+
+/**
  * Tracks only retryable ChatGPT browser failures across adapter instances. The HTTP bridge creates
  * one adapter per request, so this process-local budget must live outside createChatGptWebAdapter.
  */
