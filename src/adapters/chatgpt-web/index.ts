@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { chatGptRetainedConversationUsable } from "./retained-conversation-health";
+import { chatGptAnsweredWithoutTools } from "./toolless-turn";
 import { launcherHostForConversation } from "./launcher-host-pool";
 import { resolve } from "node:path";
 import { isChatGptWebZeroRiskBackendModel } from "../../chatgpt-web-models";
@@ -760,6 +761,16 @@ export function createChatGptWebAdapter(
         throw error;
       }
     };
+    // A turn that never reached its tools produced nothing; make Codex run it again on a fresh
+    // chat instead of accepting the model's "I had no tools" paragraph as this turn's work.
+    const requireToolAccess = (answer: string): string => {
+      if (!activeToken || (broker.toolCallsSeen?.(activeToken) ?? 1) > 0) return answer;
+      if (!chatGptAnsweredWithoutTools(answer)) return answer;
+      throw new ChatGptWebAdapterError(
+        "ChatGPT answered without the local Codex tools. The turn is being run again on a fresh chat.",
+        { status: 502, errorType: "server_error", code: "chatgpt_tools_unavailable", retryable: true },
+      );
+    };
     const browserTurn = cancellableBrowserTurn(trackBrowserOwner(finalizeCheckpoint(worker.run({
       traceId,
       ...(identity.threadId ? { threadId: identity.threadId } : {}),
@@ -785,7 +796,7 @@ export function createChatGptWebAdapter(
         captureLunaCheckpoint: true,
         onLunaCheckpoint: captureCheckpoint,
       } : {}),
-    }))), browserAbort);
+    }).then(requireToolAccess))), browserAbort);
     void browserTurn.browser.catch(error => {
       if (!tokenSettled) {
         tokenSettled = true;

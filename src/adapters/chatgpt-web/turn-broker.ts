@@ -69,6 +69,8 @@ interface TurnChannel {
   queuedCallIds: string[];
   deliveredCallIds: Set<string>;
   invocations: Map<string, PendingInvocation>;
+  /** Every tool call this turn ever made, kept after completion so a tool-less turn can be told apart. */
+  toolCallsSeen: number;
   waiters: Set<ToolWaiter>;
   compactionRequested: boolean;
   compactionResult?: BrokerToolResult;
@@ -227,6 +229,9 @@ export interface TurnBrokerOwner {
   compactionDeliveryCount(token: string): number | Promise<number>;
   beginCompletionFence(token: string): number | undefined | Promise<number | undefined>;
   commitCompletionFence(token: string, revision: number): boolean | Promise<boolean>;
+  /** Tool calls this turn made; zero on a tool-capable turn means it never reached them.
+   * Optional: a remote owner cannot answer it synchronously, and an unknown count is not evidence. */
+  toolCallsSeen?(token: string): number;
   waitForRetirement(token: string, signal?: AbortSignal): Promise<void>;
   revoke(token: string, reason?: Error): void | Promise<void>;
 }
@@ -299,6 +304,7 @@ export class TurnBroker implements TurnBrokerOwner {
       queuedCallIds: [],
       deliveredCallIds: new Set(),
       invocations: new Map(),
+      toolCallsSeen: 0,
       waiters: new Set(),
       compactionRequested: false,
       compactionDeliveryCount: 0,
@@ -607,6 +613,14 @@ export class TurnBroker implements TurnBrokerOwner {
     if (safe.state === "completed" && safe.finalAnswer !== undefined) return Promise.resolve(safe.finalAnswer);
     if (safe.state === "revoked") return Promise.reject(new Error("Zero Risk turn was revoked"));
     return this.waitForSafeState(safe.completionWaiters, signal, "Zero Risk turn completion wait aborted");
+  }
+
+  /**
+   * How many tool calls this turn made. A tool-capable turn that made none reached a ChatGPT
+   * message without its connector (or lost its binding mid-turn) and cannot have done any work.
+   */
+  toolCallsSeen(token: string): number {
+    return this.channels.get(token)?.toolCallsSeen ?? 0;
   }
 
   revoke(token: string, reason = new Error("Codex turn binding was revoked")): void {
@@ -1130,6 +1144,7 @@ export class TurnBroker implements TurnBrokerOwner {
     };
     return new Promise<BrokerToolResult>((resolveInvoke, rejectInvoke) => {
       binding.channel.invocations.set(callId, { request: toolRequest, resolve: resolveInvoke, reject: rejectInvoke });
+      binding.channel.toolCallsSeen += 1;
       binding.channel.queuedCallIds.push(callId);
       console.info(
         `[chatgpt-web] broker trace=${binding.channel.traceId} queued call=${callId.slice(0, 17)} tool=${wireName} waiters=${binding.channel.waiters.size}`,
