@@ -56,3 +56,18 @@ test("failures are classified the way the console shows them", () => {
   expect(chatGptKeepAliveState(new Error("Just a moment... Cloudflare verifying"))).toBe("challenge");
   expect(chatGptKeepAliveState(new Error("connect ECONNREFUSED"))).toBe("error");
 });
+
+test("the real probe holds the host so no turn is admitted onto it mid-check", async () => {
+  const { launcherHostHasTurn, clearLauncherHostAffinity } = await import("../src/adapters/chatgpt-web/launcher-host-pool");
+  const { markLauncherHostBusy } = await import("../src/adapters/chatgpt-web/launcher-host-pool");
+  clearLauncherHostAffinity();
+  const host = hosts[0]!;
+  expect(launcherHostHasTurn(host)).toBe(false);
+  const release = markLauncherHostBusy(host);          // what the default probe does around itself
+  expect(launcherHostHasTurn(host)).toBe(true);
+  release();
+  expect(launcherHostHasTurn(host)).toBe(false);
+  const source = await Bun.file("src/adapters/chatgpt-web/session-keepalive.ts").text();
+  expect(source).toContain("markLauncherHostBusy(host)");
+  expect(source).toContain("timeoutMs: KEEPALIVE_PROBE_TIMEOUT_MS");
+});

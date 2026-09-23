@@ -1,4 +1,5 @@
 import { inspectLauncherBrowserHost } from "../../launcher-browser-host";
+import { markLauncherHostBusy } from "./launcher-host-pool";
 
 /**
  * Browser hosts lose their ChatGPT session between turns, and nothing notices until a turn fails:
@@ -11,6 +12,8 @@ import { inspectLauncherBrowserHost } from "../../launcher-browser-host";
  * and turns "signed out" into something the console can show before a goal pays for it.
  */
 export const KEEPALIVE_INTERVAL_MS = 20 * 60_000;
+/** Long enough for a reload and the picker, short enough that a host is never held for minutes. */
+export const KEEPALIVE_PROBE_TIMEOUT_MS = 60_000;
 
 export type ChatGptKeepAliveState = "ok" | "signed-out" | "challenge" | "busy" | "error";
 
@@ -58,7 +61,16 @@ export class ChatGptSessionKeepAlive {
     // detectCapabilities reloads the ChatGPT home document, which is what actually refreshes the
     // session and the Cloudflare clearance; a DOM-only probe would keep neither warm.
     this.probe = options.probe ?? (async host => {
-      await inspectLauncherBrowserHost(host, { detectCapabilities: true });
+      // The inspection holds the launcher's operation lock while it reloads the home document, so
+      // a turn admitted onto the same host mid-check cannot reach its page (seen on Mars: two CDP
+      // rebinds timed out and a goal was blocked). Count as a turn for the duration, which both
+      // keeps selection away from this host and ends the check with a bounded timeout.
+      const release = markLauncherHostBusy(host);
+      try {
+        await inspectLauncherBrowserHost(host, { detectCapabilities: true, timeoutMs: KEEPALIVE_PROBE_TIMEOUT_MS });
+      } finally {
+        release();
+      }
     });
     this.setTimer = options.setTimer ?? ((callback, ms) => setTimeout(callback, ms));
     this.clearTimer = options.clearTimer ?? (timer => clearTimeout(timer));
