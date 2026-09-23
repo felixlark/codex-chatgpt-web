@@ -213,7 +213,7 @@ const SURFACE_RETRY_DELAY_MS = 60_000;
 
 function isChatGptSurfaceUnavailableError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /login is expired or the Temporary Chat surface is unavailable|could not load the account subscription|personalization preflight exceeded its readiness deadline|retained conversation lost its connector|page\.goto: net::ERR_ABORTED|page\.goto: Timeout \d+ms exceeded|browser stage timed out: (?:browser_page|temporary_chat_preparation)\b|browser is busy with session refresh/i
+  return /login is expired or the Temporary Chat surface is unavailable|could not load the account subscription|personalization preflight exceeded its readiness deadline|retained conversation lost its connector|page\.goto: net::ERR_ABORTED|page\.goto: Timeout \d+ms exceeded|browser stage timed out: (?:browser_page|temporary_chat_preparation)\b|model controls are unavailable|browser is busy with session refresh/i
     .test(message);
 }
 

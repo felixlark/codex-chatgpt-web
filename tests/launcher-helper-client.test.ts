@@ -551,6 +551,20 @@ describe("admission requeue on a throttle", () => {
     expect(attempts).toBe(3);
   });
 
+  test("a model picker that never responds is retried instead of blocking the goal", async () => {
+    // Mars, 09:34: effort selection timed out after 70 s on the one signed-in host and Codex was
+    // told the model was at capacity, which blocked the iOS goal. It happens before any send.
+    const { client, internal } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("ChatGPT model controls are unavailable. Reload ChatGPT and retry the task.");
+      return "done";
+    };
+    expect(await client.run(turn() as never)).toBe("done");
+    expect(attempts).toBe(2);
+  });
+
   test("a throttle after Send was pressed is not run again, even before ChatGPT confirmed it", async () => {
     const { client, internal } = gatedClient();
     let attempts = 0;
