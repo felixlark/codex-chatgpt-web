@@ -6,8 +6,7 @@ import {
   launcherHostForConversation,
   quarantineLauncherHost,
   rememberLauncherHostAffinity,
-  selectLauncherHost,
-} from "../src/adapters/chatgpt-web/launcher-host-pool";
+  selectLauncherHost, usableLauncherHostCount } from "../src/adapters/chatgpt-web/launcher-host-pool";
 
 afterEach(() => clearLauncherHostAffinity());
 
@@ -117,5 +116,17 @@ test("with every host quarantined the oldest quarantine is tried first, not the 
   quarantineLauncherHost("/alpha", Date.now() - 60_000);
   quarantineLauncherHost("/gamma", Date.now());
   expect(selectLauncherHost({ primary: "/alpha", pool: ["/beta", "/gamma"], activeTurns: busy, read })).toBe("/beta");
+  clearLauncherHostAffinity();
+});
+
+test("only live, unquarantined launchers count toward how many turns may run at once", () => {
+  clearLauncherHostAffinity();
+  const read = () => ({});
+  expect(usableLauncherHostCount("/alpha", ["/beta", "/gamma"], read)).toBe(3);
+  quarantineLauncherHost("/alpha");
+  quarantineLauncherHost("/gamma");
+  expect(usableLauncherHostCount("/alpha", ["/beta", "/gamma"], read)).toBe(1);
+  quarantineLauncherHost("/beta");
+  expect(usableLauncherHostCount("/alpha", ["/beta", "/gamma"], read)).toBe(1);   // never zero
   clearLauncherHostAffinity();
 });

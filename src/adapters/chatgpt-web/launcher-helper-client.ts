@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { noteChatGptRetainedConnectorLost } from "./retained-conversation-health";
-import { quarantineLauncherHost, readAnyLauncherBrowserHostDescriptor, rememberLauncherHostAffinity, selectLauncherHost } from "./launcher-host-pool";
+import { quarantineLauncherHost, readAnyLauncherBrowserHostDescriptor, rememberLauncherHostAffinity, selectLauncherHost, usableLauncherHostCount } from "./launcher-host-pool";
 import { existsSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -238,7 +238,9 @@ function sharedAdmission(config: ResolvedBrowserConfig): ChatGptAdmission | unde
   if (process.env.CODEX_CHATGPT_WEB_ADMISSION === "off") return undefined;
   admissionSingleton ??= new ChatGptAdmission({
     ...(process.env.NODE_ENV === "test" ? {} : { statePath: join(getConfigDir(), "runtime", "chatgpt-admission.json") }),
-    maxConcurrent: 1 + (config.browserHostPool?.length ?? 0),
+    maxConcurrent: () => (config.browserHostDescriptorPath
+      ? usableLauncherHostCount(config.browserHostDescriptorPath, config.browserHostPool ?? [])
+      : 1 + (config.browserHostPool?.length ?? 0)),
   });
   return admissionSingleton;
 }

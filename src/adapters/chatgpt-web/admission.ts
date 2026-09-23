@@ -98,7 +98,8 @@ interface Waiter {
 
 export interface AdmissionOptions {
   statePath?: string;
-  maxConcurrent: number;
+  /** A function is re-read on every decision, so the gate follows hosts that come and go. */
+  maxConcurrent: number | (() => number);
   now?: () => number;
   log?: (message: string) => void;
   setTimer?: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
@@ -118,6 +119,11 @@ export class ChatGptAdmission {
   private readonly log: (message: string) => void;
   private readonly setTimer: NonNullable<AdmissionOptions["setTimer"]>;
   private readonly clearTimer: NonNullable<AdmissionOptions["clearTimer"]>;
+
+  private get maxConcurrent(): number {
+    const value = this.options.maxConcurrent;
+    return typeof value === "function" ? Math.max(1, value()) : value;
+  }
 
   constructor(private readonly options: AdmissionOptions) {
     this.now = options.now ?? Date.now;
@@ -278,7 +284,7 @@ export class ChatGptAdmission {
   }
 
   private canAdmit(now: number): boolean {
-    if (this.running >= this.options.maxConcurrent || now < this.state.cooldownUntil) return false;
+    if (this.running >= this.maxConcurrent || now < this.state.cooldownUntil) return false;
     if (this.state.probesNeeded > 0 && this.probeTraceId !== undefined) return false;
     return WINDOWS.every(([key, span]) => this.admittedWithin(now, span) < this.state.budget[key]);
   }
@@ -320,7 +326,7 @@ export class ChatGptAdmission {
   private schedule(): void {
     if (this.timer) this.clearTimer(this.timer);
     this.timer = undefined;
-    if (!this.queues.size || this.running >= this.options.maxConcurrent) return;
+    if (!this.queues.size || this.running >= this.maxConcurrent) return;
     if (this.state.probesNeeded > 0 && this.probeTraceId !== undefined) return;   // acceptance or release pumps
     const now = this.now();
     const candidates: number[] = [];
@@ -415,7 +421,7 @@ export class ChatGptAdmission {
     if (!this.options.statePath) return;
     const live = {
       running: this.running,
-      maxConcurrent: this.options.maxConcurrent,
+      maxConcurrent: this.maxConcurrent,
       queued: [...this.queues.values()].flat().map(waiter => ({
         key: waiter.key, traceId: waiter.traceId, since: waiter.enqueuedAt,
       })),

@@ -108,6 +108,22 @@ export function readAnyLauncherBrowserHostDescriptor<T = LauncherBrowserHostDesc
  * Choose the launcher for a new browser turn: the conversation's own launcher when it is still
  * available, otherwise the live one with the fewest turns in flight (ties keep the primary first).
  */
+/**
+ * How many launchers can really take a turn right now: the live ones that are not quarantined, and
+ * never fewer than one. Running three browser turns at once when only one host is signed in put
+ * three tasks through a single browser, where the model picker and the connector menu then timed
+ * out (Mars, 2026-09-23).
+ */
+export function usableLauncherHostCount(
+  primary: string,
+  pool: readonly string[] = [],
+  read: DescriptorReader = readLauncherBrowserHostDescriptor,
+): number {
+  const now = Date.now();
+  const live = availableLauncherHosts(primary, pool, read);
+  return Math.max(1, live.filter(host => !quarantined(host, now)).length);
+}
+
 export function selectLauncherHost(options: {
   primary: string;
   pool?: readonly string[];
