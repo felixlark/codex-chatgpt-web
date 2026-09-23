@@ -565,6 +565,24 @@ describe("admission requeue on a throttle", () => {
     expect(attempts).toBe(2);
   });
 
+  test("a connector menu that did not list the host's connector is retried", async () => {
+    // Mars, 09:38: the same host had used that connector two minutes earlier, so the menu simply
+    // had not loaded; reporting it to Codex blocked the crowd-verse goal. It happens before send.
+    const { client, internal } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new Error('ChatGPT connector menu opened but exposed no row named "Codex Mars Beta" after 3 complete'
+          + " mention trigger attempt(s); create a connector with that exact name before retrying");
+      }
+      if (attempts === 2) throw new Error("ChatGPT connector menu did not open after 3 complete mention trigger attempt(s)");
+      return "done";
+    };
+    expect(await client.run(turn() as never)).toBe("done");
+    expect(attempts).toBe(3);
+  });
+
   test("a throttle after Send was pressed is not run again, even before ChatGPT confirmed it", async () => {
     const { client, internal } = gatedClient();
     let attempts = 0;
