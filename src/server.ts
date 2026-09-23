@@ -17,8 +17,9 @@ import {
 } from "./adapters/chatgpt-web/environment";
 import { rememberCompactionContinuation } from "./adapters/chatgpt-web/compaction-continuation";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./bridge";
+import { join } from "node:path";
 import type { AppConfig } from "./config";
-import { providerConfig } from "./config";
+import { atomicWriteFile, getConfigDir, providerConfig } from "./config";
 import { AsyncEventQueue } from "./event-queue";
 import { readJsonRequestBody } from "./http-body";
 import { httpStatusFromTerminalError } from "./lib/errors";
@@ -50,6 +51,8 @@ import { namespacedToolName, type AdapterEvent, type CodexParsedRequest } from "
 import type { CodexProviderConfig } from "./types";
 import type { ProviderAdapter } from "./adapters/base";
 import { VERSION } from "./version";
+import { ChatGptSessionKeepAlive } from "./adapters/chatgpt-web/session-keepalive";
+import { launcherHostHasTurn } from "./adapters/chatgpt-web/launcher-host-pool";
 
 type HttpTrackedEndpoint = "models" | "responses" | "compact" | "search" | "unspecified" | NativeImageEndpoint;
 
@@ -814,6 +817,22 @@ export function startServer(
     throw new Error("DEV harness configuration cannot start a Responses listener");
   }
   const startedAt = Date.now();
+  // Hosts sit idle between turns and quietly lose their ChatGPT session; keep them warm and make a
+  // signed-out host visible before a goal pays for it. Off in tests, which have no launcher.
+  const keepAlive = config.mode === "full" && config.browserHostDescriptorPath && process.env.NODE_ENV !== "test"
+    ? new ChatGptSessionKeepAlive({
+      hosts: () => [config.browserHostDescriptorPath!, ...(config.browserHostPool ?? [])],
+      busy: launcherHostHasTurn,
+      record: results => {
+        try {
+          atomicWriteFile(join(getConfigDir(), "runtime", "chatgpt-keepalive.json"),
+            JSON.stringify({ version: 1, checkedAt: Date.now(), hosts: results }));
+        } catch {
+          // The console simply shows nothing when the file is missing.
+        }
+      },
+    }).start()
+    : undefined;
   const turnBroker = config.mode === "full" ? TurnBroker.forSocket(config.brokerSocketPath) : undefined;
   if (config.mode === "full") {
     void turnBroker!.listen().catch(error => {
@@ -1129,6 +1148,7 @@ export function startServer(
   function shutdown(): void {
     if (shutdownPromise) return;
     draining = true;
+    keepAlive?.stop();
     chatGptTurnSessions.clear();
     flushResponseState();
     shutdownPromise = (async () => {

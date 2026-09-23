@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { noteChatGptRetainedConnectorLost } from "./retained-conversation-health";
-import { quarantineLauncherHost, readAnyLauncherBrowserHostDescriptor, rememberLauncherHostAffinity, selectLauncherHost, usableLauncherHostCount } from "./launcher-host-pool";
+import { markLauncherHostBusy, quarantineLauncherHost, readAnyLauncherBrowserHostDescriptor, rememberLauncherHostAffinity, selectLauncherHost, usableLauncherHostCount } from "./launcher-host-pool";
 import { existsSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -26,6 +26,8 @@ interface PendingTurn {
   /** Last message of any kind (heartbeats included) from the helper for this turn. */
   lastHelperEventAt?: number;
   prepared?: CompiledChatGptWebPrompt & { release: () => void };
+  /** Drops this turn from the host's in-flight count, so the keep-alive knows the host is free. */
+  releaseHost?: () => void;
   localFailure?: Error;
   progressForwarding?: AbortController;
   acknowledgedMultipartStage?: number;
@@ -417,6 +419,7 @@ export class LauncherBrowserHelperClient {
         });
         onHost?.(host);
         const pending: PendingTurn = { turn, resolve: resolveResult, reject: rejectResult, host };
+        pending.releaseHost = markLauncherHostBusy(host);
         this.pending.set(turn.traceId, pending);
         if (turn.retainConversation && turn.conversationKey) rememberLauncherHostAffinity(turn.conversationKey, host);
         if (this.config.browserHostPool?.length) {
@@ -834,6 +837,8 @@ export class LauncherBrowserHelperClient {
     pending.progressForwarding = undefined;
     pending.prepared?.release();
     pending.prepared = undefined;
+    pending.releaseHost?.();
+    pending.releaseHost = undefined;
     this.pending.delete(id);
   }
 

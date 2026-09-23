@@ -31,10 +31,33 @@ export function launcherHostForConversation(conversationKey: string | undefined,
   return entry.host;
 }
 
+/**
+ * Hosts with a turn on them right now. The keep-alive must not reload a browser mid-turn, and the
+ * count lives here rather than in one client instance because the bridge may hold several.
+ */
+const inFlight = new Map<string, number>();
+
+export function markLauncherHostBusy(host: string): () => void {
+  inFlight.set(host, (inFlight.get(host) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const left = (inFlight.get(host) ?? 1) - 1;
+    if (left > 0) inFlight.set(host, left);
+    else inFlight.delete(host);
+  };
+}
+
+export function launcherHostHasTurn(host: string): boolean {
+  return (inFlight.get(host) ?? 0) > 0;
+}
+
 /** Test hook: forget every conversation affinity. */
 export function clearLauncherHostAffinity(): void {
   affinity.clear();
   quarantine.clear();
+  inFlight.clear();
 }
 
 /**
