@@ -8,6 +8,7 @@ import {
   extractChatGptTrailingEnvironmentUpdate,
   extractChatGptCompactionSourceRevision,
   extractChatGptContinuationEnvironmentClaim,
+  extractChatGptSteeringEnvironmentClaim,
   extractChatGptTurnIdentity,
   extractChatGptThreadSpawnLineage,
   extractChatGptRootThreadMetadata,
@@ -162,7 +163,10 @@ export class ChatGptThreadEnvironmentStore {
       const currentCompaction = hasCurrentContext && isChatGptCompactionContinuation(parsed);
       const historicalMessages = hasCurrentContext && !currentCompaction && lineage
         ? unattributedChatGptEnvironmentMessages(parsed) : undefined;
-      if (hasCurrentContext && !currentCompaction && !historicalMessages) {
+      // Upstream: steering can separate the turn's environment from its active instruction.
+      const steeringClaim = hasCurrentContext && !currentCompaction
+        ? extractChatGptSteeringEnvironmentClaim(parsed) : undefined;
+      if (hasCurrentContext && !currentCompaction && !historicalMessages && !steeringClaim) {
         // A mid-turn envelope diff (e.g. only the date changed) that restates exactly the authority
         // this thread already holds is not an update to hide: keep the thread's trusted authority.
         // Anything that differs, or a thread with nothing cached, still fails closed.
@@ -179,7 +183,7 @@ export class ChatGptThreadEnvironmentStore {
         }
         throw this.rejected(parsed, identity, { reason: "current-envelope-unparsed", hasCurrentContext, currentCompaction }, error);
       }
-      const currentClaim = currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed) : undefined;
+      const currentClaim = currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed) : steeringClaim;
       const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
       // Automatic compaction has a current turn_context; standalone compaction has only its
       // source turn_context. Either must be the latest native record, never an arbitrary ancestor.
@@ -197,7 +201,7 @@ export class ChatGptThreadEnvironmentStore {
         });
         if (rolloutEnvironment) {
           if (currentClaim && !sameAuthority(currentClaim, rolloutEnvironment)) {
-            throw new Error("Compaction continuation environment conflicts with its current Codex rollout");
+            throw new Error(`${currentCompaction ? "Compaction continuation" : "Steering"} environment conflicts with its current Codex rollout`);
           }
           this.set(rolloutIdentity.threadId, rolloutEnvironment);
           return rolloutEnvironment;
