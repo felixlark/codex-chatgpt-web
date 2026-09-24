@@ -854,12 +854,27 @@ describe("trusted Codex task environment continuity", () => {
     expect(store.resolve(request)).toMatchObject({ cwd: root, sandboxPolicy: { type: "dangerFullAccess" } });
   });
 
-  test("an envelope followed by a new user instruction is not treated as this turn's diff", () => {
+  test("a resumed goal turn that carries no envelope of its own keeps the thread's authority", () => {
+    // Mars, 2026-09-24 16:47: after the goal was resumed, the request ended with a developer
+    // continuation and the goal prompt again, and the latest envelope was the cwd-less diff from
+    // before. It restates the cached authority, so there is nothing to hide.
     const store = new ChatGptThreadEnvironmentStore();
     store.resolve(currentWire());
     const request = midTurnDiff("thread_current", root);
     (request._rawBody as { input: unknown[] }).input.push(
-      { type: "message", role: "user", content: [{ type: "input_text", text: "A new request" }] },
+      { type: "function_call_output", call_id: "call_1", output: "ok" },
+      { type: "message", role: "developer", content: [{ type: "input_text", text: "Continue toward the goal." }] },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "Keep going" }] },
+    );
+    expect(store.resolve(request)).toMatchObject({ cwd: root, sandboxPolicy: { type: "dangerFullAccess" } });
+  });
+
+  test("a latest envelope that differs from the cached authority is still rejected wherever it sits", () => {
+    const store = new ChatGptThreadEnvironmentStore();
+    store.resolve(currentWire());
+    const request = midTurnDiff("thread_current", tmpdir());
+    (request._rawBody as { input: unknown[] }).input.push(
+      { type: "message", role: "user", content: [{ type: "input_text", text: "Keep going" }] },
     );
     expect(() => store.resolve(request)).toThrow("missing cwd");
   });

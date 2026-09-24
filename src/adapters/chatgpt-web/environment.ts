@@ -781,41 +781,38 @@ function matchesPath(root: string, path: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
-/** Items a running turn produces on its own: tool traffic, reasoning, and the model's own text. */
-function isTurnWorkItem(item: Record<string, unknown> | undefined): boolean {
-  if (!item) return false;
-  if (item.type === "function_call" || item.type === "function_call_output"
-    || item.type === "custom_tool_call" || item.type === "custom_tool_call_output"
-    || item.type === "reasoning") return true;
-  return item.type === "message" && item.role === "assistant";
-}
-
 /**
- * Codex re-sends <environment_context> in the middle of a running turn when part of it changes
- * (seen on Mars: the date rolled over at midnight, after the turn's tool calls). That diff is the
- * last input item, after the active instruction, so the before-the-instruction lookup never sees
- * it. Parse it only when it is exactly that shape: a pure envelope, last in the input, owned by
- * the current turn (or untagged), with the turn's instruction earlier. The caller still decides
- * whether it may be trusted; this never grants authority by itself.
+ * The latest environment envelope in the request, when it is a single pure envelope message.
+ *
+ * Codex re-sends <environment_context> mid-turn when part of it changes (seen on Mars: the date
+ * rolled over), and those diffs omit <cwd>. Only such cwd-less diffs are considered here. Where the
+ * diff lands varies: last in the input, before
+ * the turn's own tool output, or — after a goal is resumed — before a new developer/user pair that
+ * carries no envelope of its own. Position therefore cannot decide it. What decides it is whether
+ * the diff changes the thread's authority: the caller accepts it only when it restates exactly
+ * what is cached. A latest envelope that is composite or does not parse returns undefined, so the
+ * caller fails closed as before. This never grants authority by itself.
  */
 export function extractChatGptTrailingEnvironmentUpdate(parsed: CodexParsedRequest): ChatGptTurnEnvironment | undefined {
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : [];
-  // The diff need not be the very last item: the turn keeps running after Codex appends it, so
-  // tool calls and their outputs can follow (Mars, 2026-09-24 16:35: a function_call_output came
-  // after the envelope). Walk back over those; a new instruction after it means it is not this turn's.
-  let index = input.length - 1;
-  while (index >= 0 && isTurnWorkItem(record(input[index]))) index -= 1;
-  const envelope = record(input[index]);
-  if (envelope?.type !== "message" || envelope.role !== "user") return undefined;
-  const text = rawMessageText(envelope).trim();
+  let latest: Record<string, unknown> | undefined;
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    const item = record(input[index]);
+    if (item?.type === "message" && /<\/?environment_context\b/i.test(rawMessageText(item))) {
+      latest = item;
+      break;
+    }
+  }
+  if (latest?.role !== "user") return undefined;
+  const text = rawMessageText(latest).trim();
   if (!/^<environment_context>[\s\S]*<\/environment_context>$/.test(text)) return undefined;
   if ((text.match(/<environment_context>/g) ?? []).length !== 1) return undefined;
-  const turnId = extractChatGptTurnIdentity(parsed).turnId;
-  const owner = itemTurnId(envelope);
-  if (owner !== undefined && owner !== turnId) return undefined;
+  // Only a diff that leaves <cwd> out is in scope. A complete envelope in an unusual position is a
+  // real claim about where the turn runs, and must still be proven against the native rollout.
+  if (/<\/?cwd\b/i.test(text)) return undefined;
   const metadata = clientTurnMetadata(parsed);
-  if (!input.slice(0, index).some(value => isUserOrParentInstruction(record(value), metadata))) return undefined;
+  if (!input.some(value => isUserOrParentInstruction(record(value), metadata))) return undefined;
   try {
     return parseChatGptEnvironmentText(parsed, text);
   } catch {
