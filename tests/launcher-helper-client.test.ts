@@ -643,7 +643,8 @@ describe("unresponsive helper watchdog", () => {
     const error = await result.then(() => undefined, failure => failure);
     expect(error).toBeInstanceOf(ChatGptWebAdapterError);
     expect(error).toMatchObject({ code: "chatgpt_page_unresponsive", retryable: true });
-    expect(sent).toContainEqual({ type: "abort", id: "stuck-1" });
+    // The cause travels with the abort so the turn's error names it rather than reading generic.
+    expect(sent).toContainEqual({ type: "abort", id: "stuck-1", cause: "the ChatGPT page stopped responding" });
   });
 
   test("helper heartbeats keep a long turn alive", () => {

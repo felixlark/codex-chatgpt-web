@@ -277,7 +277,7 @@ export class LauncherBrowserHelperClient {
       if (now - pending.lastHelperEventAt < this.unresponsiveAfterMs) continue;
       console.warn(`[chatgpt-web] browser turn ${id} unresponsive for `
         + `${Math.round((now - pending.lastHelperEventAt) / 1000)}s on ${pending.host ?? "the browser host"}: aborting`);
-      void this.send({ type: "abort", id }).catch(() => {});
+      void this.send({ type: "abort", id, cause: "the ChatGPT page stopped responding" }).catch(() => {});
       this.finishWithError(id, new ChatGptWebAdapterError(
         "The ChatGPT page stopped responding during the turn. It was stopped so it can run again.",
         { status: 504, errorType: "server_error", code: "chatgpt_page_unresponsive", retryable: true },
@@ -434,12 +434,17 @@ export class LauncherBrowserHelperClient {
               );
               return;
             }
+            const abortCause = turn.abortSignal?.reason instanceof Error
+              ? turn.abortSignal.reason.message : undefined;
+            console.info(`[chatgpt-web] browser turn ${turn.traceId} aborted by the bridge`
+              + `${abortCause ? `: ${abortCause.slice(0, 160)}` : " with no stated reason"}`);
             void this.send({
               type: "abort",
               id: turn.traceId,
               ...(turn.abortSignal?.reason instanceof ChatGptCompactionHandoffAccepted
                 ? { reason: "compaction_handoff_accepted" }
                 : {}),
+              ...(abortCause ? { cause: abortCause } : {}),
             }).catch(error => {
               this.finishWithError(
                 turn.traceId,

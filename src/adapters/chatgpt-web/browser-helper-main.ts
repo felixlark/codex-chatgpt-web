@@ -67,7 +67,7 @@ type InputMessage = RunMessage
   | { type: "completion_fence_begin_ack"; id: string; requestId: number; revision: number | null }
   | { type: "completion_fence_commit_ack"; id: string; requestId: number; committed: boolean }
   | { type: "progress"; id: string; snapshot: ChatGptExternalTurnProgressSnapshot }
-  | { type: "abort"; id: string; reason?: "compaction_handoff_accepted" }
+  | { type: "abort"; id: string; reason?: "compaction_handoff_accepted"; cause?: string }
   | { type: "shutdown" };
 
 let outputFailure: Error | undefined;
@@ -470,9 +470,11 @@ input.on("line", line => {
       );
     }
   } else if (message.type === "abort") {
+    // Keep the cause on the signal: without it every abort reads the same in the turn's error,
+    // which is what made the crowd-verse aborts impossible to attribute (2026-09-24).
     abortControllers.get(message.id)?.abort(message.reason === "compaction_handoff_accepted"
       ? new ChatGptCompactionHandoffAccepted()
-      : undefined);
+      : typeof message.cause === "string" && message.cause ? new Error(message.cause.slice(0, 200)) : undefined);
     preparedSelections.get(message.id)?.cancel();
     const waiter = sendActivationWaiters.get(message.id);
     sendActivationWaiters.delete(message.id);
