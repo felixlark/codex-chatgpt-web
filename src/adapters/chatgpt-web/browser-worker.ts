@@ -1312,15 +1312,27 @@ export const CHATGPT_COMPOSER_SELECT_ALL_KEY = process.platform === "darwin"
   ? "Meta+A"
   : "Control+A";
 
+/** The reason an abort carries is the only way to tell a client hang-up from our own cancellation. */
+function abortReasonSuffix(signal?: AbortSignal): string {
+  const reason = signal?.reason;
+  const message = reason instanceof Error ? reason.message : typeof reason === "string" ? reason : "";
+  return message ? `: ${message.slice(0, 120)}` : "";
+}
+
 function throwIfPromptAttachmentAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) throw new DOMException("ChatGPT prompt attachment aborted", "AbortError");
+  if (signal?.aborted) {
+    throw new DOMException(`ChatGPT prompt attachment aborted${abortReasonSuffix(signal)}`, "AbortError");
+  }
 }
 
 function withBrowserTurnAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
-  if (signal.aborted) return Promise.reject(new DOMException("ChatGPT web turn aborted", "AbortError"));
+  if (signal.aborted) {
+    return Promise.reject(new DOMException(`ChatGPT web turn aborted${abortReasonSuffix(signal)}`, "AbortError"));
+  }
   return new Promise<T>((resolvePromise, rejectPromise) => {
-    const onAbort = () => rejectPromise(new DOMException("ChatGPT web turn aborted", "AbortError"));
+    const onAbort = () => rejectPromise(
+      new DOMException(`ChatGPT web turn aborted${abortReasonSuffix(signal)}`, "AbortError"));
     signal.addEventListener("abort", onAbort, { once: true });
     promise.then(resolvePromise, rejectPromise).finally(() => {
       signal.removeEventListener("abort", onAbort);
