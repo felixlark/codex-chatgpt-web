@@ -840,6 +840,30 @@ describe("trusted Codex task environment continuity", () => {
     });
   });
 
+  test("a mid-turn envelope diff followed by the turn's own tool output still keeps its authority", () => {
+    // Mars, 2026-09-24 16:35: a function_call_output arrived after the cwd-less envelope, so the
+    // envelope was no longer the last item and every retry was rejected with "missing cwd".
+    const store = new ChatGptThreadEnvironmentStore();
+    store.resolve(currentWire());
+    const request = midTurnDiff("thread_current", root);
+    const body = request._rawBody as { input: unknown[] };
+    body.input.push(
+      { type: "function_call", name: "exec_command", call_id: "call_2", arguments: "{}" },
+      { type: "function_call_output", call_id: "call_2", output: "ok" },
+    );
+    expect(store.resolve(request)).toMatchObject({ cwd: root, sandboxPolicy: { type: "dangerFullAccess" } });
+  });
+
+  test("an envelope followed by a new user instruction is not treated as this turn's diff", () => {
+    const store = new ChatGptThreadEnvironmentStore();
+    store.resolve(currentWire());
+    const request = midTurnDiff("thread_current", root);
+    (request._rawBody as { input: unknown[] }).input.push(
+      { type: "message", role: "user", content: [{ type: "input_text", text: "A new request" }] },
+    );
+    expect(() => store.resolve(request)).toThrow("missing cwd");
+  });
+
   test("a mid-turn envelope diff never changes or creates authority", () => {
     const store = new ChatGptThreadEnvironmentStore();
     store.resolve(currentWire());

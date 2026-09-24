@@ -781,6 +781,15 @@ function matchesPath(root: string, path: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
+/** Items a running turn produces on its own: tool traffic, reasoning, and the model's own text. */
+function isTurnWorkItem(item: Record<string, unknown> | undefined): boolean {
+  if (!item) return false;
+  if (item.type === "function_call" || item.type === "function_call_output"
+    || item.type === "custom_tool_call" || item.type === "custom_tool_call_output"
+    || item.type === "reasoning") return true;
+  return item.type === "message" && item.role === "assistant";
+}
+
 /**
  * Codex re-sends <environment_context> in the middle of a running turn when part of it changes
  * (seen on Mars: the date rolled over at midnight, after the turn's tool calls). That diff is the
@@ -792,16 +801,21 @@ function matchesPath(root: string, path: string): boolean {
 export function extractChatGptTrailingEnvironmentUpdate(parsed: CodexParsedRequest): ChatGptTurnEnvironment | undefined {
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : [];
-  const last = record(input[input.length - 1]);
-  if (last?.type !== "message" || last.role !== "user") return undefined;
-  const text = rawMessageText(last).trim();
+  // The diff need not be the very last item: the turn keeps running after Codex appends it, so
+  // tool calls and their outputs can follow (Mars, 2026-09-24 16:35: a function_call_output came
+  // after the envelope). Walk back over those; a new instruction after it means it is not this turn's.
+  let index = input.length - 1;
+  while (index >= 0 && isTurnWorkItem(record(input[index]))) index -= 1;
+  const envelope = record(input[index]);
+  if (envelope?.type !== "message" || envelope.role !== "user") return undefined;
+  const text = rawMessageText(envelope).trim();
   if (!/^<environment_context>[\s\S]*<\/environment_context>$/.test(text)) return undefined;
   if ((text.match(/<environment_context>/g) ?? []).length !== 1) return undefined;
   const turnId = extractChatGptTurnIdentity(parsed).turnId;
-  const owner = itemTurnId(last);
+  const owner = itemTurnId(envelope);
   if (owner !== undefined && owner !== turnId) return undefined;
   const metadata = clientTurnMetadata(parsed);
-  if (!input.slice(0, -1).some(value => isUserOrParentInstruction(record(value), metadata))) return undefined;
+  if (!input.slice(0, index).some(value => isUserOrParentInstruction(record(value), metadata))) return undefined;
   try {
     return parseChatGptEnvironmentText(parsed, text);
   } catch {
