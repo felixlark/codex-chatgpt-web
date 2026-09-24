@@ -811,6 +811,14 @@ describe("trusted Codex task environment continuity", () => {
 
   // Seen on Mars at midnight: Codex re-sent a cwd-less envelope (only the date changed) after the
   // turn's tool calls, and the bridge rejected every retry with "missing cwd", blocking the goal.
+  const followUpFor = (threadId: string): CodexParsedRequest => {
+    const next = currentWire();
+    next._rawBody = {
+      client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: "turn_after" }) },
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "Continue" }] }],
+    };
+    return next;
+  };
   const midTurnDiff = (threadId: string, workspaceRoot: string, extra = ""): CodexParsedRequest => {
     const next = currentWire();
     next._rawBody = {
@@ -877,6 +885,38 @@ describe("trusted Codex task environment continuity", () => {
       { type: "message", role: "user", content: [{ type: "input_text", text: "Keep going" }] },
     );
     expect(() => store.resolve(request)).toThrow("missing cwd");
+  });
+
+  test("a diff that only adds the thread's own visualization directory is accepted and remembered", () => {
+    // Mars, 2026-09-24 16:35: Codex added ~/.codex/visualizations/<date>/<thread> as a workspace
+    // root through a cwd-less diff, and the dev-ops goal was rejected on every retry.
+    const store = new ChatGptThreadEnvironmentStore();
+    store.resolve(currentWire());
+    const own = join(tmpdir(), ".codex", "visualizations", "2026", "09", "22", "thread_current");
+    const request = midTurnDiff("thread_current", root);
+    const body = request._rawBody as { input: Array<{ content?: Array<{ text: string }> }> };
+    const envelope = body.input[body.input.length - 1]!.content![0]!;
+    envelope.text = envelope.text.replace(`<root>${root}</root>`, `<root>${root}</root><root>${own}</root>`);
+    const accepted = store.resolve(request);
+    expect(accepted.cwd).toBe(root);
+    expect(accepted.roots).toContain(own);
+    expect(store.resolve(followUpFor("thread_current")).roots).toContain(own);   // remembered
+
+    // Any other new root is a real widening and still needs proof.
+    const fresh = new ChatGptThreadEnvironmentStore();
+    fresh.resolve(currentWire());
+    const other = midTurnDiff("thread_current", root);
+    const otherBody = other._rawBody as { input: Array<{ content?: Array<{ text: string }> }> };
+    const otherEnvelope = otherBody.input[otherBody.input.length - 1]!.content![0]!;
+    otherEnvelope.text = otherEnvelope.text.replace(`<root>${root}</root>`, `<root>${root}</root><root>${tmpdir()}</root>`);
+    expect(() => fresh.resolve(other)).toThrow("missing cwd");
+    // And another thread's visualization directory is not this thread's.
+    const foreign = midTurnDiff("thread_current", root);
+    const foreignBody = foreign._rawBody as { input: Array<{ content?: Array<{ text: string }> }> };
+    const foreignEnvelope = foreignBody.input[foreignBody.input.length - 1]!.content![0]!;
+    foreignEnvelope.text = foreignEnvelope.text.replace(`<root>${root}</root>`,
+      `<root>${root}</root><root>${own.replace("thread_current", "thread_other")}</root>`);
+    expect(() => fresh.resolve(foreign)).toThrow("missing cwd");
   });
 
   test("a mid-turn envelope diff never changes or creates authority", () => {

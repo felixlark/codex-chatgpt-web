@@ -119,6 +119,26 @@ function authority(environment: ChatGptTurnEnvironment, updatedAt: number): Stor
   };
 }
 
+/** `~/.codex/visualizations/<yyyy>/<mm>/<dd>/<thread id>`: Codex's per-thread scratch directory. */
+function isOwnVisualizationRoot(path: string, threadId: string): boolean {
+  const pattern = new RegExp(`[/\\\\]\\.codex[/\\\\]visualizations[/\\\\]\\d{4}[/\\\\]\\d{2}[/\\\\]\\d{2}[/\\\\]${threadId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`);
+  return pattern.test(path);
+}
+
+function onlyAddsOwnVisualizationRoot(
+  update: ChatGptTurnEnvironment,
+  cached: StoredThreadEnvironment,
+  threadId: string,
+): boolean {
+  if (pathIdentity(update.cwd) !== pathIdentity(cached.cwd)) return false;
+  if (update.sandboxPolicy.type !== cached.sandboxPolicy.type) return false;
+  if (update.sandboxPolicy.type !== "dangerFullAccess" && (cached.sandboxPolicy.type === "dangerFullAccess"
+    || update.sandboxPolicy.networkAccess !== cached.sandboxPolicy.networkAccess)) return false;
+  const known = new Set(cached.roots.map(pathIdentity));
+  const added = update.roots.filter(root => !known.has(pathIdentity(root)));
+  return added.length > 0 && added.every(root => isOwnVisualizationRoot(root, threadId));
+}
+
 function sameAuthority(left: ChatGptTurnEnvironment, right: ChatGptTurnEnvironment): boolean {
   const samePaths = (a: string[], b: string[]): boolean => {
     const expected = new Set(b.map(pathIdentity));
@@ -180,6 +200,14 @@ export class ChatGptThreadEnvironmentStore {
             sandboxPolicy: cached.sandboxPolicy,
             tools: parsed.context.tools ?? [],
           };
+        }
+        // Codex also uses such a diff to add the thread's own visualization scratch directory as a
+        // workspace root (Mars, 2026-09-24: dev-ops was rejected on every retry for it). Accept that
+        // one widening only: same cwd, same sandbox, and nothing new but this thread's directory.
+        if (update && cached && onlyAddsOwnVisualizationRoot(update, cached, identity.threadId)) {
+          const widened: ChatGptTurnEnvironment = { ...update, tools: parsed.context.tools ?? [] };
+          this.set(identity.threadId, widened);
+          return widened;
         }
         throw this.rejected(parsed, identity, { reason: "current-envelope-unparsed", hasCurrentContext, currentCompaction }, error);
       }
