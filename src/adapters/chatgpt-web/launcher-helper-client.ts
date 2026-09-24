@@ -393,6 +393,16 @@ export class LauncherBrowserHelperClient {
           }
           refund = unsent;                  // nothing reached ChatGPT: give the slot back
         }
+        if (!requeue && isChatGptRateLimitError(error) && !unsent) {
+          // Throttled after Send: the turn had started (on Mars a tool call had already run when the
+          // continuation hit the limit), so it must not be replayed here. Passed through as a rate
+          // limit, Codex treats it as final and blocks the goal. As a retryable failure, Codex's
+          // retry enters this gate and waits out the cooldown in the queue instead.
+          throw new ChatGptWebAdapterError(
+            "ChatGPT throttled this turn after it had started. It will run again once the account's cooldown passes.",
+            { status: 503, errorType: "server_error", code: "chatgpt_throttled_after_send", retryable: true },
+          );
+        }
         if (!requeue) throw error;
       } finally {
         release(failure === undefined ? undefined : failure instanceof Error ? failure.message : String(failure), refund);

@@ -591,7 +591,11 @@ describe("admission requeue on a throttle", () => {
       await (sentTurn as { onSendActivated?: () => unknown }).onSendActivated?.();
       throw rateLimited();
     };
-    await expect(client.run(turn() as never)).rejects.toThrow("too many requests");
+    // Not replayed here, and not handed to Codex as a rate limit either: Codex treats that as final
+    // and blocks the goal. A retryable failure makes Codex's retry wait out the cooldown in the gate.
+    const failure = await client.run(turn() as never).catch(error => error);
+    expect(String(failure.message)).toContain("throttled this turn after it had started");
+    expect(failure.retryable).toBe(true);
     expect(attempts).toBe(1);
   });
 
@@ -601,7 +605,9 @@ describe("admission requeue on a throttle", () => {
       submittedTurn.onSubmitted?.();
       throw rateLimited();
     };
-    await expect(client.run(turn() as never)).rejects.toThrow("too many requests");
+    const failure = await client.run(turn() as never).catch(error => error);
+    expect(String(failure.message)).toContain("throttled this turn after it had started");
+    expect(failure.retryable).toBe(true);
   });
 });
 
