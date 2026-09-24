@@ -318,3 +318,26 @@ describe("ChatGPT account admission turn records", () => {
     expect(recent[0]).toMatchObject({ traceId: "open", error: "bridge restarted" });
   });
 });
+
+test("a slot whose turn never finishes is reclaimed, so the queue cannot sit still", async () => {
+  let now = 1_000_000;
+  let timer: (() => void) | undefined;
+  const admission = new ChatGptAdmission({
+    maxConcurrent: 1,
+    now: () => now,
+    log: () => {},
+    setTimer: callback => { timer = callback; return 0 as unknown as ReturnType<typeof setTimeout>; },
+    clearTimer: () => {},
+  });
+  await admission.acquire("key-a", "trace-a");            // admitted, and never released
+  const second = admission.acquire("key-b", "trace-b");
+  let admitted = false;
+  void second.then(() => { admitted = true; });
+  await Bun.sleep(1);
+  expect(admitted).toBe(false);                            // blocked behind the first slot
+  now += 21 * 60_000;                                      // past the stale-slot deadline
+  timer?.();                                               // the scheduled wake-up pumps again
+  await Bun.sleep(1);
+  expect(admitted).toBe(true);
+  expect(admission.snapshot().running).toBe(1);            // only the second turn holds a slot now
+});

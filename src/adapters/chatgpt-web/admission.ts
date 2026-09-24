@@ -47,6 +47,8 @@ const SIXTY_MINUTES = 60 * 60_000;
 const WINDOWS: Array<[keyof AdmissionBudget, number]> = [
   ["req10", TEN_MINUTES], ["req30", THIRTY_MINUTES], ["req60", SIXTY_MINUTES],
 ];
+export /** A browser turn that has not finished in this long is not going to; its slot goes back. */
+const STALE_SLOT_MS = 20 * 60_000;
 export const COOLDOWN_MS = 3 * 60_000;
 export const PROBES_TO_REOPEN = 3;
 const COOLDOWN_CAP_MS = 60 * 60_000;
@@ -108,7 +110,12 @@ export interface AdmissionOptions {
 
 export class ChatGptAdmission {
   private state: AdmissionState;
-  private running = 0;
+  /**
+   * Turns holding a slot right now. A slot that is never released blocks the whole gate: on Mars
+   * the queue sat still for thirteen hours behind one such slot while nothing ran. Keep enough per
+   * slot to reclaim it, and count the set rather than a number that can drift.
+   */
+  private readonly runningTurns = new Map<string, { admittedAt: number; record: AdmissionTurnRecord }>();
   /** The current probe, admitted but not yet accepted by ChatGPT; nothing else is admitted meanwhile. */
   private probeTraceId?: string;
   /** Waiters per task, served round-robin so one busy task cannot starve the others. */
@@ -219,7 +226,7 @@ export class ChatGptAdmission {
     this.prune(now);
     return {
       budget: { ...this.state.budget },
-      running: this.running,
+      running: this.runningTurns.size,
       queued: [...this.queues.values()].reduce((sum, queue) => sum + queue.length, 0),
       cooldownUntil: this.state.cooldownUntil,
       recent10: this.admittedWithin(now, TEN_MINUTES),
@@ -230,13 +237,13 @@ export class ChatGptAdmission {
 
   private pump(): void {
     const now = this.now();
+    this.reapStaleSlots(now);
     this.prune(now);
     this.loosen(now);
     while (this.canAdmit(now)) {
       const waiter = this.next();
       if (!waiter) break;
       if (this.state.probesNeeded > 0) this.probeTraceId = waiter.traceId;
-      this.running += 1;
       this.state.admitted.push(now);
       const admittedAt = now;
       const record: AdmissionTurnRecord = {
@@ -244,6 +251,7 @@ export class ChatGptAdmission {
         ...(waiter.info?.threadId ? { threadId: waiter.info.threadId } : {}),
         ...(waiter.info?.model ? { model: waiter.info.model } : {}),
       };
+      this.runningTurns.set(waiter.traceId, { admittedAt: now, record });
       this.state.recent.push(record);
       this.write();
       if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
@@ -255,7 +263,7 @@ export class ChatGptAdmission {
       waiter.admit((error, refund) => {
         if (released) return;
         released = true;
-        this.running -= 1;
+        this.runningTurns.delete(waiter.traceId);
         if (refund) {
           // The turn failed before any prompt reached ChatGPT: it must not count against the budget.
           const at = this.state.admitted.lastIndexOf(admittedAt);
@@ -276,6 +284,24 @@ export class ChatGptAdmission {
     this.schedule();
   }
 
+  /**
+   * A turn whose release never arrives (a hung browser turn, a client that vanished mid-flight)
+   * would otherwise hold its slot forever. Reclaiming it only allows one more turn to start; the
+   * budget windows still bound the rate, so the cost of being wrong here is small and the cost of
+   * not doing it is a gate that stops for hours.
+   */
+  private reapStaleSlots(now: number): void {
+    for (const [traceId, slot] of this.runningTurns) {
+      if (now - slot.admittedAt < STALE_SLOT_MS) continue;
+      this.runningTurns.delete(traceId);
+      slot.record.endedAt = now;
+      slot.record.error ??= `slot reclaimed after ${Math.round(STALE_SLOT_MS / 60_000)} minutes without a result`;
+      this.log(`[chatgpt-web] admission reclaimed the slot of turn ${traceId}: no result in `
+        + `${Math.round((now - slot.admittedAt) / 60_000)} minutes`);
+      this.write();
+    }
+  }
+
   private findRecord(traceId: string): AdmissionTurnRecord | undefined {
     for (let index = this.state.recent.length - 1; index >= 0; index -= 1) {
       if (this.state.recent[index]!.traceId === traceId) return this.state.recent[index];
@@ -284,7 +310,7 @@ export class ChatGptAdmission {
   }
 
   private canAdmit(now: number): boolean {
-    if (this.running >= this.maxConcurrent || now < this.state.cooldownUntil) return false;
+    if (this.runningTurns.size >= this.maxConcurrent || now < this.state.cooldownUntil) return false;
     if (this.state.probesNeeded > 0 && this.probeTraceId !== undefined) return false;
     return WINDOWS.every(([key, span]) => this.admittedWithin(now, span) < this.state.budget[key]);
   }
@@ -326,7 +352,15 @@ export class ChatGptAdmission {
   private schedule(): void {
     if (this.timer) this.clearTimer(this.timer);
     this.timer = undefined;
-    if (!this.queues.size || this.running >= this.maxConcurrent) return;
+    if (!this.queues.size) return;
+    if (this.runningTurns.size >= this.maxConcurrent) {
+      // Every slot is taken. Normally a release pumps us again, but a turn that never returns would
+      // otherwise stop the gate for good, so wake when the oldest slot becomes reclaimable.
+      const oldest = Math.min(...[...this.runningTurns.values()].map(slot => slot.admittedAt));
+      const at = oldest + STALE_SLOT_MS;
+      this.timer = this.setTimer(() => this.pump(), Math.max(50, at - this.now() + 50));
+      return;
+    }
     if (this.state.probesNeeded > 0 && this.probeTraceId !== undefined) return;   // acceptance or release pumps
     const now = this.now();
     const candidates: number[] = [];
@@ -420,7 +454,7 @@ export class ChatGptAdmission {
   private write(): void {
     if (!this.options.statePath) return;
     const live = {
-      running: this.running,
+      running: this.runningTurns.size,
       maxConcurrent: this.maxConcurrent,
       queued: [...this.queues.values()].flat().map(waiter => ({
         key: waiter.key, traceId: waiter.traceId, since: waiter.enqueuedAt,
