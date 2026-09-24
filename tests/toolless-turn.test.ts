@@ -29,3 +29,12 @@ test("a connector dropped before Send is a pre-submission failure, so the turn i
   const client = await Bun.file("src/adapters/chatgpt-web/launcher-helper-client.ts").text();
   expect(client).toContain("dropped the connector before the prompt was sent");
 });
+
+test("a composer that never appears is retried, because nothing was sent yet", async () => {
+  // Mars, 14:12: prompt_attachment failed with locator.waitFor after 10s and blocked the goal.
+  // Only unsent turns are ever requeued, so matching locator timeouts cannot replay a sent prompt.
+  const client = await Bun.file("src/adapters/chatgpt-web/launcher-helper-client.ts").text();
+  expect(client).toContain("locator\\.waitFor: Timeout");
+  const guard = client.indexOf("const unsent = !submitted && !sendActivated");
+  expect(guard).toBeGreaterThan(-1);
+});
