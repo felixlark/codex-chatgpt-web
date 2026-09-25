@@ -137,6 +137,36 @@ function normalizedToolNamespace(value: unknown): string | undefined {
     : undefined;
 }
 
+/**
+ * What reached the routed model and what did not, by name and type only, logged once per distinct
+ * shape. Without it a tool Codex offers but this parser drops (the in-app browser's REPL was the
+ * case that prompted it) is invisible: the model simply never sees it.
+ */
+let lastToolShape = "";
+function logToolShape(tools: unknown[], kept: CodexTool[]): void {
+  const offered: string[] = [];
+  for (const t of tools) {
+    if (!isObj(t)) continue;
+    if (t.type === "namespace" && Array.isArray(t.tools)) {
+      for (const inner of t.tools as unknown[]) {
+        if (isObj(inner)) offered.push(`${String(t.name)}/${String(inner.name)}:${String(inner.type)}`);
+      }
+    } else {
+      offered.push(`${String(t.name ?? t.type)}:${String(t.type)}`);
+    }
+  }
+  const keptNames = new Set(kept.map(tool => tool.namespace ? `${tool.namespace}/${tool.name}` : tool.name));
+  const dropped = offered.filter(entry => {
+    const [path] = entry.split(":");
+    const name = path!.includes("/") ? path!.split("/").pop()! : path!;
+    return !keptNames.has(path!) && !keptNames.has(name) && ![...keptNames].some(k => k.endsWith(`/${name}`));
+  });
+  const shape = `offered=${offered.length} kept=${kept.length} dropped=[${dropped.join(",")}]`;
+  if (shape === lastToolShape) return;
+  lastToolShape = shape;
+  console.info(`[codex-chatgpt-web] tool_shape ${shape} namespaces=[${offered.filter(e => e.includes("/")).join(",").slice(0, 600)}]`);
+}
+
 function buildTools(tools: unknown[] | undefined): CodexTool[] | undefined {
   if (!tools) return undefined;
   const out: CodexTool[] = [];
@@ -216,6 +246,7 @@ function buildTools(tools: unknown[] | undefined): CodexTool[] | undefined {
     // Only the OpenAI-hosted server-side tools (web_search, image_generation) are intentionally
     // dropped — they're executed by OpenAI and can't be relayed to a routed chat model.
   }
+  logToolShape(tools, out);
   return out.length > 0 ? out : undefined;
 }
 
