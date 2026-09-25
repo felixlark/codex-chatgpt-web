@@ -164,7 +164,7 @@ function logToolShape(tools: unknown[], kept: CodexTool[]): void {
   const shape = `offered=${offered.length} kept=${kept.length} dropped=[${dropped.join(",")}]`;
   if (shape === lastToolShape) return;
   lastToolShape = shape;
-  console.info(`[codex-chatgpt-web] tool_shape ${shape} namespaces=[${offered.filter(e => e.includes("/")).join(",").slice(0, 600)}]`);
+  console.info(`[codex-chatgpt-web] tool_shape ${shape} offered=[${offered.join(",")}]`);
 }
 
 function buildTools(tools: unknown[] | undefined): CodexTool[] | undefined {
