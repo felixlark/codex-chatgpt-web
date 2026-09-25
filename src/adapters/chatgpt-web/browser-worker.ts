@@ -210,6 +210,22 @@ function chatGptModelControlUnavailableAdapterError(diagnostic: string, detail?:
   );
 }
 
+// The picker has already opened when this wait starts; a healthy slider renders within a
+// few seconds. The rare picker that opens on a short four-row list never grows one, so a long
+// wait only delays the retry on another host.
+const CHATGPT_EFFORT_SLIDER_WAIT_MS = 15_000;
+
+/** Short picker row labels (product UI text, never conversation text) for the failure cause. */
+async function chatGptPickerRowLabels(menu: Locator): Promise<string> {
+  try {
+    const labels = await menu.locator(CHATGPT_EFFORT_ITEM_SELECTOR).evaluateAll(rows => rows.map(row =>
+      (row.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 40)), undefined);
+    return labels.length > 0 ? JSON.stringify(labels.slice(0, 8)) : "none";
+  } catch {
+    return "unreadable";
+  }
+}
+
 export async function chatGptUnavailableProDetail(menu: Locator): Promise<string | undefined> {
   // Pro is the product label in the picker. Its linked tooltip supplies the site's own
   // localized explanation/date; do not search the conversation or infer a reset time.
@@ -2479,7 +2495,8 @@ export class ChatGptBrowserWorker {
           }
         }
       }
-      console.error(`[chatgpt-web] browser turn ${traceId} stage=${stage} failed durationMs=${Math.round(performance.now() - startedAt)}: ${surfacedError instanceof Error ? surfacedError.message : String(surfacedError)}`);
+      const cause = surfacedError instanceof Error && surfacedError.cause instanceof Error ? ` (cause: ${surfacedError.cause.message})` : "";
+      console.error(`[chatgpt-web] browser turn ${traceId} stage=${stage} failed durationMs=${Math.round(performance.now() - startedAt)}: ${surfacedError instanceof Error ? surfacedError.message : String(surfacedError)}${cause}`);
       throw surfacedError;
     } finally {
       if (timer) clearTimeout(timer);
@@ -2611,11 +2628,11 @@ export class ChatGptBrowserWorker {
     const waitAbort = new AbortController();
     try {
       const ready = await Promise.race([
-        sliderContainer.waitFor({ state: "visible", timeout: 70_000, signal: waitAbort.signal })
-          .then(() => effortSlider.waitFor({ state: "attached", timeout: 70_000, signal: waitAbort.signal }))
+        sliderContainer.waitFor({ state: "visible", timeout: CHATGPT_EFFORT_SLIDER_WAIT_MS, signal: waitAbort.signal })
+          .then(() => effortSlider.waitFor({ state: "attached", timeout: CHATGPT_EFFORT_SLIDER_WAIT_MS, signal: waitAbort.signal }))
           .then(() => "slider" as const),
-        chatGptRateLimitDialog(page).waitFor({ state: "visible", timeout: 70_000, signal: waitAbort.signal }).then(() => "rate-limit" as const),
-        chatGptExpiredSessionAlert(page).waitFor({ state: "visible", timeout: 70_000, signal: waitAbort.signal }).then(() => "session-expired" as const),
+        chatGptRateLimitDialog(page).waitFor({ state: "visible", timeout: CHATGPT_EFFORT_SLIDER_WAIT_MS, signal: waitAbort.signal }).then(() => "rate-limit" as const),
+        chatGptExpiredSessionAlert(page).waitFor({ state: "visible", timeout: CHATGPT_EFFORT_SLIDER_WAIT_MS, signal: waitAbort.signal }).then(() => "session-expired" as const),
       ]);
       if (ready === "rate-limit") await throwIfChatGptRateLimitDialog(page);
       if (ready === "session-expired") await throwIfChatGptSessionFailureAlert(page);
@@ -2625,7 +2642,8 @@ export class ChatGptBrowserWorker {
       await throwIfChatGptRateLimitDialog(page);
       await throwIfChatGptSessionFailureAlert(page);
       throw chatGptModelControlUnavailableAdapterError(
-        `ChatGPT effort slider did not become ready for item index ${uiEffortIndex}`,
+        `ChatGPT effort slider did not become ready for item index ${uiEffortIndex}`
+        + ` (open picker rows: ${await chatGptPickerRowLabels(activation.menu)})`,
       );
     } finally {
       waitAbort.abort();
