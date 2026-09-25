@@ -17,6 +17,7 @@ import {
 } from "./adapters/chatgpt-web/environment";
 import { rememberCompactionContinuation } from "./adapters/chatgpt-web/compaction-continuation";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./bridge";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AppConfig } from "./config";
 import { atomicWriteFile, getConfigDir, providerConfig } from "./config";
@@ -400,6 +401,62 @@ function modelCatalogErrorForLog(error: unknown): string {
   return `${name}: ${message}`;
 }
 
+/**
+ * The last native catalog upstream returned, kept so a failing upstream does not take the free
+ * web-route models down with it. When the paid account hits its usage limit, the native catalog
+ * answers 429; passed through, Codex loses every model — chatgpt-web/* included — and goal turns
+ * stop although the free route itself is fine (Mars, 2026-09-25).
+ */
+let lastNativeCatalog: unknown;
+const nativeCatalogCachePath = () => join(getConfigDir(), "runtime", "native-model-catalog.json");
+
+// Tests keep the copy in memory only, so they never write into a real bridge home.
+const persistNativeCatalog = () => process.env.NODE_ENV !== "test";
+
+function rememberNativeCatalog(raw: unknown): void {
+  lastNativeCatalog = raw;
+  if (!persistNativeCatalog()) return;
+  try { atomicWriteFile(nativeCatalogCachePath(), JSON.stringify(raw)); } catch { /* memory copy suffices */ }
+}
+
+function recalledNativeCatalog(): unknown {
+  if (lastNativeCatalog !== undefined || !persistNativeCatalog()) return lastNativeCatalog;
+  try { lastNativeCatalog = JSON.parse(readFileSync(nativeCatalogCachePath(), "utf8")); } catch { /* none yet */ }
+  return lastNativeCatalog;
+}
+
+/** Test hook: forget the remembered native catalog. */
+export function forgetNativeCatalogForTests(): void {
+  lastNativeCatalog = undefined;
+}
+
+function catalogResponse(catalog: Record<string, unknown>, init: { status: number; statusText?: string; headers?: Headers }): Response {
+  const body = JSON.stringify(catalog);
+  const headers = new Headers(init.headers);
+  headers.delete("content-encoding");
+  headers.delete("content-length");
+  headers.set("content-type", "application/json");
+  headers.set("etag", `W/\"${createHash("sha256").update(body).digest("base64url")}\"`);
+  return new Response(body, { status: init.status, ...(init.statusText ? { statusText: init.statusText } : {}), headers });
+}
+
+/**
+ * Upstream failed: answer with the last good native catalog plus the web routes, so the free models
+ * stay selectable. Web-route entries are built from a native template, so without a remembered
+ * catalog there is nothing to serve and upstream's error goes through. Native models from the
+ * remembered catalog still fail at request time with upstream's own error, where it belongs.
+ */
+function fallbackCatalog(config: AppConfig, contextOverride?: () => CodexModelContextOverride | undefined): Response | undefined {
+  try {
+    const base = recalledNativeCatalog();
+    if (base === undefined) return undefined;
+    const headers = new Headers({ "x-codex-chatgpt-web-catalog": "remembered" });
+    return catalogResponse(augmentNativeModelCatalog(base, config, contextOverride?.()), { status: 200, headers });
+  } catch {
+    return undefined;
+  }
+}
+
 export async function modelsRequest(
   req: Request,
   config: AppConfig,
@@ -416,26 +473,26 @@ export async function modelsRequest(
     });
   } catch (error) {
     onFailure?.(modelCatalogFailure(sent ? "transport" : "request", error), modelCatalogErrorForLog(error));
-    return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
+    // A request that never left (no credentials) is the caller's own error; only an upstream that
+    // could not be reached is covered by the remembered catalog.
+    return (sent ? fallbackCatalog(config, contextOverride) : undefined)
+      ?? formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
   }
   if (!upstream.ok) {
     onFailure?.({ stage: "upstream" });
-    return upstream;
+    return fallbackCatalog(config, contextOverride) ?? upstream;
   }
+  let raw: unknown;
   let catalog: Record<string, unknown>;
   try {
-    catalog = augmentNativeModelCatalog(await upstream.json(), config, contextOverride?.());
+    raw = await upstream.json();
+    catalog = augmentNativeModelCatalog(raw, config, contextOverride?.());
   } catch (error) {
     onFailure?.(modelCatalogFailure("catalog", error));
     return formatErrorResponse(502, "invalid_response_error", error instanceof Error ? error.message : String(error));
   }
-  const body = JSON.stringify(catalog);
-  const headers = new Headers(upstream.headers);
-  headers.delete("content-encoding");
-  headers.delete("content-length");
-  headers.set("content-type", "application/json");
-  headers.set("etag", `W/\"${createHash("sha256").update(body).digest("base64url")}\"`);
-  return new Response(body, { status: upstream.status, statusText: upstream.statusText, headers });
+  rememberNativeCatalog(raw);
+  return catalogResponse(catalog, { status: upstream.status, statusText: upstream.statusText, headers: upstream.headers });
 }
 
 export async function nativeSearchRequest(

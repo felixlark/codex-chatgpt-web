@@ -9,7 +9,7 @@ import { ChatGptTextFeed, ChatGptTraceFeed, chatGptTurnSessions } from "../src/a
 import { callTurnBroker, closeTurnBrokers, RemoteTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { defaultBrokerEndpoint, defaultConfig, providerConfig } from "../src/config";
 import { parseRequest } from "../src/responses/parser";
-import { compactRequest, HttpTurnCounter, responseRequest, routeChatGptWebRequest, startServer } from "../src/server";
+import { compactRequest, HttpTurnCounter, responseRequest, routeChatGptWebRequest, startServer, forgetNativeCatalogForTests } from "../src/server";
 
 test("DEV harness configuration cannot bind a Responses listener", () => {
   const config = { ...defaultConfig("browser-only"), purpose: "dev-harness" as const, port: 0 };
@@ -1307,6 +1307,8 @@ test("authenticated shutdown requires a verified idle drain", async () => {
 });
 
 test("model catalog health distinguishes no request, transport failure, upstream denial, and recovery without secrets", async () => {
+  // This checks the behaviour with nothing remembered; another test may have left a catalog.
+  forgetNativeCatalogForTests();
   let outcome: "transport" | "denied" | "invalid" | "ready" = "transport";
   const server = startServer({ ...defaultConfig("browser-only"), port: 0 }, {
     fetchUpstream: async () => {

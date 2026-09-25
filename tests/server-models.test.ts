@@ -175,3 +175,47 @@ test("ChatGPT-only native catalog rows do not turn model discovery into a 502", 
   expect(body.models.filter(model => model.slug.startsWith("chatgpt-web/"))
     .every(model => model.supported_in_api === true)).toBe(true);
 });
+
+test("a failing upstream catalog keeps the web-route models and the last good native ones", async () => {
+  // Mars, 2026-09-25: the paid account hit its usage limit, the native catalog answered 429, and
+  // passing that through left Codex with no models at all, so free-route goal turns stopped too.
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { forgetNativeCatalogForTests } = await import("../src/server");
+  const home = mkdtempSync(join(tmpdir(), "catalog-cache-"));
+  const previous = process.env.CODEX_CHATGPT_WEB_HOME;
+  process.env.CODEX_CHATGPT_WEB_HOME = home;
+  try {
+    forgetNativeCatalogForTests();
+    const config = defaultConfig("full");
+    config.subagentProtocol = "native";
+    const request = () => new Request("http://127.0.0.1:17841/v1/models", { headers: { authorization: "Bearer t" } });
+    const limited = async () => new Response('{"error":"usage limit"}', { status: 429 });
+    const slugs = async (response: Response) =>
+      ((await response.json()) as { models: Array<{ slug: string }> }).models.map(model => model.slug);
+
+    // Nothing remembered yet: web-route entries are built from a native template, so there is
+    // nothing to serve and upstream's own error goes through.
+    const first = await modelsRequest(request(), config, limited);
+    expect(first.status).toBe(429);
+
+    // After one good answer, a failure serves that answer again with the web routes.
+    await modelsRequest(request(), config, async () => Response.json({ models: [{
+      slug: "gpt-6-sol", display_name: "GPT-6 Sol", priority: 1, visibility: "list", supported_in_api: true,
+      supported_reasoning_levels: [], tool_mode: "code_mode_only", context_window: 300_000,
+      max_context_window: 320_000, auto_compact_token_limit: 270_000, multi_agent_version: "v2",
+    }] }));
+    const second = await modelsRequest(request(), config, limited);
+    expect(second.status).toBe(200);
+    expect(second.headers.get("x-codex-chatgpt-web-catalog")).toBe("remembered");
+    const names = await slugs(second);
+    expect(names).toContain("gpt-6-sol");
+    expect(names).toContain(CHATGPT_WEB_MODEL_ROUTES[0]!.slug);
+  } finally {
+    forgetNativeCatalogForTests();
+    if (previous === undefined) delete process.env.CODEX_CHATGPT_WEB_HOME;
+    else process.env.CODEX_CHATGPT_WEB_HOME = previous;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
