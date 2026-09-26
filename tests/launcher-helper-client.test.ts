@@ -1,3 +1,4 @@
+import { launcherSlot } from "../src/adapters/chatgpt-web/launcher-host-pool";
 import { selectedSkillFile } from "../src/adapters/chatgpt-web/skill-attachments";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -304,6 +305,51 @@ test("launcher helper protocol preserves multipart context and the compaction fl
         multipart: { parts: Array.from({ length: 6 }, (_, index) => JSON.stringify({ part: index + 1 })), commit: "commit" },
         trimmedCompactionMessages: 4,
     },
+  });
+});
+
+test("a slot sends its own connector and its browser's descriptor", async () => {
+  const sent: Record<string, unknown>[] = [];
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Mars Alpha",
+    browserHost: "launcher",
+    browserHostDescriptorPath: "/durable/alpha.json",
+    browserHostSlots: [launcherSlot("/durable/alpha.json", "Codex Mars Beta")],
+    storageStatePath: "/durable/unused-state.json",
+    chromeExecutablePath: "/durable/unused-chrome",
+    turnTimeoutMs: 60_000,
+    headed: true,
+    autoApproveToolCalls: false,
+    useSavedChats: false,
+  });
+  const internal = client as unknown as {
+    child?: unknown;
+    ensureChild(): Promise<void>;
+    send(message: Record<string, unknown>): Promise<void>;
+    handleLine(child: unknown, line: string): void;
+  };
+  const child = {};
+  internal.child = child;
+  internal.ensureChild = async () => {};
+  internal.send = async message => {
+    sent.push(message);
+    if (message.type === "run") {
+      queueMicrotask(() => internal.handleLine(child, JSON.stringify({ type: "event", id: message.id, event: "prepared_selected", reused: false })));
+    } else if (message.type === "prepared_selected_ack") {
+      queueMicrotask(() => internal.handleLine(child, JSON.stringify({ type: "result", id: message.id, text: "done" })));
+    }
+  };
+  await expect(client.run({
+    traceId: "slot-123",
+    modelId: "gpt-5.6-sol",
+    reasoning: "high",
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+    prepare: async () => ({ text: "go", images: [], release() {} }),
+    onTextDelta() {},
+  })).resolves.toBe("done");
+  expect(sent[0]).toMatchObject({
+    type: "run",
+    config: { appName: "Codex Mars Beta", browserHostDescriptorPath: "/durable/alpha.json" },
   });
 });
 

@@ -18,9 +18,9 @@ import {
 import { rememberCompactionContinuation } from "./adapters/chatgpt-web/compaction-continuation";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./bridge";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { AppConfig } from "./config";
-import { atomicWriteFile, getConfigDir, providerConfig } from "./config";
+import { atomicWriteFile, expandUserPath, getConfigDir, providerConfig } from "./config";
 import { AsyncEventQueue } from "./event-queue";
 import { readJsonRequestBody } from "./http-body";
 import { httpStatusFromTerminalError } from "./lib/errors";
@@ -53,7 +53,7 @@ import type { CodexProviderConfig } from "./types";
 import type { ProviderAdapter } from "./adapters/base";
 import { VERSION } from "./version";
 import { ChatGptSessionKeepAlive } from "./adapters/chatgpt-web/session-keepalive";
-import { launcherHostHasTurn } from "./adapters/chatgpt-web/launcher-host-pool";
+import { launcherDescriptorHasTurn } from "./adapters/chatgpt-web/launcher-host-pool";
 
 type HttpTrackedEndpoint = "models" | "responses" | "compact" | "search" | "unspecified" | NativeImageEndpoint;
 
@@ -887,8 +887,11 @@ export function startServer(
   // signed-out host visible before a goal pays for it. Off in tests, which have no launcher.
   const keepAlive = config.mode === "full" && config.browserHostDescriptorPath && process.env.NODE_ENV !== "test"
     ? new ChatGptSessionKeepAlive({
-      hosts: () => [config.browserHostDescriptorPath!, ...(config.browserHostPool ?? [])],
-      busy: launcherHostHasTurn,
+      // Keep-alive works on browsers, not slots: several slots can share one launcher.
+      hosts: () => [...new Set(config.browserHostSlots?.length
+        ? config.browserHostSlots.map(slot => resolve(expandUserPath(slot.descriptor)))
+        : [config.browserHostDescriptorPath!, ...(config.browserHostPool ?? [])])],
+      busy: launcherDescriptorHasTurn,
       record: results => {
         try {
           atomicWriteFile(join(getConfigDir(), "runtime", "chatgpt-keepalive.json"),

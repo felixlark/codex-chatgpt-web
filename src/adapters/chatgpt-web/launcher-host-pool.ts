@@ -1,13 +1,34 @@
 import { readLauncherBrowserHostDescriptor, type LauncherBrowserHostDescriptor } from "../../launcher-browser-host";
 
 /**
- * Several launcher browser processes can host ChatGPT turns for one bridge. Each launcher is its own
- * Chromium browser, so a renderer that is busy with one turn (for example while ingesting a very
- * large prompt) cannot stall CDP attach, rebinding or rendering for turns running in another one.
- * The broker, tunnel and connector stay single: tool calls are routed by turn token, not by browser.
+ * Turns are placed on slots: a connector in a launcher browser. Slots may live in several launcher
+ * processes (each its own Chromium, so a busy renderer cannot stall another browser's turns) or share
+ * one launcher, where one ChatGPT login serves every slot and the launcher's own tabs isolate the
+ * turns. Either way each slot's connector has its own tunnel. The broker stays single: tool calls
+ * are routed by turn token, not by browser.
  */
 
-/** A retained ChatGPT conversation can only resume in the launcher that still owns its tab. */
+/**
+ * A pool member is a slot: one connector in one launcher browser, written `<descriptor>#<connector>`.
+ * Several slots can share a browser, so one ChatGPT login serves them all while each connector keeps
+ * its own tunnel (OpenAI dispatches one tool call at a time per tunnel). A bare descriptor path is a
+ * whole legacy host whose connector comes from `browserHostAppNames`.
+ */
+export function launcherSlot(descriptor: string, appName: string): string {
+  return `${descriptor}#${appName}`;
+}
+
+export function launcherSlotDescriptor(slot: string): string {
+  const at = slot.indexOf("#");
+  return at < 0 ? slot : slot.slice(0, at);
+}
+
+export function launcherSlotAppName(slot: string): string | undefined {
+  const at = slot.indexOf("#");
+  return at < 0 ? undefined : slot.slice(at + 1);
+}
+
+/** A retained ChatGPT conversation can only resume in the slot (browser tab and connector) that owns it. */
 const LAUNCHER_HOST_AFFINITY_TTL_MS = 6 * 60 * 60_000;
 const affinity = new Map<string, { host: string; at: number }>();
 
@@ -51,6 +72,14 @@ export function markLauncherHostBusy(host: string): () => void {
 
 export function launcherHostHasTurn(host: string): boolean {
   return (inFlight.get(host) ?? 0) > 0;
+}
+
+/** Whether any slot of this browser has a turn, or the browser itself is held (keep-alive). */
+export function launcherDescriptorHasTurn(descriptor: string): boolean {
+  for (const [key, count] of inFlight) {
+    if (count > 0 && launcherSlotDescriptor(key) === descriptor) return true;
+  }
+  return false;
 }
 
 /** Test hook: forget every conversation affinity. */
@@ -98,7 +127,7 @@ export function availableLauncherHosts(
   for (const host of [primary, ...pool]) {
     if (hosts.includes(host)) continue;
     try {
-      read(host);
+      read(launcherSlotDescriptor(host));
       hosts.push(host);
     } catch {
       // An absent, stale or foreign descriptor is simply not available for new turns.
@@ -119,12 +148,12 @@ export function readAnyLauncherBrowserHostDescriptor<T = LauncherBrowserHostDesc
 ): T {
   for (const host of availableLauncherHosts(primary, pool, read as DescriptorReader)) {
     try {
-      return read(host);
+      return read(launcherSlotDescriptor(host));
     } catch {
       // Raced with that launcher exiting; try the next one.
     }
   }
-  return read(primary);
+  return read(launcherSlotDescriptor(primary));
 }
 
 /**

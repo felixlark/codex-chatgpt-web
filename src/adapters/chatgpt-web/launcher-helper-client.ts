@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { noteChatGptRetainedConnectorLost } from "./retained-conversation-health";
-import { markLauncherHostBusy, quarantineLauncherHost, readAnyLauncherBrowserHostDescriptor, rememberLauncherHostAffinity, selectLauncherHost, usableLauncherHostCount } from "./launcher-host-pool";
+import { launcherSlotAppName, launcherSlotDescriptor, markLauncherHostBusy, quarantineLauncherHost, readAnyLauncherBrowserHostDescriptor, rememberLauncherHostAffinity, selectLauncherHost, usableLauncherHostCount } from "./launcher-host-pool";
 import { existsSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -233,6 +233,19 @@ function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 /**
+ * Where turns can go: the configured slots, or else the legacy primary descriptor plus pool hosts.
+ * Every entry is a slot key (see launcher-host-pool); a bare descriptor is a legacy whole host.
+ */
+function launcherHostCandidates(config: ResolvedBrowserConfig): { primary: string; pool: string[] } | undefined {
+  if (config.browserHostSlots?.length) {
+    return { primary: config.browserHostSlots[0]!, pool: config.browserHostSlots.slice(1) };
+  }
+  return config.browserHostDescriptorPath
+    ? { primary: config.browserHostDescriptorPath, pool: config.browserHostPool ?? [] }
+    : undefined;
+}
+
+/**
  * One admission gate per bridge process: the account, not a client instance, is what throttles.
  * CODEX_CHATGPT_WEB_ADMISSION=off bypasses it without a rollback; tests never persist its state.
  */
@@ -240,9 +253,10 @@ function sharedAdmission(config: ResolvedBrowserConfig): ChatGptAdmission | unde
   if (process.env.CODEX_CHATGPT_WEB_ADMISSION === "off") return undefined;
   admissionSingleton ??= new ChatGptAdmission({
     ...(process.env.NODE_ENV === "test" ? {} : { statePath: join(getConfigDir(), "runtime", "chatgpt-admission.json") }),
-    maxConcurrent: () => (config.browserHostDescriptorPath
-      ? usableLauncherHostCount(config.browserHostDescriptorPath, config.browserHostPool ?? [])
-      : 1 + (config.browserHostPool?.length ?? 0)),
+    maxConcurrent: () => {
+      const hosts = launcherHostCandidates(config);
+      return hosts ? usableLauncherHostCount(hosts.primary, hosts.pool) : 1 + (config.browserHostPool?.length ?? 0);
+    },
   });
   return admissionSingleton;
 }
@@ -386,7 +400,7 @@ export class LauncherBrowserHelperClient {
           const hostFault = !/retained conversation lost its connector|browser is busy with session refresh/i.test(
             error instanceof Error ? error.message : String(error),
           );
-          if (hostFault && lastHost && this.config.browserHostPool?.length) {
+          if (hostFault && lastHost && (launcherHostCandidates(this.config)?.pool.length ?? 0) > 0) {
             quarantineLauncherHost(lastHost);
             console.warn(`[chatgpt-web] launcher host ${lastHost} failed before submission; `
               + "left out of new turns for 10 minutes");
@@ -421,9 +435,10 @@ export class LauncherBrowserHelperClient {
           rejectResult(new Error(`Duplicate launcher browser turn: ${turn.traceId}`));
           return;
         }
+        const candidates = launcherHostCandidates(this.config)!;
         const host = selectLauncherHost({
-          primary: this.config.browserHostDescriptorPath!,
-          pool: this.config.browserHostPool,
+          primary: candidates.primary,
+          pool: candidates.pool,
           conversationKey: turn.conversationKey,
           activeTurns: candidate => [...this.pending.values()].filter(item => item.host === candidate).length,
         });
@@ -432,7 +447,7 @@ export class LauncherBrowserHelperClient {
         pending.releaseHost = markLauncherHostBusy(host);
         this.pending.set(turn.traceId, pending);
         if (turn.retainConversation && turn.conversationKey) rememberLauncherHostAffinity(turn.conversationKey, host);
-        if (this.config.browserHostPool?.length) {
+        if (candidates.pool.length) {
           console.info(`[chatgpt-web] browser turn ${turn.traceId} assigned to launcher host ${host}`);
         }
         if (turn.abortSignal) {
@@ -482,8 +497,9 @@ export class LauncherBrowserHelperClient {
           config: {
             // Each launcher host can have its own connector (and therefore its own tunnel), so a
             // long tool call in one browser does not queue the tool calls of turns in another.
-            appName: (pending.host && this.config.browserHostAppNames?.[pending.host]) || this.config.appName,
-            browserHostDescriptorPath: pending.host ?? this.config.browserHostDescriptorPath!,
+            appName: (pending.host && (launcherSlotAppName(pending.host) ?? this.config.browserHostAppNames?.[pending.host]))
+              || this.config.appName,
+            browserHostDescriptorPath: pending.host ? launcherSlotDescriptor(pending.host) : this.config.browserHostDescriptorPath!,
             browserDiagnosticsPath: this.config.browserDiagnosticsPath,
             turnTimeoutMs: this.config.turnTimeoutMs,
             autoApproveToolCalls: this.config.autoApproveToolCalls,
@@ -536,10 +552,8 @@ export class LauncherBrowserHelperClient {
       && this.ready) {
       return this.ready;
     }
-    const descriptor = readAnyLauncherBrowserHostDescriptor(
-      this.config.browserHostDescriptorPath!,
-      this.config.browserHostPool,
-    );
+    const candidates = launcherHostCandidates(this.config)!;
+    const descriptor = readAnyLauncherBrowserHostDescriptor(candidates.primary, candidates.pool);
     const child = spawn(
       descriptor.helper.executable,
       [this.config.browserHelperScriptPath ?? this.bundledHelperScript() ?? descriptor.helper.script],
@@ -876,7 +890,7 @@ export class LauncherBrowserHelperClient {
     for (const id of [...this.pending.keys()]) {
       const pending = this.pending.get(id);
       if (!pending) continue;
-      void notifyLauncherTurn(pending.host ?? this.config.browserHostDescriptorPath!, {
+      void notifyLauncherTurn(pending.host ? launcherSlotDescriptor(pending.host) : this.config.browserHostDescriptorPath!, {
         phase: "end",
         traceId: id,
         helperPid: child.pid!,

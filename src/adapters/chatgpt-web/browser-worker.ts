@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { skillFileTokens, validateSkillFiles } from "./skill-attachments";
+import { launcherSlot } from "./launcher-host-pool";
 import { detectChatGptLimitsPlan, readChatGptUsageAccount, readChatGptUsageModel, type ChatGptUsageModel } from "./limits";
 import { chromium, type Browser, type BrowserContext, type Locator, type Page, type Request, type Response } from "playwright-core";
 import {
@@ -1415,6 +1416,8 @@ export interface ResolvedBrowserConfig {
   browserHostDescriptorPath?: string;
   browserHostPool?: string[];
   browserHostAppNames?: Record<string, string>;
+  /** Resolved `<descriptor>#<connector>` slots; see launcher-host-pool. */
+  browserHostSlots?: string[];
   browserHelperScriptPath?: string;
   browserDiagnosticsPath?: string;
   storageStatePath: string;
@@ -2169,6 +2172,15 @@ export function resolveBrowserConfig(provider: CodexProviderConfig): ResolvedBro
       ? {
         browserHostAppNames: Object.fromEntries(Object.entries(configured.browserHostAppNames)
           .map(([host, name]) => [resolve(expandUserPath(host.trim())), name.trim()])),
+      }
+      : {}),
+    ...(browserHost === "launcher" && configured.browserHostSlots?.length
+      ? {
+        browserHostSlots: configured.browserHostSlots.map(slot => {
+          const name = slot.appName.trim();
+          if (isLegacyChatGptConnectorName(name)) throw new Error(legacyChatGptConnectorMigrationMessage(name));
+          return launcherSlot(resolve(expandUserPath(slot.descriptor.trim())), name);
+        }),
       }
       : {}),
     ...(resolvedBrowserHelperScriptPath ? { browserHelperScriptPath: resolvedBrowserHelperScriptPath } : {}),

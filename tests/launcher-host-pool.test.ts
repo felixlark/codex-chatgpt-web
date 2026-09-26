@@ -6,7 +6,9 @@ import {
   launcherHostForConversation,
   quarantineLauncherHost,
   rememberLauncherHostAffinity,
-  selectLauncherHost, usableLauncherHostCount } from "../src/adapters/chatgpt-web/launcher-host-pool";
+  selectLauncherHost, usableLauncherHostCount,
+  launcherDescriptorHasTurn, launcherSlot, launcherSlotAppName, launcherSlotDescriptor, markLauncherHostBusy,
+} from "../src/adapters/chatgpt-web/launcher-host-pool";
 
 afterEach(() => clearLauncherHostAffinity());
 
@@ -129,4 +131,39 @@ test("only live, unquarantined launchers count toward how many turns may run at 
   quarantineLauncherHost("/beta");
   expect(usableLauncherHostCount("/alpha", ["/beta", "/gamma"], read)).toBe(1);   // never zero
   clearLauncherHostAffinity();
+});
+
+test("slots of one browser share its descriptor but are placed, counted and quarantined apart", () => {
+  const [a, b, c] = ["Codex Mars Alpha", "Codex Mars Beta", "Codex Mars Gamma"].map(name => launcherSlot("/hosts/alpha.json", name));
+  expect(launcherSlotDescriptor(b!)).toBe("/hosts/alpha.json");
+  expect(launcherSlotAppName(b!)).toBe("Codex Mars Beta");
+  expect(launcherSlotAppName("/hosts/alpha.json")).toBeUndefined();
+  // Every slot is live while its browser is, and each takes a turn of its own.
+  expect(availableLauncherHosts(a!, [b!, c!], read)).toEqual([a, b, c]);
+  expect(usableLauncherHostCount(a!, [b!, c!], read)).toBe(3);
+  const busy = new Map([[a!, 1], [b!, 1]]);
+  expect(selectLauncherHost({ primary: a!, pool: [b!, c!], activeTurns: slot => busy.get(slot) ?? 0, read })).toBe(c);
+  // A connector-specific failure leaves the other connectors of the same browser in use.
+  quarantineLauncherHost(c!);
+  expect(usableLauncherHostCount(a!, [b!, c!], read)).toBe(2);
+  // A dead browser takes all of its slots with it.
+  expect(availableLauncherHosts(launcherSlot("/hosts/dead.json", "X"), [launcherSlot("/hosts/dead.json", "Y"), b!], read)).toEqual([b]);
+});
+
+test("a browser counts as busy while any of its slots has a turn", () => {
+  const release = markLauncherHostBusy(launcherSlot("/hosts/alpha.json", "Codex Mars Beta"));
+  expect(launcherDescriptorHasTurn("/hosts/alpha.json")).toBe(true);
+  expect(launcherDescriptorHasTurn("/hosts/beta.json")).toBe(false);
+  release();
+  expect(launcherDescriptorHasTurn("/hosts/alpha.json")).toBe(false);
+  // The keep-alive holds the browser itself by its descriptor.
+  const hold = markLauncherHostBusy("/hosts/alpha.json");
+  expect(launcherDescriptorHasTurn("/hosts/alpha.json")).toBe(true);
+  hold();
+});
+
+test("the browser helper starts from a slot's browser", () => {
+  const seen: string[] = [];
+  readAnyLauncherBrowserHostDescriptor(launcherSlot("/hosts/alpha.json", "Codex Mars Alpha"), [], path => { seen.push(path); return read(path); });
+  expect(seen.every(path => path === "/hosts/alpha.json")).toBe(true);
 });

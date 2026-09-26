@@ -79,6 +79,7 @@ export interface AppConfig {
   browserHostDescriptorPath?: string;
   browserHostPool?: string[];
   browserHostAppNames?: Record<string, string>;
+  browserHostSlots?: Array<{ descriptor: string; appName: string }>;
   chromeExecutablePath: string;
   storageStatePath: string;
   brokerSocketPath: string;
@@ -454,6 +455,17 @@ function parseConfig(value: unknown, path: string): AppConfig {
       throw new Error(`browserHostAppNames must map launcher descriptor paths to connector names in ${path}`);
     }
   }
+  if (parsed.browserHostSlots !== undefined) {
+    const slots = parsed.browserHostSlots;
+    if (parsed.browserHost !== "launcher" || !Array.isArray(slots) || slots.length === 0
+      || slots.some(slot => !slot || typeof slot !== "object"
+        || typeof slot.descriptor !== "string" || !isAbsolute(expandUserPath(slot.descriptor))
+        || slot.descriptor.includes("#")
+        || typeof slot.appName !== "string" || !slot.appName.trim() || slot.appName.length > 80)
+      || new Set(slots.map(slot => `${slot.descriptor}#${slot.appName}`)).size !== slots.length) {
+      throw new Error(`browserHostSlots must list distinct { descriptor, appName } pairs with absolute launcher descriptor paths in ${path}`);
+    }
+  }
   const brokerEndpoint = expandUserPath(parsed.brokerSocketPath!);
   if (process.platform === "win32") {
     if (!isWindowsPipeEndpoint(brokerEndpoint)) {
@@ -613,6 +625,7 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       browserHostDescriptorPath: config.browserHostDescriptorPath,
       ...(config.browserHostPool?.length ? { browserHostPool: config.browserHostPool } : {}),
       ...(config.browserHostAppNames ? { browserHostAppNames: config.browserHostAppNames } : {}),
+      ...(config.browserHostSlots?.length ? { browserHostSlots: config.browserHostSlots } : {}),
       storageStatePath: config.storageStatePath,
       chromeExecutablePath: config.chromeExecutablePath,
       brokerSocketPath: config.brokerSocketPath,
