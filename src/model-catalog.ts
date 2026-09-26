@@ -46,14 +46,17 @@ function routedModelPriority(
   config: AppConfig,
 ): number | undefined {
   const priority = modelPriority(template);
+  // Fork: listed legacy rows (the Latest efforts) come after every upstream row, so showing them in
+  // the picker does not change which models Codex V1's five spawn-agent overrides advertise.
+  const listedLegacy = route.legacy === true && route.listed === true;
   if (priority === undefined
     || config.subagentProtocol !== "compatibility-v1"
-    || !["chatgpt-web/light", "chatgpt-web/gpt-5.6-sol-instant"].includes(route.slug)) return priority;
-  if (priority === Number.MAX_SAFE_INTEGER) {
+    || (!listedLegacy && !["chatgpt-web/light", "chatgpt-web/gpt-5.6-sol-instant"].includes(route.slug))) return priority;
+  if (priority >= Number.MAX_SAFE_INTEGER - 1) {
     throw new Error("Native Codex model template priority cannot reserve the Compatibility V1 roster");
   }
   // Preserve the native model and the reasoning/Pro choices in Codex V1's bounded registry.
-  return priority + 1;
+  return priority + (listedLegacy ? 2 : 1);
 }
 
 function nativeTemplateCandidate(value: unknown, requireTools: boolean): value is JsonObject {
@@ -121,7 +124,7 @@ export function buildChatGptWebModel(
     display_name: route.displayName,
     description: route.description,
     input_modalities: route.interactionMode === "manual" ? ["text"] : ["text", "image"],
-    visibility: route.legacy ? "hide" : "list",
+    visibility: route.legacy && !route.listed ? "hide" : "list",
     // These slugs are implemented by this local Responses-compatible bridge. Marking them false
     // makes Codex drop them from spawn_agent whenever openai_base_url points at the bridge.
     supported_in_api: true,

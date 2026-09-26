@@ -62,9 +62,12 @@ describe("native /models augmentation", () => {
 
     expect(native).toEqual(nativeSnapshot);
     expect(models.slice(0, 3)).toEqual(originalModels);
-    const web = models.slice(3).filter(model => model.visibility === "list");
-    const legacy = models.slice(3).filter(model => model.visibility === "hide");
+    const web = models.slice(3).filter(model => model.visibility === "list"
+      && !CHATGPT_WEB_LEGACY_MODEL_ROUTES.some(route => route.slug === model.slug));
+    // Fork: the legacy Latest efforts stay listed in the picker (route.listed).
+    const legacy = models.slice(3).filter(model => CHATGPT_WEB_LEGACY_MODEL_ROUTES.some(route => route.slug === model.slug));
     expect(legacy.map(model => model.slug)).toEqual(CHATGPT_WEB_LEGACY_MODEL_ROUTES.map(route => route.slug));
+    expect(legacy.every(model => model.visibility === "list")).toBe(true);
     expect(legacy.map(model => [model.context_window, model.auto_compact_token_limit])).toEqual([
       [111_193, 95_000], [111_193, 95_000], [111_193, 95_000], [111_193, 95_000], [112_193, 95_000],
     ]);
@@ -135,7 +138,8 @@ describe("native /models augmentation", () => {
       ...CHATGPT_WEB_MODEL_ROUTES.slice(1).map(route => route.slug),
       "chatgpt-web/gpt-5.6-sol-instant",
     ]);
-    expect(models.find(model => model.slug === "chatgpt-web/light")?.priority).toBe(3);
+    // Fork: listed legacy rows sit after every upstream row.
+    expect(models.find(model => model.slug === "chatgpt-web/light")?.priority).toBe(4);
   });
 
   test("Compatibility V1 preserves an explicit native delegation disable while pinning supported rows", () => {

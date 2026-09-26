@@ -230,6 +230,8 @@ interface ChatGptWebModelRouteBase {
   requiresExtraHigh?: boolean;
   /** Old task identities remain resolvable, but are omitted from the picker. */
   legacy?: boolean;
+  /** Fork: a legacy route that still shows in the Codex picker. */
+  listed?: boolean;
   /** Omission denotes an immutable route, including all pre-6.0 task identities. */
   supportedCodexEfforts?: readonly ChatGptWebCodexEffort[];
 }
@@ -329,7 +331,8 @@ export const CHATGPT_WEB_LUNA_MODEL_ROUTES: readonly ChatGptWebModelRoute[] = [
  * Preserve the exact pre-6.0 bindings for saved tasks, including the old unpinned Pro route.
  * Native Codex may normalize its technical effort; these identities have always owned the mode.
  * Fork: they hold the picker's Latest row, as the fork did before 6.0, so a Sol task sharing the
- * account cannot leave them on Sol.
+ * account cannot leave them on Sol. They also stay in the Codex picker: "ChatGPT Web — High" (Latest
+ * at High) is the route the goals run on, and upstream's named families offer no Latest row.
  */
 export const CHATGPT_WEB_LEGACY_MODEL_ROUTES: readonly ChatGptWebAutomaticModelRoute[] = [
   {
@@ -343,6 +346,7 @@ export const CHATGPT_WEB_LEGACY_MODEL_ROUTES: readonly ChatGptWebAutomaticModelR
     adapterEffort: "low",
     requiresPro: false,
     legacy: true,
+    listed: true,
   },
   {
     slug: "chatgpt-web/medium",
@@ -355,6 +359,7 @@ export const CHATGPT_WEB_LEGACY_MODEL_ROUTES: readonly ChatGptWebAutomaticModelR
     adapterEffort: "medium",
     requiresPro: false,
     legacy: true,
+    listed: true,
   },
   {
     slug: "chatgpt-web/high",
@@ -367,6 +372,7 @@ export const CHATGPT_WEB_LEGACY_MODEL_ROUTES: readonly ChatGptWebAutomaticModelR
     adapterEffort: "high",
     requiresPro: false,
     legacy: true,
+    listed: true,
   },
   {
     slug: "chatgpt-web/extra-high",
@@ -380,6 +386,7 @@ export const CHATGPT_WEB_LEGACY_MODEL_ROUTES: readonly ChatGptWebAutomaticModelR
     requiresPro: false,
     requiresExtraHigh: true,
     legacy: true,
+    listed: true,
   },
   {
     slug: "chatgpt-web/pro",
@@ -392,6 +399,7 @@ export const CHATGPT_WEB_LEGACY_MODEL_ROUTES: readonly ChatGptWebAutomaticModelR
     adapterEffort: "max",
     requiresPro: true,
     legacy: true,
+    listed: true,
   },
 ];
 
