@@ -180,6 +180,21 @@ function isTemporaryChatUrl(value) {
     && parsed.searchParams.get("temporary-chat") === "true";
 }
 
+/** ChatGPT sends a signed-out session to its login page (or straight on to an identity provider). */
+function isChatGptLoginUrl(value) {
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return false;
+  }
+  if (AUTH_PROVIDER_HOSTS.has(parsed.hostname)) return true;
+  return parsed.origin === CHATGPT_ORIGIN && parsed.pathname.startsWith("/auth/");
+}
+
+const CHATGPT_SIGNED_OUT_MESSAGE = "ChatGPT web is signed out: the browser was sent to the ChatGPT login page. "
+  + "Sign this launcher browser in to ChatGPT again";
+
 function isChatGptBackendUrl(value) {
   let parsed;
   try {
@@ -1231,7 +1246,9 @@ class BrowserHost {
     } else {
       await this.view.webContents.loadURL(TEMPORARY_CHAT_URL);
     }
-    await this.waitForAuthenticated(60_000);
+    // Nobody is at this browser to finish a login, so a redirect to the login page is the answer.
+    // Waiting out the deadline instead made the keep-alive report a signed-out host as a timeout.
+    await this.waitForAuthenticated(60_000, { failWhenSignedOut: true });
   }
 
   bindChatGptBackendRecovery() {
@@ -2864,7 +2881,7 @@ class BrowserHost {
     return tracked;
   }
 
-  async waitForAuthenticated(timeoutMs = 180_000) {
+  async waitForAuthenticated(timeoutMs = 180_000, { failWhenSignedOut = false } = {}) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       if (this.authNavigationError) {
@@ -2874,6 +2891,9 @@ class BrowserHost {
       }
       const state = await this.probeAuthentication();
       if (state.authenticated) return state;
+      if (failWhenSignedOut && isChatGptLoginUrl(this.view?.webContents?.getURL?.())) {
+        throw new Error(CHATGPT_SIGNED_OUT_MESSAGE);
+      }
       await sleep(750);
     }
     throw new Error("ChatGPT login was not completed before the timeout");
@@ -3113,6 +3133,7 @@ module.exports = {
   CHATGPT_VIEWPORT_CSS,
   IDLE_BROWSER_URL,
   isChatGptCloudflareChallengeResponse,
+  isChatGptLoginUrl,
   isTemporaryChatUrl,
   loadCommittedBrowserSurface,
   MANUAL_SUBMIT_TIMEOUT_MS,

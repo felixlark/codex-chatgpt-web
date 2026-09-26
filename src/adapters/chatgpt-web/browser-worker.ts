@@ -202,6 +202,28 @@ function chatGptConnectorUnavailableError(message: string): ChatGptWebAdapterErr
   });
 }
 
+export const CHATGPT_SIGNED_OUT_MESSAGE = "ChatGPT web is signed out: the browser was sent to the ChatGPT login page. "
+  + "Sign the launcher browser in to ChatGPT again";
+
+/** Where ChatGPT sends a browser whose session has ended: its own login page or an identity provider. */
+export function isChatGptLoginPageUrl(value: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return false;
+  }
+  if (/^(?:auth0?|login|accounts)\.openai\.com$/.test(parsed.hostname)) return true;
+  return parsed.origin === "https://chatgpt.com" && parsed.pathname.startsWith("/auth/");
+}
+
+/** After an aborted navigation, give the redirect a moment to land before judging the page. */
+async function settlesOnChatGptLoginPage(page: Page, timeoutMs = 5_000): Promise<boolean> {
+  if (isChatGptLoginPageUrl(page.url())) return true;
+  return await page.waitForURL(url => isChatGptLoginPageUrl(url.href), { timeout: timeoutMs, waitUntil: "commit" })
+    .then(() => true, () => false);
+}
+
 const CHATGPT_MODEL_CONTROL_UNAVAILABLE_MESSAGE = "ChatGPT model controls are unavailable. Reload ChatGPT and retry the task.";
 
 function chatGptModelControlUnavailableError(diagnostic: string): Error {
@@ -2839,16 +2861,24 @@ export class ChatGptBrowserWorker {
     // about:blank and therefore still performs exactly one navigation through this same method.
     const targetUrl = chatGptNewChatUrl(useSavedChats);
     if (page.url() !== targetUrl) {
-      await page.goto(targetUrl, {
-        waitUntil: "domcontentloaded",
-        timeout: 60_000,
-      });
+      try {
+        await page.goto(targetUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: 60_000,
+        });
+      } catch (error) {
+        // A signed-out session is redirected to the login page, which aborts this navigation. Say
+        // so: "net::ERR_ABORTED" alone kept Mars retrying a signed-out browser for nine hours.
+        if (await settlesOnChatGptLoginPage(page)) throw new Error(CHATGPT_SIGNED_OUT_MESSAGE, { cause: error });
+        throw error;
+      }
       await captureDiagnostic?.(useSavedChats ? "saved-chat-navigation-complete" : "temporary-chat-navigation-complete");
     }
     let composer: Locator;
     try {
       composer = await this.activeComposer(page);
     } catch {
+      if (isChatGptLoginPageUrl(page.url())) throw new Error(CHATGPT_SIGNED_OUT_MESSAGE);
       throw new Error("ChatGPT web login is expired or the new chat surface is unavailable");
     }
     if (!useSavedChats && await dismissChatGptTemporaryChatOnboarding(page)) {

@@ -211,11 +211,23 @@ const MAX_THROTTLE_REQUEUES = 12;
 const MAX_SURFACE_RETRIES = 12;
 const IMMEDIATE_SURFACE_RETRIES = 2;
 const SURFACE_RETRY_DELAY_MS = 60_000;
+/**
+ * A signed-out browser needs a person to log it in again, which takes longer than any page hiccup
+ * (Mars, 2026-09-26: nine hours). Unsent turns wait for that in the gate, one check per five
+ * surface delays for up to three hours, so their goals resume by themselves after the login
+ * instead of being blocked after ten minutes of retries that could not succeed.
+ */
+const SIGNED_OUT_RETRY_DELAY_FACTOR = 5;
+const MAX_SIGNED_OUT_RETRIES = 36;
+
+function isChatGptSignedOutError(error: unknown): boolean {
+  return /ChatGPT web is signed out/i.test(error instanceof Error ? error.message : String(error));
+}
 
 
 function isChatGptSurfaceUnavailableError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /login is expired or the Temporary Chat surface is unavailable|could not load the account subscription|personalization preflight exceeded its readiness deadline|retained conversation lost its connector|page\.goto: net::ERR_ABORTED|page\.goto: Timeout \d+ms exceeded|browser stage timed out: (?:browser_page|temporary_chat_preparation)\b|model controls are unavailable|connector menu (?:did not open|opened but exposed no row)|dropped the connector before the prompt was sent|locator\.waitFor: Timeout|browser is busy with session refresh/i
+  return /login is expired or the (?:Temporary Chat|new chat) surface is unavailable|could not load the account subscription|personalization preflight exceeded its readiness deadline|retained conversation lost its connector|page\.goto: net::ERR_ABORTED|page\.goto: Timeout \d+ms exceeded|browser stage timed out: (?:browser_page|temporary_chat_preparation)\b|model controls are unavailable|connector menu (?:did not open|opened but exposed no row)|dropped the connector before the prompt was sent|locator\.waitFor: Timeout|browser is busy with session refresh/i
     .test(message);
 }
 
@@ -365,6 +377,7 @@ export class LauncherBrowserHelperClient {
     // turn; surfacing the error instead spends Codex's few retries in seconds and leaves goals
     // blocked for the rest of the throttle.
     let surfaceRetries = 0;
+    let signedOutRetries = 0;
     let lastHost: string | undefined;
     for (let requeues = 0; ; requeues += 1) {
       const release = await admission.acquire(turn.conversationKey ?? turn.traceId, turn.traceId, turn.abortSignal, {
@@ -388,6 +401,19 @@ export class LauncherBrowserHelperClient {
         if (isChatGptRateLimitError(error)) {
           admission.noteThrottle();
           requeue = unsent && requeues < MAX_THROTTLE_REQUEUES;
+        } else if (isChatGptSignedOutError(error)) {
+          signedOutRetries += 1;
+          requeue = unsent && signedOutRetries <= MAX_SIGNED_OUT_RETRIES;
+          // Every slot of that browser shares its one login, so they are all out until it is back.
+          const candidates = launcherHostCandidates(this.config);
+          if (lastHost && candidates && candidates.pool.length > 0) {
+            const descriptor = launcherSlotDescriptor(lastHost);
+            const slots = [candidates.primary, ...candidates.pool].filter(slot => launcherSlotDescriptor(slot) === descriptor);
+            for (const slot of slots) quarantineLauncherHost(slot);
+            console.warn(`[chatgpt-web] launcher browser ${descriptor} is signed out; its ${slots.length} slot(s) `
+              + "left out of new turns for 10 minutes. Sign it in to ChatGPT again");
+          }
+          refund = unsent;
         } else if (isChatGptSurfaceUnavailableError(error)) {
           if (/retained conversation lost its connector/i.test(
             error instanceof Error ? error.message : String(error),
@@ -423,7 +449,9 @@ export class LauncherBrowserHelperClient {
       }
       console.info(`[chatgpt-web] admission turn ${turn.traceId} failed before ChatGPT accepted it `
         + `(${failure instanceof Error ? failure.message.slice(0, 80) : "error"}): back in the queue`);
-      if (surfaceRetries > IMMEDIATE_SURFACE_RETRIES && isChatGptSurfaceUnavailableError(failure)) {
+      if (isChatGptSignedOutError(failure)) {
+        await sleepUnlessAborted(this.surfaceRetryDelayMs * SIGNED_OUT_RETRY_DELAY_FACTOR, turn.abortSignal);
+      } else if (surfaceRetries > IMMEDIATE_SURFACE_RETRIES && isChatGptSurfaceUnavailableError(failure)) {
         await sleepUnlessAborted(this.surfaceRetryDelayMs, turn.abortSignal);
       }
     }

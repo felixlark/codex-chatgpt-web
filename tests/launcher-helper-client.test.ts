@@ -1,4 +1,4 @@
-import { launcherSlot } from "../src/adapters/chatgpt-web/launcher-host-pool";
+import { clearLauncherHostAffinity, launcherSlot, selectLauncherHost } from "../src/adapters/chatgpt-web/launcher-host-pool";
 import { selectedSkillFile } from "../src/adapters/chatgpt-web/skill-attachments";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -573,6 +573,78 @@ describe("admission requeue on a throttle", () => {
     };
     await expect(fresh.client.run(turn() as never)).rejects.toThrow("login is expired");
     expect(always).toBe(13);                             // first try + 12 retries
+  });
+
+  test("the 6.1 wording of the expired-login failure is still retried before submission", async () => {
+    // Upstream 6.1 renamed "Temporary Chat surface" to "new chat surface"; the old pattern then sent
+    // this pre-submission failure straight back to Codex, which blocks the goal.
+    const { client, internal } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("ChatGPT web login is expired or the new chat surface is unavailable");
+      return "done";
+    };
+    expect(await client.run(turn() as never)).toBe("done");
+    expect(attempts).toBe(2);
+  });
+
+  test("a signed-out browser holds its turns for a login, far past the page-failure limit", async () => {
+    const { client, internal, admission } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async () => {
+      attempts += 1;
+      if (attempts <= 20) throw new Error("ChatGPT web is signed out: the browser was sent to the ChatGPT login page.");
+      return "done";
+    };
+    expect(await client.run(turn() as never)).toBe("done");
+    expect(attempts).toBe(21);                          // beyond the twelve page-failure retries
+    expect(admission.snapshot().cooldownUntil).toBe(0);  // nothing reached ChatGPT: no account cooldown
+    const fresh = gatedClient();
+    let always = 0;
+    fresh.internal.runAdmitted = async () => {
+      always += 1;
+      throw new Error("ChatGPT web is signed out: the browser was sent to the ChatGPT login page.");
+    };
+    await expect(fresh.client.run(turn() as never)).rejects.toThrow("signed out");
+    expect(always).toBe(37);                             // first try + 36 waits (three hours on Mars)
+  });
+
+  test("a signed-out browser takes every slot it hosts out of new turns, not just the one that failed", async () => {
+    // Mars, 2026-09-26: three slots share alpha's login, and each round of retries tried all three.
+    clearLauncherHostAffinity();
+    const alphaA = launcherSlot("/durable/alpha.json", "Codex Mars Alpha");
+    const alphaB = launcherSlot("/durable/alpha.json", "Codex Mars Beta");
+    const other = launcherSlot("/durable/other.json", "Codex Mars Gamma");
+    setSharedAdmissionForTests(new ChatGptAdmission({ maxConcurrent: 3, log: () => {} }));
+    const client = new LauncherBrowserHelperClient({
+      appName: "Codex Mars Alpha", browserHost: "launcher", browserHostDescriptorPath: "/durable/alpha.json",
+      browserHostSlots: [alphaA, alphaB, other],
+      storageStatePath: "/durable/unused.json", chromeExecutablePath: "/durable/chrome", headed: true, autoApproveToolCalls: false,
+      useSavedChats: false,
+    } as ResolvedBrowserConfig, undefined, undefined, 0);
+    const internal = client as unknown as {
+      ensureChild(): Promise<void>;
+      runAdmitted(turn: unknown, onHost?: (host: string) => void): Promise<string>;
+    };
+    internal.ensureChild = async () => {};
+    let attempts = 0;
+    internal.runAdmitted = async (_turn, onHost) => {
+      attempts += 1;
+      onHost?.(alphaA);
+      if (attempts === 1) throw new Error("ChatGPT web is signed out: the browser was sent to the ChatGPT login page.");
+      return "done";
+    };
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(await client.run(turn() as never)).toBe("done");
+    } finally {
+      warn.mockRestore();
+    }
+    expect(selectLauncherHost({
+      primary: alphaA, pool: [alphaB, other], activeTurns: () => 0, read: () => ({}),
+    })).toBe(other);
+    clearLauncherHostAffinity();
   });
 
   test("a host still refreshing its session after a bridge restart is retried with the slot refunded", async () => {

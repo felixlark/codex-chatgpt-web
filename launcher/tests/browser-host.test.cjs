@@ -17,6 +17,7 @@ const {
   BrowserHost,
   IDLE_BROWSER_URL,
   isChatGptCloudflareChallengeResponse,
+  isChatGptLoginUrl,
   isTemporaryChatUrl,
   loadCommittedBrowserSurface,
   MANUAL_COMPACTION_SUBMIT_TIMEOUT_MS,
@@ -446,6 +447,32 @@ test("smoke preserves an already-hydrated Temporary Chat page", () => {
   assert.equal(isTemporaryChatUrl("https://chatgpt.com/?temporary-chat=false"), false);
   assert.equal(isTemporaryChatUrl("https://chatgpt.com/c/abc?temporary-chat=true"), false);
   assert.equal(isTemporaryChatUrl("not a url"), false);
+});
+
+test("a signed-out host fails the keep-alive refresh at once instead of timing out", async () => {
+  // Mars, 2026-09-26: alpha was on /auth/login for nine hours and the keep-alive only ever said
+  // "session inspection timed out", so the console showed an error rather than a signed-out host.
+  assert.equal(isChatGptLoginUrl("https://chatgpt.com/auth/login?next=%2F%3Ftemporary-chat%3Dtrue"), true);
+  assert.equal(isChatGptLoginUrl("https://auth.openai.com/log-in"), true);
+  assert.equal(isChatGptLoginUrl("https://chatgpt.com/?temporary-chat=true"), false);
+  assert.equal(isChatGptLoginUrl("https://chatgpt.com/api/auth/session"), false);
+  const url = "https://chatgpt.com/auth/login?next=%2F";
+  let probes = 0;
+  const fixture = {
+    authNavigationError: null,
+    view: { webContents: { getURL: () => url } },
+    probeAuthentication: async () => { probes += 1; return { authenticated: false }; },
+  };
+  await assert.rejects(
+    BrowserHost.prototype.waitForAuthenticated.call(fixture, 60_000, { failWhenSignedOut: true }),
+    /ChatGPT web is signed out/,
+  );
+  assert.equal(probes, 1);
+  // A person logging in waits on the same page without the flag, so it must keep waiting there.
+  await assert.rejects(
+    BrowserHost.prototype.waitForAuthenticated.call(fixture, 1),
+    /login was not completed before the timeout/,
+  );
 });
 
 test("session inspection delegates navigation and capability detection to the shared browser helper", async () => {
