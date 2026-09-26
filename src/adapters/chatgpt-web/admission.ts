@@ -135,7 +135,13 @@ export class ChatGptAdmission {
   constructor(private readonly options: AdmissionOptions) {
     this.now = options.now ?? Date.now;
     this.log = options.log ?? (message => console.info(message));
-    this.setTimer = options.setTimer ?? ((callback, ms) => setTimeout(callback, ms));
+    // Unref'd: the listener keeps a live bridge running, and a queued turn's wake-up must not keep a
+    // stopping one alive (on Mars a restart with three turns queued waited out the 90s stop timeout).
+    this.setTimer = options.setTimer ?? ((callback, ms) => {
+      const timer = setTimeout(callback, ms);
+      timer.unref?.();
+      return timer;
+    });
     this.clearTimer = options.clearTimer ?? (timer => clearTimeout(timer));
     this.state = this.read();
   }
