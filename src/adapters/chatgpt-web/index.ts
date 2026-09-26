@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { chatGptRetainedConversationUsable } from "./retained-conversation-health";
 import { chatGptAnsweredWithoutTools } from "./toolless-turn";
-import { launcherHostForConversation } from "./launcher-host-pool";
+import { launcherHostForConversation, launcherSlotDescriptor } from "./launcher-host-pool";
 import { resolve } from "node:path";
 import { isChatGptWebZeroRiskBackendModel } from "../../chatgpt-web-models";
 import { defaultBrokerEndpoint, expandUserPath, resolveBrokerEndpoint } from "../../config";
@@ -451,7 +451,8 @@ export function createChatGptWebAdapter(
     const releaseRetainedConversation = conversationKey && retainedLauncherDescriptor
       ? async () => {
         await releaseLauncherRetainedConversation(
-          launcherHostForConversation(conversationKey) ?? retainedLauncherDescriptor,
+          // Affinity names a slot; the retained tab lives in that slot's browser.
+          launcherSlotDescriptor(launcherHostForConversation(conversationKey) ?? retainedLauncherDescriptor),
           conversationKey,
         );
       }

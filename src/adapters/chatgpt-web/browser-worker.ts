@@ -1392,6 +1392,8 @@ interface ChatGptAssistantTurnBinding {
   identity: string;
   locator: Locator;
   acceptedTurnIdentities: readonly string[];
+  /** User turns on the page when the binding was made; more than this means someone else typed. */
+  acceptedUserTurnCount?: number;
 }
 
 interface ChatGptSubmissionDomState {
@@ -1556,6 +1558,22 @@ export function chatGptNewTurnIdentity(
     throw new Error(`ChatGPT exposed ${added.length} new conversation turns for one submitted message`);
   }
   return added[0];
+}
+
+/**
+ * Fork: whether a detached binding saw a user turn that is not ours. The updated ChatGPT UI first
+ * renders a turn group under a provisional `fallback-turn-*` key and remounts it under the message
+ * id once the server has it (seen on Mars, 2026-09-26: 8 of 12 tool turns failed this way within
+ * 13-44s of acceptance, while the page held exactly the one user turn we sent). A new key alone is
+ * therefore not another turn; more user turns than when the binding was made is.
+ */
+export function chatGptAnotherUserTurnOpened(
+  current: readonly string[],
+  accepted: ReadonlySet<string>,
+  acceptedUserTurnCount: number | undefined,
+): boolean {
+  if (!current.some(identity => !accepted.has(identity))) return false;
+  return acceptedUserTurnCount === undefined || current.length > acceptedUserTurnCount;
 }
 
 export function chatGptReboundTurnIdentity(
@@ -3238,6 +3256,7 @@ export class ChatGptBrowserWorker {
         identity,
         locator: observationPage.locator(chatGptAssistantTurnSelector(identity)),
         acceptedTurnIdentities: state.turnIdentities,
+        acceptedUserTurnCount: state.userIdentities.length,
       };
       // The power UI can expose Stop for a long reasoning phase before mounting any assistant
       // node. Fresh generation evidence extends only DOM grace, never the caller's deadline.
@@ -3274,7 +3293,7 @@ export class ChatGptBrowserWorker {
     }
     const state = await this.submissionDomState(page, baseline.domCache, signal);
     const acceptedTurns = new Set(binding.acceptedTurnIdentities);
-    if (state.userIdentities.some(identity => !acceptedTurns.has(identity))) {
+    if (chatGptAnotherUserTurnOpened(state.userIdentities, acceptedTurns, binding.acceptedUserTurnCount)) {
       throw new Error("ChatGPT opened another user turn while the bound assistant response was detached");
     }
     const identity = chatGptReboundTurnIdentity(
@@ -3287,6 +3306,7 @@ export class ChatGptBrowserWorker {
       identity,
       locator: page.locator(chatGptAssistantTurnSelector(identity)),
       acceptedTurnIdentities: state.turnIdentities,
+      acceptedUserTurnCount: state.userIdentities.length,
     };
   }
 
