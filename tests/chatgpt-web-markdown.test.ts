@@ -24,14 +24,32 @@ test("turns observed inline file path formats into Markdown links", () => {
       target: "C:/Users/Dev/Documents/Codex/path-format-probe/zeta-result.pdf",
     },
     {
+      path: String.raw`C:\Codex_Project_Unity\_Editor\file.cs`,
+      target: "C:/Codex_Project_Unity/_Editor/file.cs",
+    },
+    {
+      path: String.raw`C:\Codex_Project_Unity\_file.cs`,
+      target: "C:/Codex_Project_Unity/_file.cs",
+    },
+    {
+      path: String.raw`\\server\share_name\_Editor\file.cs`,
+      target: "//server/share_name/_Editor/file.cs",
+    },
+    {
+      path: "src/_private_/file_name.ts",
+      target: "src/_private_/file_name.ts",
+    },
+    {
       path: "src/adapters/chatgpt-web/markdown.ts:47:3",
       target: "src/adapters/chatgpt-web/markdown.ts:47:3",
     },
   ];
 
   for (const { path, target } of cases) {
-    expect(chatGptHtmlToMarkdown(`<p>Created <code>${path}</code>.</p>`))
-      .toBe(`Created [${path}](<${target}>).`);
+    const markdown = chatGptHtmlToMarkdown(`<p>Created <code>${path}</code>.</p>`);
+    expect(markdown).toContain(`](<${target}>)`);
+    expect(Bun.markdown.html(markdown))
+      .toBe(`<p>Created <a href="${target}">${path}</a>.</p>\n`);
   }
 });
 
@@ -79,27 +97,26 @@ test("converts Obsidian aliases and headings but preserves code examples and emb
   ].join("\n"));
 });
 
-test("keeps Codex plan block markers verbatim so the client can render the plan", () => {
-  // ChatGPT renders the literal markers as text; Turndown would escape them to `<proposed\_plan>`.
-  const markdown = chatGptHtmlToMarkdown([
+test("preserves standalone Codex plan markers in paragraphs and list continuations", () => {
+  expect(chatGptHtmlToMarkdown([
     "<p>&lt;proposed_plan&gt;</p>",
-    "<h1>Collapse to the built-in display</h1>",
-    "<p>Keep snake_case names unchanged.</p>",
-    "<p>&lt;/proposed_plan&gt;</p>",
-  ].join(""));
-
-  expect(markdown).toBe([
-    "<proposed_plan>",
-    "",
-    "# Collapse to the built-in display",
-    "",
-    "Keep snake\\_case names unchanged.",
-    "",
-    "</proposed_plan>",
+    "<h2>Plan</h2>",
+    "<ul><li><p>Keep snake_case.</p><p>&lt;/proposed_plan&gt;</p></li></ul>",
+  ].join(""))).toBe([
+    "<proposed_plan>", "", "## Plan", "", "- Keep snake\\_case.", "  ", "  </proposed_plan>",
   ].join("\n"));
+  expect(chatGptHtmlToMarkdown("<p>&lt;proposed_plan&gt;<br>Step<br>&lt;/proposed_plan&gt;</p>"))
+    .toBe("<proposed_plan>  \nStep  \n</proposed_plan>");
 });
 
-test("does not rewrite plan markers that are only mentioned inside a sentence", () => {
-  expect(chatGptHtmlToMarkdown("<p>Wrap it in a &lt;proposed_plan&gt; block.</p>"))
-    .toBe("Wrap it in a <proposed\\_plan> block.");
+test("preserving plan markers does not rewrite mentions or literal code", () => {
+  expect(chatGptHtmlToMarkdown([
+    "<p>Mention &lt;proposed_plan&gt; and &lt;/proposed_plan&gt; inline.</p>",
+    "<p><code>&lt;proposed_plan&gt;</code> <code>&lt;/proposed_plan&gt;</code></p>",
+    "<pre><code>&lt;proposed\\_plan&gt;\n&lt;/proposed\\_plan&gt;</code></pre>",
+  ].join(""))).toBe([
+    "Mention <proposed\\_plan> and </proposed\\_plan> inline.", "",
+    "`<proposed_plan>` `</proposed_plan>`", "",
+    "```", "<proposed\\_plan>", "</proposed\\_plan>", "```",
+  ].join("\n"));
 });

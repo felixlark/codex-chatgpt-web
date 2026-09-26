@@ -21,12 +21,22 @@ turndown.addRule("removeSvg", {
   filter: node => node.nodeName === "SVG",
   replacement: () => "",
 });
+turndown.addRule("preserveCodexPlanBlockTags", {
+  filter: "p",
+  replacement: content => {
+    // Codex recognizes these standalone control lines verbatim. Restore only paragraph text:
+    // a post-conversion replacement would also rewrite literal escapes in fenced code.
+    const paragraph = content.replace(/^([ \t]*)<(\/?)proposed\\_plan>([ \t]*)$/gm, "$1<$2proposed_plan>$3");
+    return `\n\n${paragraph}\n\n`;
+  },
+});
 turndown.addRule("linkInlineFilePaths", {
   filter: node => inlineFilePath(node) !== undefined,
   replacement: (_content, node) => {
     const path = node.textContent!;
     const target = path.replaceAll("\\", "/");
-    return `[${path}](<${target}>)`;
+    // Code text becomes a plain link label, where backslashes and emphasis must be escaped.
+    return `[${turndown.escape(path)}](<${target}>)`;
   },
 });
 turndown.addRule("compactListItem", {
@@ -69,13 +79,6 @@ function preserveObsidianWikiLinks(markdown: string): string {
   // Turndown escapes literal brackets, but Codex interprets the resulting `\[` as LaTeX.
   // Restore the source syntax before converting it into a regular Markdown file link.
   return markdown.replace(/\\\[\\\[([^\r\n]*?)\\\]\\\]/g, "[[$1]]");
-}
-
-function preserveCodexPlanBlockTags(markdown: string): string {
-  // Turndown escapes the underscore in literal text, but Codex recognizes a plan block only when
-  // `<proposed_plan>` / `</proposed_plan>` appear verbatim on their own lines; `\_` hides the plan
-  // and its Implement action. Only the standalone marker lines are restored.
-  return markdown.replace(/^([ \t]*)<(\/?)proposed\\_plan>([ \t]*)$/gm, "$1<$2proposed_plan>$3");
 }
 
 function obsidianWikiLink(value: string): string | undefined {
@@ -138,7 +141,7 @@ function linkObsidianWikiLinks(markdown: string): string {
 
 export function chatGptHtmlToMarkdown(html: string): string {
   if (!html.trim()) return "";
-  return linkObsidianWikiLinks(preserveCodexPlanBlockTags(preserveObsidianWikiLinks(turndown.turndown(html)))).trim();
+  return linkObsidianWikiLinks(preserveObsidianWikiLinks(turndown.turndown(html))).trim();
 }
 
 export interface ChatGptMarkdownSegment {
@@ -146,6 +149,7 @@ export interface ChatGptMarkdownSegment {
   tag?: string;
   html: string;
   text: string;
+  linkTargets?: string[];
   group?: string;
   sourceStart?: number;
   sourceEnd?: number;
@@ -161,13 +165,14 @@ interface CommittedChatGptMarkdownSegment {
   key: string;
   tag?: string;
   text: string;
+  linkTargets?: string[];
   sourceStart?: number;
   sourceEnd?: number;
 }
 
 export class ChatGptMarkdownConsistencyError extends Error {
   constructor(message: string, readonly diagnostic?: {
-    reason: "text_changed" | "block_order_changed" | "source_range_overlap";
+    reason: "text_changed" | "link_target_changed" | "block_order_changed" | "source_range_overlap";
     observedStart?: number;
     observedEnd?: number;
     committedStart?: number;
@@ -310,6 +315,11 @@ export class ChatGptMarkdownBuffer {
           );
         }
         highestCommittedIndex = committedIndex;
+        // Link destinations are answer content even when textContent remains identical.
+        // Cosmetic DOM/formatting hydration still does not invalidate a committed paragraph.
+        if (JSON.stringify(committed.linkTargets ?? []) !== JSON.stringify(segment.linkTargets ?? [])) {
+          return this.changedCommittedBlockError("link_target_changed", segment, committed);
+        }
         continue;
       }
 
@@ -376,6 +386,7 @@ export class ChatGptMarkdownBuffer {
       key: segment.key,
       ...(segment.tag ? { tag: segment.tag } : {}),
       text: segment.text,
+      ...(segment.linkTargets ? { linkTargets: [...segment.linkTargets] } : {}),
       ...(segment.sourceStart !== undefined ? { sourceStart: segment.sourceStart } : {}),
       ...(segment.sourceEnd !== undefined ? { sourceEnd: segment.sourceEnd } : {}),
     };
