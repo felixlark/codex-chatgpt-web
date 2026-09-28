@@ -1,3 +1,14 @@
+> ### これは fork です
+>
+> アップストリーム：**[miuuyy/codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web)** — オリジナル、各プラットフォームのインストーラー、サポートはアップストリームを利用してください。
+>
+> この fork は、アップストリームが明示的にサポートしていない構成、つまり **Codex とは別のマシンでブリッジを動かし、複数のランチャーブラウザーを同時に扱う構成** のために存在します。
+>
+> - **相違点：**[この fork の変更点](#what-this-fork-changes)
+> - **リリース：** タグは `mars-vX.Y.Z`（アップストリームは `vX.Y.Z`）。最新は、アップストリーム v5.0.8 ベースの **[mars-v1.0.0](https://github.com/longbiaochen/codex-chatgpt-web/releases/tag/mars-v1.0.0)** です。
+> - **ここではインストーラーを配布しません。** リリースには 2 つのランタイムバンドル（`cli.js`、`browser-helper.cjs`）のみが含まれます。アップストリームのアプリをインストールしてから、この 2 ファイルを差し替えてください。
+> - この配置に固有でない変更はアップストリームへ提案し、それ以外は `mars-6.1` ブランチに残します。
+
 <p align="center">
   <img src="assets/readme/hero.svg" width="960" alt="Web モデルに切り替えても、Codex はそのまま。ChatGPT のプラン。いつものワークフロー。モデルの力を最大限に。">
 </p>
@@ -207,13 +218,3 @@ bun run app:package
 [トラブルシューティング](TROUBLESHOOTING.md) · [セキュリティ](SECURITY.md) · [コントリビューション](CONTRIBUTING.md) · [MIT ライセンス](LICENSE) · [CI](https://github.com/miuuyy/codex-chatgpt-web/actions/workflows/ci.yml)
 
 もう一つの自作アプリ：<img src="assets/readme/persona-voice.svg" width="20" height="20" alt=""> [ChatGPT Persona Voice](https://github.com/miuuyy/ChatGPT-Persona-Voice) — ChatGPT と Codex に、ローカルでほぼリアルタイムのカスタム音声を。
-> ### これは fork です
->
-> アップストリーム：**[miuuyy/codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web)** — オリジナル、各プラットフォームのインストーラー、サポートはアップストリームを利用してください。
->
-> この fork は、アップストリームが明示的にサポートしていない構成、つまり **Codex とは別のマシンでブリッジを動かし、複数のランチャーブラウザーを同時に扱う構成** のために存在します。
->
-> - **相違点：**[この fork の変更点](#what-this-fork-changes)
-> - **リリース：** タグは `mars-vX.Y.Z`（アップストリームは `vX.Y.Z`）。最新は、アップストリーム v5.0.8 ベースの **[mars-v1.0.0](https://github.com/longbiaochen/codex-chatgpt-web/releases/tag/mars-v1.0.0)** です。
-> - **ここではインストーラーを配布しません。** リリースには 2 つのランタイムバンドル（`cli.js`、`browser-helper.cjs`）のみが含まれます。アップストリームのアプリをインストールしてから、この 2 ファイルを差し替えてください。
-> - この配置に固有でない変更はアップストリームへ提案し、それ以外は `mars-6.1` ブランチに残します。

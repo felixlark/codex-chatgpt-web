@@ -1,3 +1,14 @@
+> ### 이 저장소는 fork입니다
+>
+> 업스트림: **[miuuyy/codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web)** — 원본, 플랫폼별 설치 프로그램과 지원은 업스트림을 이용하세요.
+>
+> 이 fork는 업스트림이 명시적으로 지원하지 않는 구성, 즉 **Codex와 다른 컴퓨터에서 브리지를 실행하면서 여러 런처 브라우저를 동시에 제공하는 구성**을 위해 존재합니다.
+>
+> - **차이점:** [이 fork의 변경 사항](#what-this-fork-changes)
+> - **릴리스:** 태그는 `mars-vX.Y.Z` 형식입니다(업스트림은 `vX.Y.Z`). 최신 릴리스는 업스트림 v5.0.8 기반의 **[mars-v1.0.0](https://github.com/longbiaochen/codex-chatgpt-web/releases/tag/mars-v1.0.0)** 입니다.
+> - **여기서는 설치 프로그램을 제공하지 않습니다.** 릴리스에는 런타임 번들 두 개(`cli.js`, `browser-helper.cjs`)만 있습니다. 업스트림 앱을 설치한 뒤 이 두 파일을 교체하세요.
+> - 이 배포에만 한정되지 않는 변경은 업스트림에 제안하고, 나머지는 `mars-6.1` 브랜치에 유지합니다.
+
 <p align="center">
   <img src="assets/readme/hero.svg" width="960" alt="웹 모델로 전환해도, Codex는 그대로. 내 ChatGPT 플랜. 내 작업 흐름. 모델의 가능성을 최대한.">
 </p>
@@ -210,13 +221,3 @@ bun run app:package
 [문제 해결](TROUBLESHOOTING.md) · [보안](SECURITY.md) · [기여](CONTRIBUTING.md) · [MIT 라이선스](LICENSE) · [CI](https://github.com/miuuyy/codex-chatgpt-web/actions/workflows/ci.yml)
 
 제가 만든 또 다른 앱: <img src="assets/readme/persona-voice.svg" width="20" height="20" alt=""> [ChatGPT Persona Voice](https://github.com/miuuyy/ChatGPT-Persona-Voice) — ChatGPT와 Codex를 위한 로컬, 거의 실시간의 사용자 지정 음성.
-> ### 이 저장소는 fork입니다
->
-> 업스트림: **[miuuyy/codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web)** — 원본, 플랫폼별 설치 프로그램과 지원은 업스트림을 이용하세요.
->
-> 이 fork는 업스트림이 명시적으로 지원하지 않는 구성, 즉 **Codex와 다른 컴퓨터에서 브리지를 실행하면서 여러 런처 브라우저를 동시에 제공하는 구성**을 위해 존재합니다.
->
-> - **차이점:** [이 fork의 변경 사항](#what-this-fork-changes)
-> - **릴리스:** 태그는 `mars-vX.Y.Z` 형식입니다(업스트림은 `vX.Y.Z`). 최신 릴리스는 업스트림 v5.0.8 기반의 **[mars-v1.0.0](https://github.com/longbiaochen/codex-chatgpt-web/releases/tag/mars-v1.0.0)** 입니다.
-> - **여기서는 설치 프로그램을 제공하지 않습니다.** 릴리스에는 런타임 번들 두 개(`cli.js`, `browser-helper.cjs`)만 있습니다. 업스트림 앱을 설치한 뒤 이 두 파일을 교체하세요.
-> - 이 배포에만 한정되지 않는 변경은 업스트림에 제안하고, 나머지는 `mars-6.1` 브랜치에 유지합니다.
