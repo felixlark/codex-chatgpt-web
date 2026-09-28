@@ -35,21 +35,54 @@ export function legacyChatGptConnectorMigrationMessage(legacyName: string): stri
     + ` do not rename or refresh ${JSON.stringify(legacyName)}.`;
 }
 
+export function validateConnectorNameSuffix(value: unknown): string {
+  if (typeof value !== "string" || value.length > 74
+    || !/^[\p{L}\p{N}][\p{L}\p{N} _-]*$/u.test(value)
+    || value !== value.trim()) {
+    throw new Error("The part after Codex must contain 1–74 letters, numbers, spaces, hyphens or underscores");
+  }
+  if (value === "Native") throw new Error("Codex Native is retired; choose another plugin name");
+  return value;
+}
+
+function validateCurrentConnectorName(value: unknown): string {
+  if (typeof value !== "string" || !value.startsWith("Codex ")) {
+    throw new Error("Plugin names must start with Codex followed by a space");
+  }
+  validateConnectorNameSuffix(value.slice(6));
+  return value;
+}
+
 export interface InteractionConnectorIdentities {
   appName: string;
   automaticAppName: string;
-  manualAppName: typeof ZERO_RISK_CHATGPT_CONNECTOR_NAME;
+  manualAppName: string;
 }
 
 export function resolveInteractionConnectorIdentities(
   interactionMode: BrowserInteractionMode,
   profile: "production" | "development" = "production",
+  existing: Partial<InteractionConnectorIdentities> = {},
+  suffix?: string,
 ): InteractionConnectorIdentities {
-  const automaticAppName = profile === "development" ? DEV_CHATGPT_CONNECTOR_NAME : CHATGPT_CONNECTOR_NAME;
+  const defaultAutomatic = profile === "development" ? DEV_CHATGPT_CONNECTOR_NAME : CHATGPT_CONNECTOR_NAME;
+  let automaticAppName = existing.automaticAppName ?? defaultAutomatic;
+  let manualAppName = existing.manualAppName ?? ZERO_RISK_CHATGPT_CONNECTOR_NAME;
+  if (isLegacyChatGptConnectorName(automaticAppName)) automaticAppName = defaultAutomatic;
+  if (suffix !== undefined) {
+    const name = `Codex ${validateConnectorNameSuffix(suffix)}`;
+    if (interactionMode === "manual") manualAppName = name;
+    else automaticAppName = name;
+  }
+  validateCurrentConnectorName(automaticAppName);
+  validateCurrentConnectorName(manualAppName);
+  if (automaticAppName === manualAppName) {
+    throw new Error("Automatic and Zero Risk connector names must differ");
+  }
   return {
-    appName: interactionMode === "manual" ? ZERO_RISK_CHATGPT_CONNECTOR_NAME : automaticAppName,
+    appName: interactionMode === "manual" ? manualAppName : automaticAppName,
     automaticAppName,
-    manualAppName: ZERO_RISK_CHATGPT_CONNECTOR_NAME,
+    manualAppName,
   };
 }
 
@@ -73,10 +106,13 @@ export interface AppConfig {
   contextWindow: number;
   appName: string;
   automaticAppName: string;
-  manualAppName: typeof ZERO_RISK_CHATGPT_CONNECTOR_NAME;
+  manualAppName: string;
   browserHost: BrowserHostMode;
   browserInteractionMode: BrowserInteractionMode;
   browserHostDescriptorPath?: string;
+  browserHostPool?: string[];
+  browserHostAppNames?: Record<string, string>;
+  browserHostSlots?: Array<{ descriptor: string; appName: string }>;
   chromeExecutablePath: string;
   storageStatePath: string;
   brokerSocketPath: string;
@@ -86,6 +122,8 @@ export interface AppConfig {
   proAvailable: boolean;
   experimentalBiggerContext: boolean;
   experimentalSkillAttachments: boolean;
+  experimentalFreshConversationPerTurn: boolean;
+  useSavedChats: boolean;
   /** Explicitly install the additional Pro-sized model row while Zero Risk is active. */
   zeroRiskProEnabled: boolean;
   /** Optional adapter-silence budget for the Responses watchdog. */
@@ -216,6 +254,8 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     proAvailable: false,
     experimentalBiggerContext: false,
     experimentalSkillAttachments: false,
+    experimentalFreshConversationPerTurn: false,
+    useSavedChats: false,
     zeroRiskProEnabled: false,
     autoApproveToolCalls: false,
     controlToken: randomBytes(32).toString("base64url"),
@@ -360,7 +400,8 @@ export function loadConfigForSetup(): AppConfig {
   const interactionMode = raw.browserInteractionMode ?? "automatic";
   const automaticName = raw.automaticAppName
     ?? (interactionMode === "automatic" ? raw.appName : CHATGPT_CONNECTOR_NAME);
-  if (automaticName === ZERO_RISK_CHATGPT_CONNECTOR_NAME) {
+  if (automaticName === ZERO_RISK_CHATGPT_CONNECTOR_NAME
+    && (raw.manualAppName ?? ZERO_RISK_CHATGPT_CONNECTOR_NAME) === ZERO_RISK_CHATGPT_CONNECTOR_NAME) {
     raw.automaticAppName = CHATGPT_CONNECTOR_NAME;
     if (interactionMode === "automatic") raw.appName = CHATGPT_CONNECTOR_NAME;
   }
@@ -415,9 +456,8 @@ function parseConfig(value: unknown, path: string): AppConfig {
   if (typeof automaticAppName !== "string" || !automaticAppName.trim() || automaticAppName.length > 80) {
     throw new Error(`Invalid automaticAppName in ${path}`);
   }
-  if (manualAppName !== ZERO_RISK_CHATGPT_CONNECTOR_NAME) {
-    throw new Error(`manualAppName must be ${JSON.stringify(ZERO_RISK_CHATGPT_CONNECTOR_NAME)} in ${path}`);
-  }
+  if (!isLegacyChatGptConnectorName(automaticAppName)) validateCurrentConnectorName(automaticAppName);
+  validateCurrentConnectorName(manualAppName);
   if (automaticAppName === manualAppName) {
     throw new Error(`Automatic and Zero Risk connector names must differ in ${path}; rerun setup`);
   }
@@ -432,6 +472,32 @@ function parseConfig(value: unknown, path: string): AppConfig {
   if (parsed.browserHost === "launcher"
     && !isAbsolute(expandUserPath(parsed.browserHostDescriptorPath!))) {
     throw new Error(`Launcher browserHostDescriptorPath must be absolute in ${path}`);
+  }
+  if (parsed.browserHostPool !== undefined) {
+    if (parsed.browserHost !== "launcher"
+      || !Array.isArray(parsed.browserHostPool)
+      || parsed.browserHostPool.some(host => typeof host !== "string" || !isAbsolute(expandUserPath(host)))) {
+      throw new Error(`browserHostPool must list absolute launcher descriptor paths in ${path}`);
+    }
+  }
+  if (parsed.browserHostAppNames !== undefined) {
+    const names = parsed.browserHostAppNames;
+    if (!names || typeof names !== "object" || Array.isArray(names)
+      || Object.entries(names).some(([host, name]) => !isAbsolute(expandUserPath(host))
+        || typeof name !== "string" || !name.trim() || name.length > 80)) {
+      throw new Error(`browserHostAppNames must map launcher descriptor paths to connector names in ${path}`);
+    }
+  }
+  if (parsed.browserHostSlots !== undefined) {
+    const slots = parsed.browserHostSlots;
+    if (parsed.browserHost !== "launcher" || !Array.isArray(slots) || slots.length === 0
+      || slots.some(slot => !slot || typeof slot !== "object"
+        || typeof slot.descriptor !== "string" || !isAbsolute(expandUserPath(slot.descriptor))
+        || slot.descriptor.includes("#")
+        || typeof slot.appName !== "string" || !slot.appName.trim() || slot.appName.length > 80)
+      || new Set(slots.map(slot => `${slot.descriptor}#${slot.appName}`)).size !== slots.length) {
+      throw new Error(`browserHostSlots must list distinct { descriptor, appName } pairs with absolute launcher descriptor paths in ${path}`);
+    }
   }
   const brokerEndpoint = expandUserPath(parsed.brokerSocketPath!);
   if (process.platform === "win32") {
@@ -510,6 +576,15 @@ function parseConfig(value: unknown, path: string): AppConfig {
     throw new Error(`Invalid experimentalSkillAttachments in ${path}`);
   }
   const experimentalSkillAttachments = parsed.experimentalSkillAttachments === true;
+  if (parsed.experimentalFreshConversationPerTurn !== undefined
+    && typeof parsed.experimentalFreshConversationPerTurn !== "boolean") {
+    throw new Error(`Invalid experimentalFreshConversationPerTurn in ${path}`);
+  }
+  const experimentalFreshConversationPerTurn = parsed.experimentalFreshConversationPerTurn === true;
+  if (parsed.useSavedChats !== undefined && typeof parsed.useSavedChats !== "boolean") {
+    throw new Error(`Invalid useSavedChats in ${path}`);
+  }
+  const useSavedChats = parsed.useSavedChats === true;
   if (browserInteractionMode === "manual" && experimentalSkillAttachments) {
     throw new Error(`Zero Risk does not support Skills as files in ${path}`);
   }
@@ -535,6 +610,8 @@ function parseConfig(value: unknown, path: string): AppConfig {
     proAvailable,
     experimentalBiggerContext,
     experimentalSkillAttachments,
+    experimentalFreshConversationPerTurn,
+    useSavedChats,
     zeroRiskProEnabled,
   } as AppConfig;
 }
@@ -579,6 +656,9 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       browserInteractionMode: config.browserInteractionMode,
       browserHost: config.browserHost,
       browserHostDescriptorPath: config.browserHostDescriptorPath,
+      ...(config.browserHostPool?.length ? { browserHostPool: config.browserHostPool } : {}),
+      ...(config.browserHostAppNames ? { browserHostAppNames: config.browserHostAppNames } : {}),
+      ...(config.browserHostSlots?.length ? { browserHostSlots: config.browserHostSlots } : {}),
       storageStatePath: config.storageStatePath,
       chromeExecutablePath: config.chromeExecutablePath,
       brokerSocketPath: config.brokerSocketPath,
@@ -591,6 +671,8 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       proAvailable: manual ? false : config.proAvailable,
       experimentalBiggerContext: manual ? false : config.experimentalBiggerContext,
       experimentalSkillAttachments: manual ? false : config.experimentalSkillAttachments,
+      experimentalFreshConversationPerTurn: !manual && config.experimentalFreshConversationPerTurn === true,
+      useSavedChats: config.useSavedChats === true,
       ...(config.stallTimeoutSec !== undefined ? { stallTimeoutSec: config.stallTimeoutSec } : {}),
       autoApproveToolCalls: manual ? false : config.autoApproveToolCalls,
     },

@@ -1,10 +1,12 @@
+import { clearLauncherHostAffinity, launcherSlot, selectLauncherHost } from "../src/adapters/chatgpt-web/launcher-host-pool";
 import { selectedSkillFile } from "../src/adapters/chatgpt-web/skill-attachments";
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
-import { LauncherBrowserHelperClient } from "../src/adapters/chatgpt-web/launcher-helper-client";
+import { LauncherBrowserHelperClient, setSharedAdmissionForTests } from "../src/adapters/chatgpt-web/launcher-helper-client";
+import { ChatGptAdmission, COOLDOWN_MS } from "../src/adapters/chatgpt-web/admission";
 import type { BrowserTurn, ResolvedBrowserConfig } from "../src/adapters/chatgpt-web/browser-worker";
 import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
 
@@ -20,7 +22,9 @@ test("daemon streams browser lifecycle through the real helper process", async (
   writeFileSync(helper, `
     import { ChatGptBrowserWorker } from ${JSON.stringify(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url).href)};
     // Substitute only the browser. Both sides of the production IPC protocol run unchanged.
-    ChatGptBrowserWorker.prototype.run = async turn => {
+    ChatGptBrowserWorker.prototype.run = async function(turn) {
+      if (this.config.useSavedChats !== true) throw new Error("Saved chat preference lost in helper IPC");
+      if (turn.modelFamily !== "5.6") throw new Error("Pinned model family lost in helper IPC");
       await turn.onPreparedSelected(false);
       const prepared = await turn.prepare();
       if (prepared.skillFiles?.[0]?.text !== "<skill>\\n<name>ipc</name>\\n<path>/skills/ipc/SKILL.md</path>\\ncheck IPC\\n</skill>") throw new Error("Skill file lost in IPC");
@@ -78,6 +82,7 @@ test("daemon streams browser lifecycle through the real helper process", async (
     turnTimeoutMs: 60_000,
     headed: true,
     autoApproveToolCalls: false,
+    useSavedChats: true,
   };
   const reasoning: Array<{ text: string; continuation: boolean }> = [];
   const deltas: string[] = [];
@@ -92,6 +97,7 @@ test("daemon streams browser lifecycle through the real helper process", async (
       traceId: "abcdef123456",
       modelId: "gpt-5.6-sol",
       reasoning: "high",
+      modelFamily: "5.6",
       capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
       prepare: async () => ({
         text: "inspect", images: [],
@@ -185,7 +191,7 @@ test("accepted compaction retires through the helper as completed without hiding
     appName: "Codex Native2", browserHost: "launcher", browserHostDescriptorPath: descriptorPath,
     browserHelperScriptPath: helper, browserDiagnosticsPath: join(root, "diagnostics"),
     storageStatePath: join(root, "unused-state.json"), chromeExecutablePath: join(root, "unused-chrome"),
-    turnTimeoutMs: 60_000, headed: true, autoApproveToolCalls: false,
+    turnTimeoutMs: 60_000, headed: true, autoApproveToolCalls: false, useSavedChats: false,
   });
   const logs: string[] = [];
   const logger = spyOn(console, "info").mockImplementation((...args) => { logs.push(args.join(" ")); });
@@ -238,6 +244,7 @@ test("launcher helper protocol preserves multipart context and the compaction fl
     turnTimeoutMs: 60_000,
     headed: true,
     autoApproveToolCalls: false,
+    useSavedChats: false,
   });
   const internal = client as unknown as {
     pending: Map<string, { resolve(value: string): void }>;
@@ -301,6 +308,51 @@ test("launcher helper protocol preserves multipart context and the compaction fl
   });
 });
 
+test("a slot sends its own connector and its browser's descriptor", async () => {
+  const sent: Record<string, unknown>[] = [];
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Mars Alpha",
+    browserHost: "launcher",
+    browserHostDescriptorPath: "/durable/alpha.json",
+    browserHostSlots: [launcherSlot("/durable/alpha.json", "Codex Mars Beta")],
+    storageStatePath: "/durable/unused-state.json",
+    chromeExecutablePath: "/durable/unused-chrome",
+    turnTimeoutMs: 60_000,
+    headed: true,
+    autoApproveToolCalls: false,
+    useSavedChats: false,
+  });
+  const internal = client as unknown as {
+    child?: unknown;
+    ensureChild(): Promise<void>;
+    send(message: Record<string, unknown>): Promise<void>;
+    handleLine(child: unknown, line: string): void;
+  };
+  const child = {};
+  internal.child = child;
+  internal.ensureChild = async () => {};
+  internal.send = async message => {
+    sent.push(message);
+    if (message.type === "run") {
+      queueMicrotask(() => internal.handleLine(child, JSON.stringify({ type: "event", id: message.id, event: "prepared_selected", reused: false })));
+    } else if (message.type === "prepared_selected_ack") {
+      queueMicrotask(() => internal.handleLine(child, JSON.stringify({ type: "result", id: message.id, text: "done" })));
+    }
+  };
+  await expect(client.run({
+    traceId: "slot-123",
+    modelId: "gpt-5.6-sol",
+    reasoning: "high",
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+    prepare: async () => ({ text: "go", images: [], release() {} }),
+    onTextDelta() {},
+  })).resolves.toBe("done");
+  expect(sent[0]).toMatchObject({
+    type: "run",
+    config: { appName: "Codex Mars Beta", browserHostDescriptorPath: "/durable/alpha.json" },
+  });
+});
+
 test("an abort dispatched during run submission cannot overtake the run frame", async () => {
   const controller = new AbortController();
   const messages: string[] = [];
@@ -314,6 +366,7 @@ test("an abort dispatched during run submission cannot overtake the run frame", 
     turnTimeoutMs: 60_000,
     headed: true,
     autoApproveToolCalls: false,
+    useSavedChats: false,
   });
   const internal = client as unknown as {
     ensureChild(): Promise<void>;
@@ -360,6 +413,7 @@ test("structured helper errors preserve the ChatGPT adapter failure contract", a
     turnTimeoutMs: 60_000,
     headed: true,
     autoApproveToolCalls: false,
+    useSavedChats: false,
   });
   const internal = client as unknown as {
     child?: unknown;
@@ -410,7 +464,7 @@ test("structured helper errors preserve the ChatGPT adapter failure contract", a
 test("an older helper cannot silently drop selected skill files and releases the prepared turn", async () => {
   const client = new LauncherBrowserHelperClient({
     appName: "Codex Native2", browserHost: "launcher", browserHostDescriptorPath: "/durable/launcher.json",
-    storageStatePath: "/durable/unused.json", chromeExecutablePath: "/durable/chrome", headed: true, autoApproveToolCalls: false,
+    storageStatePath: "/durable/unused.json", chromeExecutablePath: "/durable/chrome", headed: true, autoApproveToolCalls: false, useSavedChats: false,
   });
   const internal = client as unknown as {
     child: unknown;
@@ -445,4 +499,299 @@ test("an older helper cannot silently drop selected skill files and releases the
   })).rejects.toThrow("does not support skill attachments");
   expect(sent).toEqual(["run", "abort"]);
   expect(released).toBe(true);
+});
+
+describe("admission requeue on a throttle", () => {
+  function gatedClient() {
+    let now = 5_000_000;
+    let timer: (() => void) | undefined;
+    const admission = new ChatGptAdmission({
+      maxConcurrent: 3, now: () => now, log: () => {},
+      setTimer: callback => { timer = callback; return 0 as unknown as ReturnType<typeof setTimeout>; },
+      clearTimer: () => { timer = undefined; },
+    });
+    setSharedAdmissionForTests(admission);
+    const client = new LauncherBrowserHelperClient({
+      appName: "Codex Native2", browserHost: "launcher", browserHostDescriptorPath: "/durable/launcher.json",
+      storageStatePath: "/durable/unused.json", chromeExecutablePath: "/durable/chrome", headed: true, autoApproveToolCalls: false,
+      useSavedChats: false,
+    }, undefined, undefined, 0);
+    const internal = client as unknown as {
+      ensureChild(): Promise<void>;
+      runAdmitted(turn: { onSubmitted?: () => void }, onHost?: (host: string) => void): Promise<string>;
+    };
+    internal.ensureChild = async () => {};
+    return {
+      client, internal, admission,
+      advance(ms: number) { now += ms; const fire = timer; timer = undefined; fire?.(); },
+    };
+  }
+  const turn = () => ({
+    traceId: "t-throttle", modelId: "chatgpt-web/high",
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+    prepare: async () => ({ text: "x", images: [], release() {} }),
+    onTextDelta() {},
+  });
+  const rateLimited = () => new Error("ChatGPT rate limit: too many requests. Try again in a few minutes.");
+  afterEach(() => setSharedAdmissionForTests(undefined));
+
+  test("a throttle before ChatGPT accepted the prompt waits in the gate and runs again", async () => {
+    const { client, internal, admission, advance } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async () => {
+      attempts += 1;
+      if (attempts === 1) throw rateLimited();
+      return "done";
+    };
+    const result = client.run(turn() as never);
+    await Bun.sleep(5);
+    expect(attempts).toBe(1);
+    expect(admission.snapshot().cooldownUntil).toBeGreaterThan(5_000_000);   // cooling down, not failed
+    advance(COOLDOWN_MS + 100);
+    expect(await result).toBe("done");
+    expect(attempts).toBe(2);
+  });
+
+  test("page failures before submission are retried (twelve times at most), without a cooldown", async () => {
+    const { client, internal, admission } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("ChatGPT web login is expired or the Temporary Chat surface is unavailable");
+      if (attempts === 2) throw new Error("ChatGPT could not load the account subscription. Reload ChatGPT inside the launcher and retry");
+      if (attempts === 3) throw new Error("ChatGPT personalization preflight exceeded its readiness deadline");
+      return "done";
+    };
+    expect(await client.run(turn() as never)).toBe("done");
+    expect(attempts).toBe(4);
+    expect(admission.snapshot().cooldownUntil).toBe(0);
+    const fresh = gatedClient();                          // its own budget: 13 more admissions
+    let always = 0;
+    fresh.internal.runAdmitted = async () => {
+      always += 1;
+      throw new Error("ChatGPT web login is expired or the Temporary Chat surface is unavailable");
+    };
+    await expect(fresh.client.run(turn() as never)).rejects.toThrow("login is expired");
+    expect(always).toBe(13);                             // first try + 12 retries
+  });
+
+  test("the 6.1 wording of the expired-login failure is still retried before submission", async () => {
+    // Upstream 6.1 renamed "Temporary Chat surface" to "new chat surface"; the old pattern then sent
+    // this pre-submission failure straight back to Codex, which blocks the goal.
+    const { client, internal } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("ChatGPT web login is expired or the new chat surface is unavailable");
+      return "done";
+    };
+    expect(await client.run(turn() as never)).toBe("done");
+    expect(attempts).toBe(2);
+  });
+
+  test("a signed-out browser holds its turns for a login, far past the page-failure limit", async () => {
+    const { client, internal, admission } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async () => {
+      attempts += 1;
+      if (attempts <= 20) throw new Error("ChatGPT web is signed out: the browser was sent to the ChatGPT login page.");
+      return "done";
+    };
+    expect(await client.run(turn() as never)).toBe("done");
+    expect(attempts).toBe(21);                          // beyond the twelve page-failure retries
+    expect(admission.snapshot().cooldownUntil).toBe(0);  // nothing reached ChatGPT: no account cooldown
+    const fresh = gatedClient();
+    let always = 0;
+    fresh.internal.runAdmitted = async () => {
+      always += 1;
+      throw new Error("ChatGPT web is signed out: the browser was sent to the ChatGPT login page.");
+    };
+    await expect(fresh.client.run(turn() as never)).rejects.toThrow("signed out");
+    expect(always).toBe(37);                             // first try + 36 waits (three hours on Mars)
+  });
+
+  test("a signed-out browser takes every slot it hosts out of new turns, not just the one that failed", async () => {
+    // Mars, 2026-09-26: three slots share alpha's login, and each round of retries tried all three.
+    clearLauncherHostAffinity();
+    const alphaA = launcherSlot("/durable/alpha.json", "Codex Mars Alpha");
+    const alphaB = launcherSlot("/durable/alpha.json", "Codex Mars Beta");
+    const other = launcherSlot("/durable/other.json", "Codex Mars Gamma");
+    setSharedAdmissionForTests(new ChatGptAdmission({ maxConcurrent: 3, log: () => {} }));
+    const client = new LauncherBrowserHelperClient({
+      appName: "Codex Mars Alpha", browserHost: "launcher", browserHostDescriptorPath: "/durable/alpha.json",
+      browserHostSlots: [alphaA, alphaB, other],
+      storageStatePath: "/durable/unused.json", chromeExecutablePath: "/durable/chrome", headed: true, autoApproveToolCalls: false,
+      useSavedChats: false,
+    } as ResolvedBrowserConfig, undefined, undefined, 0);
+    const internal = client as unknown as {
+      ensureChild(): Promise<void>;
+      runAdmitted(turn: unknown, onHost?: (host: string) => void): Promise<string>;
+    };
+    internal.ensureChild = async () => {};
+    let attempts = 0;
+    internal.runAdmitted = async (_turn, onHost) => {
+      attempts += 1;
+      onHost?.(alphaA);
+      if (attempts === 1) throw new Error("ChatGPT web is signed out: the browser was sent to the ChatGPT login page.");
+      return "done";
+    };
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(await client.run(turn() as never)).toBe("done");
+    } finally {
+      warn.mockRestore();
+    }
+    expect(selectLauncherHost({
+      primary: alphaA, pool: [alphaB, other], activeTurns: () => 0, read: () => ({}),
+    })).toBe(other);
+    clearLauncherHostAffinity();
+  });
+
+  test("a host still refreshing its session after a bridge restart is retried with the slot refunded", async () => {
+    // Seen on Mars right after a restart: four turns failed with this before any prompt was sent,
+    // were not retried, and each kept its admission slot, filling the 60-minute window.
+    const { client, internal, admission } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new Error("Launcher browser control channel failed: HTTP 400: ChatGPT browser is busy with session refresh");
+      }
+      return "done";
+    };
+    expect(await client.run(turn() as never)).toBe("done");
+    expect(attempts).toBe(2);
+    expect(admission.snapshot().recent60).toBe(1);
+  });
+
+  test("a page that does not load before submission is retried instead of blocking the goal", async () => {
+    // Seen on Mars at 01:39: both errors went back to Codex and blocked two goals.
+    const { client, internal } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("ChatGPT browser stage timed out: browser_page");
+      if (attempts === 2) throw new Error("page.goto: Timeout 60000ms exceeded.\nCall log:\n  - navigating to \"https://chatgpt.com/?temporary-chat=true\"");
+      return "done";
+    };
+    expect(await client.run(turn() as never)).toBe("done");
+    expect(attempts).toBe(3);
+  });
+
+  test("a model picker that never responds is retried instead of blocking the goal", async () => {
+    // Mars, 09:34: effort selection timed out after 70 s on the one signed-in host and Codex was
+    // told the model was at capacity, which blocked the iOS goal. It happens before any send.
+    const { client, internal } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("ChatGPT model controls are unavailable. Reload ChatGPT and retry the task.");
+      return "done";
+    };
+    expect(await client.run(turn() as never)).toBe("done");
+    expect(attempts).toBe(2);
+  });
+
+  test("a connector menu that did not list the host's connector is retried", async () => {
+    // Mars, 09:38: the same host had used that connector two minutes earlier, so the menu simply
+    // had not loaded; reporting it to Codex blocked the crowd-verse goal. It happens before send.
+    const { client, internal } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new Error('ChatGPT connector menu opened but exposed no row named "Codex Mars Beta" after 3 complete'
+          + " mention trigger attempt(s); create a connector with that exact name before retrying");
+      }
+      if (attempts === 2) throw new Error("ChatGPT connector menu did not open after 3 complete mention trigger attempt(s)");
+      return "done";
+    };
+    expect(await client.run(turn() as never)).toBe("done");
+    expect(attempts).toBe(3);
+  });
+
+  test("a throttle after Send was pressed is not run again, even before ChatGPT confirmed it", async () => {
+    const { client, internal } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async sentTurn => {
+      attempts += 1;
+      await (sentTurn as { onSendActivated?: () => unknown }).onSendActivated?.();
+      throw rateLimited();
+    };
+    // Not replayed here, and not handed to Codex as a rate limit either: Codex treats that as final
+    // and blocks the goal. A retryable failure makes Codex's retry wait out the cooldown in the gate.
+    const failure = await client.run(turn() as never).catch(error => error);
+    expect(String(failure.message)).toContain("throttled this turn after it had started");
+    expect(failure.retryable).toBe(true);
+    expect(attempts).toBe(1);
+  });
+
+  test("a throttle after ChatGPT accepted the prompt still goes back to Codex", async () => {
+    const { client, internal } = gatedClient();
+    internal.runAdmitted = async submittedTurn => {
+      submittedTurn.onSubmitted?.();
+      throw rateLimited();
+    };
+    const failure = await client.run(turn() as never).catch(error => error);
+    expect(String(failure.message)).toContain("throttled this turn after it had started");
+    expect(failure.retryable).toBe(true);
+  });
+});
+
+describe("unresponsive helper watchdog", () => {
+  function client(now: { value: number }) {
+    const created = new LauncherBrowserHelperClient({
+      appName: "Codex Native2", browserHost: "launcher", browserHostDescriptorPath: "/durable/launcher.json",
+      storageStatePath: "/durable/unused.json", chromeExecutablePath: "/durable/chrome", headed: true, autoApproveToolCalls: false,
+      useSavedChats: false,
+    }, 5 * 60_000, () => now.value);
+    const internal = created as unknown as {
+      pending: Map<string, unknown>;
+      send(message: Record<string, unknown>): Promise<void>;
+      handleLine(child: unknown, line: string): void;
+      child: unknown;
+    };
+    const sent: Record<string, unknown>[] = [];
+    internal.send = async message => { sent.push(message); };
+    return { created, internal, sent };
+  }
+  const pendingTurn = (resolve: (v: string) => void, reject: (e: Error) => void, lastHelperEventAt: number) => ({
+    turn: {
+      traceId: "stuck-1", modelId: "chatgpt-web/high",
+      capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+      prepare: async () => ({ text: "x", images: [], release() {} }),
+      onTextDelta() {},
+    },
+    resolve, reject, sent: true, lastHelperEventAt,
+  });
+
+  test("a sent turn whose helper goes silent for five minutes is aborted with a retryable error", async () => {
+    const now = { value: 1_000_000 };
+    const { created, internal, sent } = client(now);
+    const result = new Promise<string>((resolve, reject) => internal.pending.set("stuck-1", pendingTurn(resolve, reject, now.value)));
+    now.value += 4 * 60_000;
+    created.checkUnresponsiveTurns();
+    expect(internal.pending.has("stuck-1")).toBe(true);           // four minutes: still waiting
+    now.value += 61_000;
+    created.checkUnresponsiveTurns();
+    const error = await result.then(() => undefined, failure => failure);
+    expect(error).toBeInstanceOf(ChatGptWebAdapterError);
+    expect(error).toMatchObject({ code: "chatgpt_page_unresponsive", retryable: true });
+    // The cause travels with the abort so the turn's error names it rather than reading generic.
+    expect(sent).toContainEqual({ type: "abort", id: "stuck-1", cause: "the ChatGPT page stopped responding" });
+  });
+
+  test("helper heartbeats keep a long turn alive", () => {
+    const now = { value: 1_000_000 };
+    const { created, internal } = client(now);
+    const child = {};
+    internal.child = child;
+    internal.pending.set("stuck-1", pendingTurn(() => {}, () => {}, now.value));
+    for (let minute = 0; minute < 12; minute += 1) {
+      now.value += 60_000;
+      internal.handleLine(child, JSON.stringify({ type: "event", id: "stuck-1", event: "heartbeat" }));
+      created.checkUnresponsiveTurns();
+    }
+    expect(internal.pending.has("stuck-1")).toBe(true);
+  });
 });

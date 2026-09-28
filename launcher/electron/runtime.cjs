@@ -12,6 +12,7 @@ const {
   isLegacyConnectorName,
   requireCurrentRuntimeConnectorName,
   validateConnectorName,
+  validateConnectorNameSuffix,
 } = require("./connector-identity.cjs");
 const { embeddedRuntimeInvocation, runtimeInvocation } = require("./runtime-command.cjs");
 const { redactText } = require("./logging.cjs");
@@ -908,22 +909,62 @@ class RuntimeHost {
     if (!current.configured || current.mode !== "full") {
       throw new Error("The native MCP runtime is not configured");
     }
-    return this.launcherProfile === "development"
+    return this.launcherProfile === "development" && !current.config?.automaticAppName
       ? connectorNameForDevSetup(current.config?.appName)
       : requireCurrentRuntimeConnectorName(current.config?.appName);
   }
 
   browserConnectorName() {
     const current = this.runtimeConfigSnapshot();
-    if (this.launcherProfile === "development") {
+    if (this.launcherProfile === "development" && !current.config?.automaticAppName) {
       return connectorNameForDevSetup(current.config?.appName);
     }
-    if (!current.configured || current.mode !== "full") return CURRENT_CONNECTOR_NAME;
+    if (!current.configured) return CURRENT_CONNECTOR_NAME;
     return connectorNameForSetup(current.config?.appName);
   }
 
-  setupConnectorName() {
-    return this.launcherProfile === "development" ? DEV_CONNECTOR_NAME : CURRENT_CONNECTOR_NAME;
+  setupConnectorName(mode = "automatic") {
+    if (mode !== "automatic" && mode !== "manual") throw new Error("Invalid interaction mode");
+    const current = this.runtimeConfigSnapshot().config;
+    const defaultName = mode === "manual" ? "Codex Zero Risk"
+      : this.launcherProfile === "development" ? DEV_CONNECTOR_NAME : CURRENT_CONNECTOR_NAME;
+    const stored = mode === "manual" ? current?.manualAppName : current?.automaticAppName;
+    if (stored !== undefined) return isLegacyConnectorName(stored) ? defaultName : validateConnectorName(stored);
+    if (mode !== "manual" && current?.browserInteractionMode !== "manual" && current?.appName) {
+      return this.launcherProfile === "development" ? connectorNameForDevSetup(current.appName)
+        : connectorNameForSetup(current.appName);
+    }
+    return defaultName;
+  }
+
+  async setConnectorNameSuffix(value) {
+    const suffix = validateConnectorNameSuffix(value);
+    const current = this.runtimeConfigSnapshot();
+    if (!current.configured) throw new Error("Set up the launcher before changing the plugin name");
+    const mode = this.browserInteractionMode();
+    const name = `Codex ${suffix}`;
+    if (name === this.setupConnectorName(mode)) return { changed: false };
+    if (name === this.setupConnectorName(mode === "manual" ? "automatic" : "manual")) {
+      throw new Error("Automatic and Zero Risk connector names must differ");
+    }
+    const args = [
+      ...(this.launcherProfile === "development" ? ["dev", "setup"] : ["setup"]),
+      current.mode === "full" ? "--full" : "--browser-only",
+      "--browser-host-descriptor", this.browserDescriptorPath,
+      ...this.browserInteractionArgs(),
+      "--connector-name-suffix", suffix,
+      "--acknowledge-unofficial",
+      ...(this.launcherProfile === "production" ? ["--replace-codex-route", "--restart-service"] : []),
+    ];
+    if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
+    const options = {
+      message: "Changing the plugin name",
+      successMessage: "Plugin name changed; complete MCP setup with the new name",
+      timeoutMs: current.mode === "full" ? MCP_SETUP_TIMEOUT_MS : CORE_SETUP_TIMEOUT_MS,
+    };
+    if (this.launcherProfile === "development") await this.runDevSetup("connector-name", args, options);
+    else await this.runSetup("connector-name", args, options);
+    return { changed: true };
   }
 
   cancelActiveTurns() {
@@ -1122,6 +1163,61 @@ class RuntimeHost {
       ? await this.runDevSetup("skill-attachments", args, options)
       : await this.runSetup("skill-attachments", args, options);
     return { ...result, enabled: enabled === true };
+  }
+
+  async setFreshConversationPerTurn(enabled) {
+    if (typeof enabled !== "boolean") throw new Error("Fresh conversation preference must be a boolean");
+    const current = this.runtimeConfigSnapshot();
+    if (!current.configured) throw new Error("Initialize the runtime before changing browser conversation retention");
+    if ((current.config?.browserInteractionMode ?? "automatic") !== "automatic") {
+      throw new Error("New browser chats per turn are unavailable in Zero Risk mode");
+    }
+    const development = this.launcherProfile === "development";
+    const args = [
+      ...(development ? ["dev", "setup"] : ["setup"]),
+      current.mode === "full" ? "--full" : "--browser-only",
+      "--browser-host-descriptor", this.browserDescriptorPath,
+      ...this.browserInteractionArgs(),
+      "--acknowledge-unofficial",
+      ...(development ? [] : ["--replace-codex-route", "--restart-service"]),
+      enabled ? "--fresh-conversation" : "--retained-conversation",
+    ];
+    if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
+    const options = {
+      message: enabled ? "Enabling a new browser chat for each turn" : "Restoring browser chat retention",
+      successMessage: enabled ? "New browser chats per turn enabled" : "Browser chat retention restored",
+      timeoutMs: CORE_SETUP_TIMEOUT_MS,
+    };
+    const result = development
+      ? await this.runDevSetup("fresh-conversation-per-turn", args, options)
+      : await this.runSetup("fresh-conversation-per-turn", args, options);
+    return { ...result, enabled };
+  }
+
+  async setUseSavedChats(enabled) {
+    if (typeof enabled !== "boolean") throw new Error("Saved chat preference must be a boolean");
+    const current = this.runtimeConfigSnapshot();
+    if (!current.configured) throw new Error("Initialize the runtime before changing saved chats");
+    const development = this.launcherProfile === "development";
+    const args = [
+      ...(development ? ["dev", "setup"] : ["setup"]),
+      current.mode === "full" ? "--full" : "--browser-only",
+      "--browser-host-descriptor", this.browserDescriptorPath,
+      ...this.browserInteractionArgs(),
+      "--acknowledge-unofficial",
+      ...(development ? [] : ["--replace-codex-route", "--restart-service"]),
+      enabled ? "--saved-chats" : "--temporary-chats",
+    ];
+    if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
+    const options = {
+      message: enabled ? "Enabling saved ChatGPT conversations" : "Restoring Temporary Chat",
+      successMessage: enabled ? "Saved ChatGPT conversations enabled" : "Temporary Chat restored",
+      timeoutMs: CORE_SETUP_TIMEOUT_MS,
+    };
+    const result = development
+      ? await this.runDevSetup("use-saved-chats", args, options)
+      : await this.runSetup("use-saved-chats", args, options);
+    return { ...result, enabled };
   }
 
   async setZeroRiskPro(enabled) {
@@ -1440,7 +1536,7 @@ class RuntimeHost {
         ...failures,
       ].join("; ");
       this.publishOperation?.({ name, status: "failed", message });
-      throw new Error(message);
+      throw new Error(message, { cause: error });
     } finally {
       this.lifecycleOperation = null;
     }

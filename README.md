@@ -1,15 +1,26 @@
+> ### This is a fork
+>
+> Upstream: **[miuuyy/codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web)** — if you want the original, go there. It is the one with installers, releases for every platform, and support.
+>
+> This fork exists for one deployment upstream explicitly does not support: **the bridge running on a different machine than Codex**, serving several launcher browsers at once. Everything here is built for that shape, and several patches were declined upstream for exactly that reason.
+>
+> - **What is different:** [What this fork changes](#what-this-fork-changes)
+> - **Releases:** tagged `mars-vX.Y.Z` (upstream uses `vX.Y.Z`). Latest: **[mars-v1.0.0](https://github.com/longbiaochen/codex-chatgpt-web/releases/tag/mars-v1.0.0)**, based on upstream v5.0.8.
+> - **No installers here.** Releases ship only the two runtime bundles (`cli.js`, `browser-helper.cjs`). Install the app from upstream, then swap those two files in.
+> - Changes are offered upstream when they are not specific to this deployment; the rest stays on the `mars-5.0.8` branch.
+
 <p align="center">
   <img src="assets/readme/hero.svg" width="960" alt="Switch to web models. Stay in Codex. Your ChatGPT plan. Your workflow. Maximum capabilities.">
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v5.0.8/codex-web-gpt-5.0.8-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v5.0.8/codex-web-gpt-5.0.8-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v5.0.8/codex-web-gpt-5.0.8-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.2/codex-web-gpt-6.1.2-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.2/codex-web-gpt-6.1.2-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.2/codex-web-gpt-6.1.2-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v5.0.8/codex-web-gpt-5.0.8-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">All releases</a>
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.2/codex-web-gpt-6.1.2-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">All releases</a>
 </p>
 
 <p align="center">
@@ -30,13 +41,43 @@ Full harness mode connects ChatGPT to the current task’s files, terminal, tool
 
 <div id="get-started"><a id="quick-start"></a></div>
 
+## What this fork changes
+
+Based on upstream **v5.0.8**. One bridge process serves several launcher browsers, each with its own ChatGPT connector and tunnel.
+
+### Architecture
+
+| Change | Why |
+| --- | --- |
+| **Browser host pool** — one bridge, several launcher browsers; turns go to the host with the fewest in flight, and a retained conversation stays on the launcher owning its tab | A renderer busy ingesting a large prompt used to stall CDP attach and rebinding for every other turn in the same Chromium |
+| **Per-host connector names** — each pool browser mentions its own connector, so each has its own tunnel | OpenAI dispatches one tool call at a time per tunnel; without this, concurrent turns queue behind each other |
+| **Host failover** — the primary launcher is validated like any pool member, and the browser helper starts from whichever launcher is alive | Stopping the primary used to fail every turn, even with live pool members |
+| **`CODEX_WEB_GPT_BROWSER_HOST_ONLY=1`** — a launcher that hosts the browser but hides the install step, the Codex restart notice and the MCP entry points | A pool host has no config of its own; the setup wizard it showed could only ever fail |
+
+### Fixes
+
+- **Environment after a compaction** — a compacted turn either puts the summary between the envelope and the instruction, or makes the envelope message itself the last item. Both left every following turn failing with `missing cwd in trusted Codex environment context`.
+- **Remote-bridge visualization roots** — accept the client-side `.codex/visualizations/YYYY/MM/DD/<thread>` layout, which a bridge on another host cannot verify against its own Codex home.
+- **Same-thread environment reuse** — historical envelopes no longer block a thread's already-trusted authority.
+- **Rebind and probe reliability** — retry a timed-out same-page rebind; do not rebind a stalled DOM probe while broker activity proves the turn is alive; bound per-page ownership inspection.
+- **Abandoned turns** — retire browser turns whose tool batch Codex never answered instead of heartbeating forever.
+- **Diagnostics** — a structured `environment_rejected` line naming which branch refused a turn, plus launcher connect timings and renderer CPU before a rebind. The compaction bugs above were only findable because of it.
+
+Commit-level detail is in the [release notes](https://github.com/longbiaochen/codex-chatgpt-web/releases/tag/mars-v1.0.0).
+
+### Status
+
+Runs in production on one host: 3 rounds x 3 concurrent turns, 9/9, zero rebinds, zero rate limiting. `bun test`: 1050 pass, plus 2 launcher-localization flakes that also fail on a clean upstream checkout.
+
+Not packaged, not supported, and not tested on Windows or macOS — it is a Linux deployment that happens to be useful to publish. Issues and PRs about the pool are welcome; anything about the app itself belongs upstream.
+
 ## Get started
 
 **Available models:** Free/Go → **Luna / Think**. Accounts with reasoning controls → **Instant–High**, plus **Extra High** and **Pro** when available. The launcher detects what your account can use.
 
 1. **Install the launcher** using the download for your system above.
 2. **Sign in to ChatGPT** in the embedded browser and run the browser smoke test.
-3. **Install models**, restart Codex once, and choose a **ChatGPT Web — …** model.
+3. **Install models** and restart Codex once. In automatic mode, choose a model ending in **(Web)**. Pro versions have separate entries; Sol reasoning is selected through Effort. Zero Risk keeps its dedicated entry.
 4. **For coding with tools**, open **MCP** in the launcher and complete the Full harness setup below.
 
 The app includes its browser and runtime. No separate Chrome, Node, or Bun installation is needed.
@@ -73,7 +114,7 @@ Automatic modes offer Luna/Think when the account has no reasoning selector; oth
 | **Full harness (With Automation)** | Automatic | Yes, through MCP |
 | **Zero Risk** | Paste and send manually | Yes, through a separate MCP connector |
 
-Zero Risk does not read or operate the ChatGPT page. Choose the model and `Codex Zero Risk` connector yourself, paste and send the prepared prompt, then confirm **Sent** in the launcher. Automatic model entries each select a fixed ChatGPT mode; Codex’s Effort and Speed rows do not override it.
+Zero Risk does not read or operate the ChatGPT page. Choose the model and `Codex Zero Risk` connector yourself, paste and send the prepared prompt, then confirm **Sent** in the launcher. Automatic models ending in **(Web)** expose their supported Effort choices in Codex. Instant and each Pro version have separate entries to preserve their context budgets; older saved model entries keep their original fixed mode.
 
 <a id="full-harness"></a>
 
@@ -115,6 +156,7 @@ that option clicks **Allow once**, never a permanent grant.
 
 Use **Activity** for safe local diagnostics and **Settings → Run doctor** for end-to-end health.
 Settings can also cancel a retained browser turn or remove the Codex integration before uninstall.
+**Save chats in ChatGPT** keeps task conversations in ChatGPT history. Off by default; independent of **New browser chat for each turn**.
 Set `CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS=1` only when every browser checkpoint needs a screenshot.
 
 New installs use **Compatibility V1** for cross-backend subagents. **Native** preserves Codex's own

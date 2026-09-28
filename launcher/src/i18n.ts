@@ -1,6 +1,13 @@
 import type { Language } from "./types";
 
 const en = {
+  hostOnlySetupTitle: "Browser host",
+  hostOnlySetupSubtitle: "This launcher only hosts the browser. Sign in to ChatGPT here; the bridge runs as a separate service.",
+  pluginName: "Plugin name",
+  pluginNameBody: "Codex stays fixed. Edit the rest of the name.",
+  pluginNameChange: "Change name",
+  pluginNameWarning: "Create a new plugin with the displayed name, then verify MCP again. This changes only the current mode. Tunnel credentials and your ChatGPT login are kept.",
+  pluginNameConfirm: "Change and configure",
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "Set up the isolated DEV profile",
@@ -21,6 +28,11 @@ const en = {
   skillAttachments: "Skills as files (experimental)",
   skillAttachmentsBody: "Upload explicitly selected Codex skills as named text files instead of inline instructions. Other skills still load through tools. Off by default; uses the same attachment limit as images.",
   manualSkillAttachmentsUnavailable: "Skill uploads require automatic browser interaction.",
+  savedChats: "Save chats in ChatGPT",
+  savedChatsBody: "Keep task conversations in ChatGPT history. ChatGPT memory and custom instructions may apply. Off by default.",
+  freshConversation: "New browser chat for each turn",
+  freshConversationBody: "Rebuild context from the same Codex task in a new browser chat for each turn. This may help when ChatGPT loses access to tools, but can send more context and be slower. Off by default.",
+  manualFreshConversationUnavailable: "Available only with Automation. Your preference is saved while Zero Risk is active.",
   biggerContextRecommendationTitle: "Use up to 3× more context",
   biggerContextRecommendationBody: "Bigger Context sends large tasks in multiple messages so ChatGPT Web can use up to three times more context. It remains experimental and can increase rate limits or temporary cooldowns.",
   biggerContextRecommendationToggleBody: "Stage large tasks across multiple messages and raise the model context and compaction limits.",
@@ -112,6 +124,8 @@ const en = {
   done: "Done",
   guideVideo: "Guide video",
   expandGuideVideo: "Expand guide video",
+  playGuideVideo: "Play video",
+  pauseGuideVideo: "Pause video",
   closeGuideVideo: "Close expanded guide video",
   mcpStepOne: "Create a tunnel and API key",
   mcpStepOneBody: "Create an OpenAI tunnel, copy its Tunnel ID, and create a regular API key with Tunnels Read + Use (free; the key is required only to run the tunnel). (Don't forget to create a ChatGPT workspace.)",
@@ -203,6 +217,13 @@ const en = {
 } as const;
 
 const zh: Record<keyof typeof en, string> = {
+  hostOnlySetupTitle: "浏览器宿主",
+  hostOnlySetupSubtitle: "这个启动器只承载浏览器：在这里登录 ChatGPT，桥作为独立服务在别处运行。",
+  pluginName: "插件名称",
+  pluginNameBody: "Codex 保持不变，可以修改其后的名称。",
+  pluginNameChange: "更改名称",
+  pluginNameWarning: "请使用显示的名称创建新插件，然后重新验证 MCP。仅更改当前模式，隧道凭据和 ChatGPT 登录状态将保留。",
+  pluginNameConfirm: "更改并配置",
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "设置隔离的 DEV 配置",
@@ -223,6 +244,11 @@ const zh: Record<keyof typeof en, string> = {
   skillAttachments: "技能作为文件（实验性）",
   skillAttachmentsBody: "将明确选择的 Codex 技能作为命名文本文件上传，而不是内联指令。其他技能仍通过工具读取。默认关闭；与图片共用附件数量限制。",
   manualSkillAttachmentsUnavailable: "上传技能需要自动浏览器交互模式。",
+  savedChats: "在 ChatGPT 中保存聊天",
+  savedChatsBody: "将任务对话保留在 ChatGPT 历史记录中。可能应用 ChatGPT 记忆和自定义指令。默认关闭。",
+  freshConversation: "每轮使用新的浏览器聊天",
+  freshConversationBody: "每轮在新的浏览器聊天中重建同一个 Codex 任务的上下文。这可能有助于解决 ChatGPT 丢失工具访问的问题，但可能发送更多上下文，速度也可能更慢。默认关闭。",
+  manualFreshConversationUnavailable: "仅在自动化模式下可用。启用零风险模式时会保留此偏好设置。",
   biggerContextRecommendationTitle: "使用多达 3 倍的上下文",
   biggerContextRecommendationBody: "Bigger Context 通过多条消息发送大型任务，让 ChatGPT Web 使用多达三倍的上下文。此功能仍处于实验阶段，可能增加触发速率限制或临时冷却的概率。",
   biggerContextRecommendationToggleBody: "将大型任务分成多条消息，并提高模型上下文与压缩限制。",
@@ -314,6 +340,8 @@ const zh: Record<keyof typeof en, string> = {
   done: "完成",
   guideVideo: "指导视频",
   expandGuideVideo: "展开指导视频",
+  playGuideVideo: "播放视频",
+  pauseGuideVideo: "暂停视频",
   closeGuideVideo: "关闭展开的指导视频",
   mcpStepOne: "创建 Tunnel 和 API key",
   mcpStepOneBody: "创建 OpenAI Tunnel，复制 Tunnel ID，然后创建一个拥有 Tunnels Read + Use 权限的普通 API key（免费；此密钥仅用于运行 Tunnel）。（别忘了创建 ChatGPT 工作区。）",
@@ -405,6 +433,13 @@ const zh: Record<keyof typeof en, string> = {
 };
 
 const ja: Record<keyof typeof en, string> = {
+  hostOnlySetupTitle: "ブラウザーホスト",
+  hostOnlySetupSubtitle: "このランチャーはブラウザーのみをホストします。ここで ChatGPT にサインインしてください。ブリッジは別のサービスとして動作します。",
+  pluginName: "プラグイン名",
+  pluginNameBody: "Codex は固定です。それ以降の名前を編集できます。",
+  pluginNameChange: "名前を変更",
+  pluginNameWarning: "表示された名前で新しいプラグインを作成し、MCP を再確認してください。現在のモードだけが変わります。トンネルの認証情報と ChatGPT のログインは保持されます。",
+  pluginNameConfirm: "変更して設定",
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "隔離された DEV プロファイルをセットアップ",
@@ -425,6 +460,11 @@ const ja: Record<keyof typeof en, string> = {
   skillAttachments: "スキルをファイルで送信（試験的）",
   skillAttachmentsBody: "明示的に選択した Codex スキルを、インラインの指示ではなく名前付きテキストファイルとしてアップロードします。他のスキルは引き続きツールで読み込みます。初期設定はオフ。画像と添付数の上限を共有します。",
   manualSkillAttachmentsUnavailable: "スキルのアップロードには自動ブラウザ操作が必要です。",
+  savedChats: "ChatGPT にチャットを保存",
+  savedChatsBody: "タスクの会話を ChatGPT の履歴に残します。ChatGPT のメモリとカスタム指示が適用される場合があります。初期設定はオフです。",
+  freshConversation: "ターンごとに新しいブラウザチャットを使用",
+  freshConversationBody: "ターンごとに新しいブラウザチャットで、同じ Codex タスクのコンテキストを再構築します。ChatGPT がツールにアクセスできなくなった場合に役立つことがありますが、送信するコンテキストが増え、遅くなる可能性があります。初期設定はオフです。",
+  manualFreshConversationUnavailable: "自動操作モードでのみ利用できます。ゼロリスクモード中も設定は保存されます。",
   biggerContextRecommendationTitle: "最大 3 倍のコンテキストを使用",
   biggerContextRecommendationBody: "Bigger Context は大きなタスクを複数のメッセージで送信し、ChatGPT Web で最大 3 倍のコンテキストを使用できるようにします。試験的な機能であり、レート制限や一時的なクールダウンが発生しやすくなる場合があります。",
   biggerContextRecommendationToggleBody: "大きなタスクを複数のメッセージに分割し、モデルのコンテキスト上限とコンパクション上限を引き上げます。",
@@ -516,6 +556,8 @@ const ja: Record<keyof typeof en, string> = {
   done: "完了",
   guideVideo: "ガイド動画",
   expandGuideVideo: "ガイド動画を拡大",
+  playGuideVideo: "動画を再生",
+  pauseGuideVideo: "動画を一時停止",
   closeGuideVideo: "拡大したガイド動画を閉じる",
   mcpStepOne: "トンネルと API キーを作成",
   mcpStepOneBody: "OpenAI トンネルを作成して Tunnel ID をコピーし、Tunnels Read + Use 権限を持つ通常の API キーを作成します（無料。キーはトンネルの実行にのみ必要です）。（ChatGPT ワークスペースの作成も忘れないでください。）",
@@ -607,6 +649,13 @@ const ja: Record<keyof typeof en, string> = {
 };
 
 const ko: Record<keyof typeof en, string> = {
+  hostOnlySetupTitle: "브라우저 호스트",
+  hostOnlySetupSubtitle: "이 런처는 브라우저만 호스팅합니다. 여기에서 ChatGPT에 로그인하세요. 브리지는 별도의 서비스로 실행됩니다.",
+  pluginName: "플러그인 이름",
+  pluginNameBody: "Codex는 고정입니다. 뒤에 오는 이름을 변경하세요.",
+  pluginNameChange: "이름 변경",
+  pluginNameWarning: "표시된 이름으로 새 플러그인을 만들고 MCP를 다시 확인하세요. 현재 모드에만 적용됩니다. 터널 인증 정보와 ChatGPT 로그인은 유지됩니다.",
+  pluginNameConfirm: "변경 및 설정",
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "격리된 DEV 프로필 설정",
@@ -627,6 +676,11 @@ const ko: Record<keyof typeof en, string> = {
   skillAttachments: "스킬을 파일로 전송 (실험적)",
   skillAttachmentsBody: "명시적으로 선택한 Codex 스킬을 인라인 지침 대신 이름이 있는 텍스트 파일로 업로드합니다. 다른 스킬은 도구로 읽습니다. 기본값은 꺼짐이며 이미지와 첨부 파일 수 제한을 공유합니다.",
   manualSkillAttachmentsUnavailable: "스킬 업로드에는 자동 브라우저 조작이 필요합니다.",
+  savedChats: "ChatGPT에 채팅 저장",
+  savedChatsBody: "작업 대화를 ChatGPT 기록에 보관합니다. ChatGPT 메모리와 맞춤 지침이 적용될 수 있습니다. 기본값은 꺼짐입니다.",
+  freshConversation: "매 턴 새 브라우저 채팅 사용",
+  freshConversationBody: "매 턴 새 브라우저 채팅에서 동일한 Codex 작업의 컨텍스트를 다시 구성합니다. ChatGPT가 도구에 접근하지 못할 때 도움이 될 수 있지만, 더 많은 컨텍스트를 전송하고 속도가 느려질 수 있습니다. 기본값은 꺼짐입니다.",
+  manualFreshConversationUnavailable: "자동화 모드에서만 사용할 수 있습니다. 제로 리스크 모드에서도 이 설정은 저장됩니다.",
   biggerContextRecommendationTitle: "최대 3배 더 많은 컨텍스트 사용",
   biggerContextRecommendationBody: "Bigger Context는 큰 작업을 여러 메시지로 나누어 ChatGPT Web에서 최대 3배 더 많은 컨텍스트를 사용할 수 있게 합니다. 아직 실험적인 기능이며 사용량 제한이나 일시적인 쿨다운이 더 자주 발생할 수 있습니다.",
   biggerContextRecommendationToggleBody: "큰 작업을 여러 메시지에 걸쳐 나누고 모델 컨텍스트 및 컴팩션 한도를 늘립니다.",
@@ -718,6 +772,8 @@ const ko: Record<keyof typeof en, string> = {
   done: "완료",
   guideVideo: "가이드 영상",
   expandGuideVideo: "가이드 영상 확대",
+  playGuideVideo: "영상 재생",
+  pauseGuideVideo: "영상 일시 정지",
   closeGuideVideo: "확대된 가이드 영상 닫기",
   mcpStepOne: "터널 및 API 키 생성",
   mcpStepOneBody: "OpenAI 터널을 만들고 Tunnel ID를 복사한 다음 Tunnels Read + Use 권한이 있는 일반 API 키를 생성하세요. 무료이며, 이 키는 터널 실행에만 필요합니다. (ChatGPT 작업 공간을 만드는 것도 잊지 마세요.)",
@@ -809,6 +865,13 @@ const ko: Record<keyof typeof en, string> = {
 };
 
 const zhTW: Record<keyof typeof en, string> = {
+  hostOnlySetupTitle: "瀏覽器宿主",
+  hostOnlySetupSubtitle: "這個啟動器只承載瀏覽器：在這裡登入 ChatGPT，橋接會以獨立服務在別處執行。",
+  pluginName: "外掛程式名稱",
+  pluginNameBody: "Codex 保持不變，可以修改後面的名稱。",
+  pluginNameChange: "變更名稱",
+  pluginNameWarning: "請使用顯示的名稱建立新的外掛程式，再重新驗證 MCP。僅變更目前模式，隧道憑證和 ChatGPT 登入狀態將保留。",
+  pluginNameConfirm: "變更並設定",
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "設定隔離的 DEV 設定檔",
@@ -829,6 +892,11 @@ const zhTW: Record<keyof typeof en, string> = {
   skillAttachments: "技能作為檔案（實驗性）",
   skillAttachmentsBody: "將明確選取的 Codex 技能作為具名文字檔上傳，而不是內嵌指令。其他技能仍透過工具讀取。預設關閉；與圖片共用附件數量限制。",
   manualSkillAttachmentsUnavailable: "上傳技能需要自動瀏覽器互動模式。",
+  savedChats: "在 ChatGPT 中儲存聊天",
+  savedChatsBody: "將任務對話保留在 ChatGPT 歷史記錄中。可能套用 ChatGPT 記憶和自訂指令。預設關閉。",
+  freshConversation: "每輪使用新的瀏覽器聊天",
+  freshConversationBody: "每輪在新的瀏覽器聊天中重建同一個 Codex 任務的上下文。這可能有助於解決 ChatGPT 失去工具存取權的問題，但可能傳送更多上下文，速度也可能更慢。預設關閉。",
+  manualFreshConversationUnavailable: "僅在自動化模式下可用。啟用零風險模式時會保留此偏好設定。",
   biggerContextRecommendationTitle: "使用最多 3 倍上下文",
   biggerContextRecommendationBody: "Bigger Context 會透過多則訊息傳送大型任務，讓 ChatGPT Web 使用最多三倍上下文。此功能仍屬實驗性，可能更容易觸發速率限制或暫時冷卻。",
   biggerContextRecommendationToggleBody: "將大型任務分段傳送，並提高模型上下文與壓縮限制。",
@@ -920,6 +988,8 @@ const zhTW: Record<keyof typeof en, string> = {
   done: "完成",
   guideVideo: "導覽影片",
   expandGuideVideo: "展開導覽影片",
+  playGuideVideo: "播放影片",
+  pauseGuideVideo: "暫停影片",
   closeGuideVideo: "關閉展開的導覽影片",
   mcpStepOne: "建立 Tunnel 與 API key",
   mcpStepOneBody: "建立 OpenAI Tunnel，複製 Tunnel ID，然後建立一個擁有 Tunnels Read + Use 權限的一般 API key（免費；此金鑰僅用於執行 Tunnel）。（別忘了建立 ChatGPT 工作區。）",
@@ -1010,9 +1080,20 @@ const zhTW: Record<keyof typeof en, string> = {
   doctorMacTunnelRunning: "macOS 隧道服務已安裝、載入並執行",
 };
 
-export type Copy = typeof en;
+export type Copy = { [Key in keyof typeof en]: string };
 
-export function copyFor(language: Language): Copy {
+export function copyFor(language: Language, names?: { automatic: string; manual: string }): Copy {
+  const copy = baseCopyFor(language);
+  if (!names) return copy;
+  const localized = { ...copy };
+  for (const key of ["manualMcpStepThreeBody", "manualConnectorNotice", "manualPromptInstruction", "manualPromptWaiting"] as const) {
+    localized[key] = copy[key].replaceAll("Codex Zero Risk", () => names.manual);
+  }
+  localized.connectorMigrationNotice = copy.connectorMigrationNotice.replaceAll("Codex Native2", () => names.automatic);
+  return localized;
+}
+
+function baseCopyFor(language: Language): Copy {
   if (language === "zh-CN") return zh as Copy;
   if (language === "ja") return ja as Copy;
   if (language === "ko") return ko as Copy;

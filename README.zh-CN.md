@@ -1,15 +1,26 @@
+> ### 这是一个 fork
+>
+> 上游：**[miuuyy/codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web)** —— 想用原版请去那边，安装包、各平台发布和支持都在上游。
+>
+> 这个 fork 只为一种上游明确不支持的部署而存在：**桥跑在与 Codex 不同的机器上**，并且同时驱动多个启动器浏览器。这里的改动都是为这个形态做的，其中几个补丁正是因此被上游拒绝。
+>
+> - **差异说明：**[这个 fork 改了什么](#what-this-fork-changes)
+> - **发布：** 标签形如 `mars-vX.Y.Z`（上游是 `vX.Y.Z`）。最新：**[mars-v1.0.0](https://github.com/longbiaochen/codex-chatgpt-web/releases/tag/mars-v1.0.0)**，基于上游 v5.0.8。
+> - **这里没有安装包。** 发布里只有两个运行时产物（`cli.js`、`browser-helper.cjs`）：先从上游装好应用，再把这两个文件换进去。
+> - 与该部署无关的通用修复会提给上游，其余留在 `mars-5.0.8` 分支。
+
 <p align="center">
   <img src="assets/readme/hero.svg" width="960" alt="切换到网页版模型，继续使用 Codex。你的 ChatGPT 订阅。你的工作流。充分发挥模型能力。">
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v5.0.8/codex-web-gpt-5.0.8-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v5.0.8/codex-web-gpt-5.0.8-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v5.0.8/codex-web-gpt-5.0.8-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.2/codex-web-gpt-6.1.2-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.2/codex-web-gpt-6.1.2-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.2/codex-web-gpt-6.1.2-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v5.0.8/codex-web-gpt-5.0.8-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">所有版本</a>
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.2/codex-web-gpt-6.1.2-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">所有版本</a>
 </p>
 
 <p align="center">
@@ -30,13 +41,45 @@
 
 <div id="get-started"><a id="quick-start"></a></div>
 
+<a id="what-this-fork-changes"></a>
+
+## 这个 fork 改了什么
+
+基于上游 **v5.0.8**。一个桥进程服务多个启动器浏览器，每个浏览器有自己的 ChatGPT 连接器和隧道。
+
+### 架构
+
+| 改动 | 为什么 |
+| --- | --- |
+| **浏览器宿主池** —— 一个桥、多个启动器浏览器；回合分给进行中最少的宿主，保留对话固定在拥有其标签页的那个启动器 | 同一个 Chromium 里，一个渲染进程在吞大提示词时会拖住其他回合的 CDP 连接与重绑 |
+| **每宿主独立的连接器名** —— 每个池成员 @ 自己的连接器，各走各的隧道 | OpenAI 在同一条隧道上一次只下发一个工具调用；没有这一步，并发回合会互相排队 |
+| **宿主故障回落** —— 主启动器与池成员一视同仁地校验，浏览器 helper 从任一存活启动器启动 | 以前主启动器一停，所有回合都失败，哪怕池里还有活着的成员 |
+| **`CODEX_WEB_GPT_BROWSER_HOST_ONLY=1`** —— 启动器只承载浏览器，隐藏安装步骤、Codex 重启提示和 MCP 入口 | 池成员没有自己的配置，它显示的安装向导只可能失败 |
+
+### 修复
+
+- **压缩之后读不到环境信封** —— 压缩后的一轮要么把摘要放在信封和指令之间，要么信封消息本身就是最后一条。两种形态都会让后续每一轮报 `missing cwd in trusted Codex environment context`。
+- **远程桥的可视化根目录** —— 接受客户端侧的 `.codex/visualizations/YYYY/MM/DD/<thread>` 结构；桥在另一台机器上时无法用自己的 Codex home 去比对。
+- **同线程环境复用** —— 历史信封不再挡住该线程已经受信的权限。
+- **重绑与探测的可靠性** —— 同页重绑超时后重试；broker 活动证明回合还活着时不重绑；单页归属检查加上界。
+- **卡死回合** —— Codex 从未交回工具结果的回合会被回收，而不是无限心跳。
+- **诊断** —— 结构化的 `environment_rejected` 日志写明是哪条分支拒绝了回合，另有启动器连接耗时与重绑前的渲染进程 CPU。上面那两个压缩 bug 就是靠它才定位到的。
+
+逐条提交见[发布说明](https://github.com/longbiaochen/codex-chatgpt-web/releases/tag/mars-v1.0.0)。
+
+### 状态
+
+在一台主机上长期运行：3 轮 × 3 并发回合，9/9 通过，零重绑、零限流。`bun test`：1050 通过，另有 2 个启动器本地化测试在干净的上游检出上同样失败。
+
+没有打包、没有支持，也没在 Windows 和 macOS 上测过——它就是一套恰好值得公开的 Linux 部署。关于宿主池的 issue 和 PR 欢迎提；关于应用本身的请去上游。
+
 ## 开始使用
 
 **可用模型：** Free/Go → **Luna / Think**；具有推理控制选项的账户 → **Instant–High**，并按实际可用状态提供 **Extra High** 和 **Pro**。启动器会自动检测账户可用的模型。
 
 1. **安装启动器**：点击上方对应系统的下载按钮。
 2. **登录 ChatGPT**：在内置浏览器中登录并运行浏览器冒烟测试。
-3. **安装模型**：重启一次 Codex，然后选择 **ChatGPT Web — …** 模型。
+3. **安装模型**：重启一次 Codex。在自动模式下，选择名称以 **(Web)** 结尾的模型。Pro 版本使用独立条目，Sol 推理等级通过 Effort 选择。Zero Risk 保留专用条目。
 4. **需要使用工具编程时**：打开启动器中的 **MCP**，完成下方的完整 harness 设置。
 
 应用已包含浏览器和运行时，无需另外安装 Chrome、Node 或 Bun。
@@ -73,7 +116,7 @@ irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install
 | **Full harness (With Automation)** | 自动 | 支持，通过 MCP |
 | **Zero Risk** | 手动粘贴并发送 | 支持，通过独立 MCP 连接器 |
 
-Zero Risk 不读取或操作 ChatGPT 页面。请自行选择模型和 `Codex Zero Risk` 连接器，粘贴并发送准备好的提示词，再在启动器中确认 **Sent**。自动模式的每个模型条目对应固定的 ChatGPT 模式；Codex 的 Effort 和 Speed 选项不会覆盖它。
+Zero Risk 不读取或操作 ChatGPT 页面。请自行选择模型和 `Codex Zero Risk` 连接器，粘贴并发送准备好的提示词，再在启动器中确认 **Sent**。名称以 **(Web)** 结尾的自动模型会在 Codex 中提供其支持的 Effort 选项。Instant 和各个 Pro 版本使用独立条目，以保留各自的上下文额度；旧任务中保存的模型条目仍使用原来的固定模式。
 
 <a id="full-harness"></a>
 

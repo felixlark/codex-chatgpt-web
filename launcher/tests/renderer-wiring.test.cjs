@@ -389,3 +389,250 @@ test("catalog verification reports a failed request instead of requesting anothe
   assert.equal(state.codexRestartRequired, false);
   assert.ok(events.some(([event]) => event === "codex.model_catalog_verified"));
 });
+
+test("a browser-host-only launcher hides everything that would start a bridge here", () => {
+  assert.match(electronMain, /browserHostOnly: LAUNCHER_PROFILE\.browserHostOnly === true/);
+  assert.match(appSource, /const browserHostOnly = snapshot\.browserHostOnly === true/);
+  // The install step, the Codex restart notice and both MCP entry points are gated on it.
+  assert.match(appSource, /\{browserHostOnly \? null : <SetupRow/);
+  assert.match(appSource, /!devProfile && !browserHostOnly && snapshot\.state\.codexRestartRequired/);
+  assert.match(appSource, /\{browserHostOnly \? null : <SidebarItem/);
+  assert.match(appSource, /\{browserHostOnly \? null : <>\n\s*<SectionHeading label="MCP"/);
+  // Signing in and the smoke test stay available: that is what the host window is for.
+  assert.match(appSource, /onAction=\{openLogin\}/);
+  // It opens on the browser instead of a setup page it can never complete, and does not nag.
+  assert.match(appSource, /interactionSetupComplete \|\| browserHostOnly \? "browser" : "setup"/);
+  assert.match(appSource, /const needsSetup = !needsBrowser && !interactionSetupComplete && !browserHostOnly/);
+  assert.match(appSource, /title=\{browserHostOnly \? copy\.hostOnlySetupTitle/);
+});
+
+test("fresh-conversation IPC commits only after setup succeeds and refuses active browser work", async () => {
+  const vm = require("node:vm");
+  for (const savedChats of [false, true]) {
+    const property = savedChats ? "useSavedChats" : "experimentalFreshConversationPerTurn";
+    const method = savedChats ? "setUseSavedChats" : "setFreshConversationPerTurn";
+    const channel = savedChats ? "launcher:use-saved-chats" : "launcher:fresh-conversation-per-turn";
+    const nextChannel = savedChats ? "launcher:zero-risk-pro" : "launcher:use-saved-chats";
+    const source = electronMain.slice(
+      electronMain.indexOf(`handle("${channel}",`),
+      electronMain.indexOf(`handle("${nextChannel}",`),
+    );
+    const state = { experimentalFreshConversationPerTurn: false, useSavedChats: false };
+    const config = { experimentalFreshConversationPerTurn: false, useSavedChats: false };
+    const events = [];
+    let handler, finishSetup, setupFailure, calls = 0;
+    const browserHost = { activeTraceId: "running-turn", currentOperation: () => null, turnTabs: new Map() };
+    const syncSource = electronMain.slice(electronMain.indexOf("function syncFreshConversationPreference("), electronMain.indexOf("function registerIpc("));
+    vm.runInNewContext(syncSource + source, {
+      handle: (_channel, callback) => { handler = callback; }, browserHost,
+      releaseRetainedConversation: require("../electron/retained-turn-release.cjs").releaseRetainedConversation,
+      runtimeHost: { currentOperation: () => null, runtimeConfigSnapshot: () => ({ config }), [method]: async enabled => {
+        calls++;
+        if (setupFailure) throw setupFailure;
+        await new Promise(resolve => { finishSetup = resolve; });
+        config[property] = enabled;
+        return { enabled };
+      } },
+      stateStore: { read: () => ({ ...state }), update: patch => Object.assign(state, patch) },
+      send: (channel, value) => events.push({ channel, value: { ...value } }),
+    });
+    await assert.rejects(() => handler(null, true), /Finish or cancel active ChatGPT turns/);
+    browserHost.activeTraceId = null;
+    browserHost.currentOperation = () => "browser-smoke";
+    await assert.rejects(() => handler(null, true), /Finish or cancel active ChatGPT turns/);
+    assert.equal(calls, 0);
+    browserHost.currentOperation = () => null;
+    let api;
+    vm.runInNewContext(preloadSource, { require: () => ({
+      contextBridge: { exposeInMainWorld: (_name, value) => { api = value; } },
+      ipcRenderer: { invoke: (actualChannel, enabled) => {
+        assert.equal(actualChannel, channel);
+        return handler(null, enabled);
+      } },
+    }) });
+    const changing = api[method](true);
+    assert.equal(state[property], false);
+    assert.equal(events.length, 0);
+    finishSetup();
+    assert.equal((await changing)[property], true);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].channel, "launcher:state-changed");
+    setupFailure = new Error("synthetic setup rollback");
+    await assert.rejects(() => api[method](false), /synthetic setup rollback/);
+    assert.equal(state[property], true);
+    assert.equal(events.length, 1);
+  }
+});
+
+test("fresh-conversation snapshot uses runtime configuration and mode switching preserves the preference", async () => {
+  const vm = require("node:vm");
+  const handlers = new Map();
+  const state = { browserInteractionMode: "automatic", experimentalFreshConversationPerTurn: false };
+  let config = { browserInteractionMode: "automatic", experimentalFreshConversationPerTurn: true };
+  const runtimeHost = {
+    currentOperation: () => null,
+    runtimeConfigSnapshot: () => ({ config }), browserConnectorName: () => "Codex Native2",
+    setupConnectorName: () => "Codex Native2", mcpCredentialsConfigured: () => true,
+    setBrowserInteractionMode: async mode => { config.browserInteractionMode = mode; return { configured: true }; },
+  };
+  const sandbox = {
+    handle: (name, handler) => handlers.set(name, handler), runtimeHost,
+    releaseRetainedConversation: require("../electron/retained-turn-release.cjs").releaseRetainedConversation,
+    stateStore: { read: () => ({ ...state }), update: patch => Object.assign(state, patch) },
+    browserHost: { activeTraceId: null, turnTabs: new Map(), currentOperation: () => null, snapshot: () => ({}),
+      withInteractionModeChange: async (_mode, action) => action() },
+    validateBrowserInteractionMode: mode => mode, IS_DEV_PROFILE: false, send() {}, startCatalogVerificationMonitor() {},
+    LAUNCHER_PROFILE: { kind: "production", codexHome: "/fixture/codex" }, CORE_HOME: "/fixture/core",
+    launcherUserData: "/fixture/launcher", logger: { recent: () => [] },
+    GITHUB_URL: "", X_URL: "", CONNECTORS_URL: "", TUNNELS_URL: "", KEYS_URL: "",
+    process: { platform: "darwin" }, app: { isPackaged: false, getVersion: () => "test" },
+    smokePassedThisSession: false, smokePassedForCurrentVersion: () => false, lastOperation: null, updateController: null,
+  };
+  vm.runInNewContext(electronMain.slice(electronMain.indexOf("function syncFreshConversationPreference("), electronMain.indexOf("function registerIpc(")) +
+    electronMain.slice(electronMain.indexOf('handle("launcher:snapshot",'),
+    electronMain.indexOf('handle("launcher:set-language",')) +
+    electronMain.slice(electronMain.indexOf('handle("launcher:browser-interaction-mode",'),
+    electronMain.indexOf('handle("launcher:set-preference",')), sandbox);
+  const snapshot = handlers.get("launcher:snapshot");
+  assert.equal((await snapshot()).state.experimentalFreshConversationPerTurn, true);
+  assert.equal(state.experimentalFreshConversationPerTurn, true, "snapshot synchronizes a CLI configuration change");
+  const changeMode = handlers.get("launcher:browser-interaction-mode");
+  for (const mode of ["manual", "automatic"]) {
+    const changed = await changeMode(null, mode);
+    assert.equal(changed.state.experimentalFreshConversationPerTurn, true);
+    assert.equal((await snapshot()).state.experimentalFreshConversationPerTurn, true);
+  }
+  config = {};
+  assert.equal((await snapshot()).state.experimentalFreshConversationPerTurn, false);
+});
+
+test("fresh-conversation control is translated, disabled in Zero Risk, and invokes the async setting", async () => {
+  const ts = require("typescript");
+  const vm = require("node:vm");
+  const settings = appSource.slice(appSource.indexOf("function SettingsSurface("), appSource.indexOf("function ContentSurface("));
+  const transpile = (source, fileName) => ts.transpileModule(source, {
+    fileName, compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS,
+      jsx: ts.JsxEmit.React, jsxFactory: "element" },
+  }).outputText;
+  const translated = { exports: {} };
+  vm.runInNewContext(transpile(fs.readFileSync(path.join(launcherRoot, "src", "i18n.ts"), "utf8"), "i18n.ts"), translated);
+  let render, invocation, saved;
+  const sandbox = {
+    element: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+    useState: value => [value, () => {}],
+    useEffect() {},
+    api: { setFreshConversationPerTurn: async enabled => { invocation = enabled; return { experimentalFreshConversationPerTurn: enabled }; } },
+    messageOf: String, platformLabel: String,
+  };
+  for (const name of ["ContentSurface", "SectionHeading", "SettingRow", "PrimaryButton", "SecondaryButton", "Switch", "InteractionModePicker", "LanguageMenu", "NoticeRow", "Icon", "DoctorSummary", "BrandMark"]) sandbox[name] = name;
+  vm.runInNewContext(transpile(settings, "settings.tsx") + "\nrender = SettingsSurface;", Object.assign(sandbox, { render }));
+  render = sandbox.render;
+  const visit = tree => Array.isArray(tree) ? tree.flatMap(visit) : tree && typeof tree === "object"
+    ? [tree, ...visit(tree.children ?? [])] : [];
+  for (const language of Object.keys(require("../electron/languages.json"))) {
+    const copy = translated.exports.copyFor(language);
+    for (const key of ["freshConversation", "freshConversationBody", "manualFreshConversationUnavailable"]) {
+      assert.equal(typeof copy[key], "string");
+      assert.ok(copy[key].length > 10);
+    }
+    for (const [mode, configured, enabled] of [["automatic", true, false], ["manual", true, true], ["automatic", false, false]]) {
+      const tree = render({ copy, devProfile: false, language, configureInteractionMode() {}, setError() {},
+        snapshot: { connectorNames: { automatic: "Codex Native2", manual: "Codex Zero Risk" }, state: { browserInteractionMode: mode, coreSetupComplete: configured, experimentalFreshConversationPerTurn: enabled } },
+        updateState: value => { saved = value; },
+      });
+      const row = visit(tree).find(node => node.type === "SettingRow" && node.props.label === copy.freshConversation);
+      assert.ok(row);
+      assert.equal(row.props.body, mode === "manual" ? copy.manualFreshConversationUnavailable : copy.freshConversationBody);
+      const control = visit(row).find(node => node.type === "Switch");
+      assert.equal(control.props.checked, enabled);
+      assert.equal(control.props.disabled, mode === "manual" || !configured);
+      if (!control.props.disabled) {
+        control.props.onChange(true);
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(invocation, true);
+        assert.equal(saved.experimentalFreshConversationPerTurn, true);
+      }
+    }
+  }
+});
+
+test("plugin rename invalidates verification only after success and rejects active browser work", async () => {
+  const vm = require("node:vm");
+  const handlers = new Map();
+  const state = { mcpSetupComplete: true, mcpGuideStep: 0 };
+  const events = [];
+  let fail = true, calls = 0;
+  const browserHost = { activeTraceId: "busy", currentOperation: () => null };
+  vm.runInNewContext(electronMain.slice(electronMain.indexOf('handle("launcher:connector-name",'),
+    electronMain.indexOf('handle("launcher:set-mcp-step",')), {
+    handle: (name, handler) => handlers.set(name, handler), browserHost,
+    runtimeHost: {
+      setConnectorNameSuffix: async () => { calls++; if (fail) throw new Error("setup failed"); return { changed: true }; },
+      browserConnectorName: () => "Codex Work",
+      setupConnectorName: mode => mode === "manual" ? "Codex Zero Risk" : "Codex Work",
+      runtimeConfigSnapshot: () => ({ config: { appName: "Codex Work" } }),
+    },
+    stateStore: { read: () => state, update: patch => Object.assign(state, patch) },
+    send: (channel, body) => events.push({ channel, body }),
+  });
+  const rename = handlers.get("launcher:connector-name");
+  await assert.rejects(rename(null, "Work"), /Finish active ChatGPT turns/);
+  assert.equal(calls, 0);
+  browserHost.activeTraceId = null;
+  await assert.rejects(rename(null, "Work"), /setup failed/);
+  assert.equal(state.mcpSetupComplete, true);
+  assert.equal(events.length, 0);
+  fail = false;
+  await rename(null, "Work");
+  assert.equal(state.mcpSetupComplete, false);
+  assert.equal(state.mcpGuideStep, 2);
+  assert.equal(events[0].channel, "launcher:connector-names-changed");
+  assert.equal(events[0].body.connectorNames.manual, "Codex Zero Risk");
+  assert.equal(events[1].channel, "launcher:state-changed");
+});
+
+test("plugin name editor fixes Codex and edits Native2 before asking to reconfigure", async () => {
+  const ts = require("typescript");
+  const vm = require("node:vm");
+  const transpile = (source, fileName) => ts.transpileModule(source, {
+    fileName, compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS,
+      jsx: ts.JsxEmit.React, jsxFactory: "element", jsxFragmentFactory: "Fragment" },
+  }).outputText;
+  const translated = { exports: {} };
+  vm.runInNewContext(transpile(fs.readFileSync(path.join(launcherRoot, "src", "i18n.ts"), "utf8"), "i18n.ts"), translated);
+  const copy = translated.exports.copyFor("en");
+  const hooks = [];
+  let cursor = 0, submitted, configureMode;
+  const sandbox = {
+    element: (type, props, ...children) => ({ type, props: props ?? {}, children }), Fragment: "Fragment",
+    useState: initial => { const index = cursor++; if (!(index in hooks)) hooks[index] = initial;
+      return [hooks[index], value => { hooks[index] = value; }]; },
+    useEffect() {}, messageOf: String, platformLabel: String,
+    api: { setConnectorNameSuffix: async suffix => { submitted = suffix; return { mcpSetupComplete: false }; } },
+  };
+  for (const name of ["ContentSurface", "SectionHeading", "SettingRow", "PrimaryButton", "SecondaryButton", "Switch", "InteractionModePicker", "LanguageMenu", "NoticeRow", "Icon", "DoctorSummary", "BrandMark"]) sandbox[name] = name;
+  const settings = appSource.slice(appSource.indexOf("function SettingsSurface("), appSource.indexOf("function ContentSurface("));
+  vm.runInNewContext(transpile(settings, "settings.tsx") + "\nrender = SettingsSurface;", sandbox);
+  const visit = tree => Array.isArray(tree) ? tree.flatMap(visit) : tree && typeof tree === "object"
+    ? [tree, ...visit(tree.children ?? [])] : [];
+  const render = () => { cursor = 0; return visit(sandbox.render({ copy, devProfile: false, language: "en",
+    snapshot: { connectorNames: { automatic: "Codex Native2", manual: "Codex Zero Risk" }, state: { browserInteractionMode: "automatic", coreSetupComplete: true } },
+    configureInteractionMode: mode => { configureMode = mode; }, setError: error => { if (error) throw new Error(error); }, updateState() {},
+  })); };
+  let nodes = render();
+  const group = nodes.find(node => node.props.className === "plugin-name-input");
+  assert.ok(visit(group).some(node => node.type === "span" && node.children[0] === "Codex"));
+  const input = visit(group).find(node => node.type === "input");
+  assert.equal(input.props.value, "Native2");
+  input.props.onChange({ target: { value: "Work" } });
+  nodes = render();
+  assert.ok(nodes.some(node => node.type === "code" && node.children[0] === "Codex Work"));
+  nodes.find(node => node.type === "SecondaryButton" && node.children[0] === copy.pluginNameChange).props.onClick();
+  assert.equal(submitted, undefined);
+  nodes = render();
+  assert.ok(nodes.some(node => node.type === "p" && node.children[0] === copy.pluginNameWarning));
+  nodes.find(node => node.type === "PrimaryButton" && node.children[0] === copy.pluginNameConfirm).props.onClick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(submitted, "Work");
+  assert.equal(configureMode, "automatic");
+});

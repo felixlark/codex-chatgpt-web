@@ -1,9 +1,13 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { noteChatGptRetainedConnectorLost } from "./retained-conversation-health";
+import { launcherSlotAppName, launcherSlotDescriptor, markLauncherHostBusy, quarantineLauncherHost, readAnyLauncherBrowserHostDescriptor, rememberLauncherHostAffinity, selectLauncherHost, usableLauncherHostCount } from "./launcher-host-pool";
 import { existsSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
-import { notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
+import { notifyLauncherTurn } from "../../launcher-browser-host";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
+import { ChatGptAdmission, isChatGptRateLimitError } from "./admission";
+import { getConfigDir } from "../../config";
 import type { CompiledChatGptWebPrompt } from "./prompt";
 import type { BrowserTurn, ResolvedBrowserConfig } from "./browser-worker";
 import {
@@ -12,12 +16,18 @@ import {
 } from "./rolling-checkpoint";
 
 interface PendingTurn {
+  /** Launcher browser host (descriptor path) that owns this turn's tab. */
+  host?: string;
   turn: BrowserTurn;
   resolve: (value: string) => void;
   reject: (error: Error) => void;
   abortListener?: () => void;
   sent?: boolean;
+  /** Last message of any kind (heartbeats included) from the helper for this turn. */
+  lastHelperEventAt?: number;
   prepared?: CompiledChatGptWebPrompt & { release: () => void };
+  /** Drops this turn from the host's in-flight count, so the keep-alive knows the host is free. */
+  releaseHost?: () => void;
   localFailure?: Error;
   progressForwarding?: AbortController;
   acknowledgedMultipartStage?: number;
@@ -179,6 +189,90 @@ function parseHelperMessage(line: string): HelperMessage {
   throw new Error("Launcher browser helper emitted an unknown message type");
 }
 
+let admissionSingleton: ChatGptAdmission | undefined;
+
+/** Tests only: swap in a gate with a controllable clock (undefined restores the default). */
+export function setSharedAdmissionForTests(admission: ChatGptAdmission | undefined): void {
+  admissionSingleton = admission;
+}
+
+/** Helper silence (no heartbeat either) after which a sent turn counts as stuck. */
+const HELPER_UNRESPONSIVE_MS = 5 * 60_000;
+
+/** Throttles a single turn may wait out in the gate before the error goes back to Codex. */
+const MAX_THROTTLE_REQUEUES = 12;
+/**
+ * Page failures before submission a turn may retry before the error goes back to Codex. A freshly
+ * (re)started host's first load (signed-out render, subscription not loaded) clears on the next
+ * load, so the first retries are immediate. A Cloudflare check in front of ChatGPT (seen on Mars:
+ * "Verifying..." for minutes, personalization preflight timing out behind it) needs time or a person,
+ * so later retries wait SURFACE_RETRY_DELAY_MS each: about ten minutes in all.
+ */
+const MAX_SURFACE_RETRIES = 12;
+const IMMEDIATE_SURFACE_RETRIES = 2;
+const SURFACE_RETRY_DELAY_MS = 60_000;
+/**
+ * A signed-out browser needs a person to log it in again, which takes longer than any page hiccup
+ * (Mars, 2026-09-26: nine hours). Unsent turns wait for that in the gate, one check per five
+ * surface delays for up to three hours, so their goals resume by themselves after the login
+ * instead of being blocked after ten minutes of retries that could not succeed.
+ */
+const SIGNED_OUT_RETRY_DELAY_FACTOR = 5;
+const MAX_SIGNED_OUT_RETRIES = 36;
+
+function isChatGptSignedOutError(error: unknown): boolean {
+  return /ChatGPT web is signed out/i.test(error instanceof Error ? error.message : String(error));
+}
+
+
+function isChatGptSurfaceUnavailableError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /login is expired or the (?:Temporary Chat|new chat) surface is unavailable|could not load the account subscription|personalization preflight exceeded its readiness deadline|retained conversation lost its connector|page\.goto: net::ERR_ABORTED|page\.goto: Timeout \d+ms exceeded|browser stage timed out: (?:browser_page|temporary_chat_preparation)\b|model controls are unavailable|connector menu (?:did not open|opened but exposed no row)|dropped the connector before the prompt was sent|locator\.waitFor: Timeout|browser is busy with session refresh/i
+    .test(message);
+}
+
+function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0 || signal?.aborted) return Promise.resolve();
+  return new Promise(resolve => {
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    }
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+
+/**
+ * Where turns can go: the configured slots, or else the legacy primary descriptor plus pool hosts.
+ * Every entry is a slot key (see launcher-host-pool); a bare descriptor is a legacy whole host.
+ */
+function launcherHostCandidates(config: ResolvedBrowserConfig): { primary: string; pool: string[] } | undefined {
+  if (config.browserHostSlots?.length) {
+    return { primary: config.browserHostSlots[0]!, pool: config.browserHostSlots.slice(1) };
+  }
+  return config.browserHostDescriptorPath
+    ? { primary: config.browserHostDescriptorPath, pool: config.browserHostPool ?? [] }
+    : undefined;
+}
+
+/**
+ * One admission gate per bridge process: the account, not a client instance, is what throttles.
+ * CODEX_CHATGPT_WEB_ADMISSION=off bypasses it without a rollback; tests never persist its state.
+ */
+function sharedAdmission(config: ResolvedBrowserConfig): ChatGptAdmission | undefined {
+  if (process.env.CODEX_CHATGPT_WEB_ADMISSION === "off") return undefined;
+  admissionSingleton ??= new ChatGptAdmission({
+    ...(process.env.NODE_ENV === "test" ? {} : { statePath: join(getConfigDir(), "runtime", "chatgpt-admission.json") }),
+    maxConcurrent: () => {
+      const hosts = launcherHostCandidates(config);
+      return hosts ? usableLauncherHostCount(hosts.primary, hosts.pool) : 1 + (config.browserHostPool?.length ?? 0);
+    },
+  });
+  return admissionSingleton;
+}
+
 export class LauncherBrowserHelperClient {
   private child?: ChildProcessWithoutNullStreams;
   private ready?: Promise<void>;
@@ -187,7 +281,41 @@ export class LauncherBrowserHelperClient {
   private readonly pending = new Map<string, PendingTurn>();
   private helperFeatures = new Set<string>();
 
-  constructor(private readonly config: ResolvedBrowserConfig) {}
+  private unresponsiveWatch?: ReturnType<typeof setInterval>;
+
+  constructor(
+    private readonly config: ResolvedBrowserConfig,
+    private readonly unresponsiveAfterMs = HELPER_UNRESPONSIVE_MS,
+    private readonly now: () => number = Date.now,
+    private readonly surfaceRetryDelayMs = SURFACE_RETRY_DELAY_MS,
+  ) {}
+
+  /**
+   * The helper heartbeats every 10s from inside its observation loop, also while Codex runs a tool.
+   * Silence for minutes means that loop is stuck on a page that stopped responding (seen on Mars:
+   * a tab frozen on "Loading" for 30 minutes while Codex waited on the bridge's own heartbeats).
+   * Such a turn is aborted with a retryable error so Codex starts it again on a fresh surface.
+   */
+  checkUnresponsiveTurns(): void {
+    const now = this.now();
+    for (const [id, pending] of this.pending) {
+      if (!pending.sent || pending.lastHelperEventAt === undefined) continue;
+      if (now - pending.lastHelperEventAt < this.unresponsiveAfterMs) continue;
+      console.warn(`[chatgpt-web] browser turn ${id} unresponsive for `
+        + `${Math.round((now - pending.lastHelperEventAt) / 1000)}s on ${pending.host ?? "the browser host"}: aborting`);
+      void this.send({ type: "abort", id, cause: "the ChatGPT page stopped responding" }).catch(() => {});
+      this.finishWithError(id, new ChatGptWebAdapterError(
+        "The ChatGPT page stopped responding during the turn. It was stopped so it can run again.",
+        { status: 504, errorType: "server_error", code: "chatgpt_page_unresponsive", retryable: true },
+      ));
+    }
+  }
+
+  private watchUnresponsiveTurns(): void {
+    if (this.unresponsiveWatch) return;
+    this.unresponsiveWatch = setInterval(() => this.checkUnresponsiveTurns(), 30_000);
+    this.unresponsiveWatch.unref?.();
+  }
 
   /**
    * The helper that shipped with this daemon, when one sits beside its own entrypoint.
@@ -227,13 +355,129 @@ export class LauncherBrowserHelperClient {
         "Launcher browser helper does not support the MCP completion fence; update or restart the launcher",
       );
     }
+    // Every pool host drives the same ChatGPT account; pace the account before picking a host.
+    const admission = sharedAdmission(this.config);
+    if (!admission) return await this.runAdmitted(turn);
+    let submitted = false;
+    let sendActivated = false;
+    const observed: BrowserTurn = {
+      ...turn,
+      onSendActivated: () => {
+        sendActivated = true;
+        return turn.onSendActivated?.();
+      },
+      onSubmitted: () => {
+        submitted = true;
+        admission.noteAccepted(turn.traceId);
+        turn.onSubmitted?.();
+      },
+    };
+    // A throttle before ChatGPT accepted the prompt consumed nothing, so the turn goes back to the
+    // gate and waits out the cooldown there. Codex keeps receiving heartbeats and only sees a slow
+    // turn; surfacing the error instead spends Codex's few retries in seconds and leaves goals
+    // blocked for the rest of the throttle.
+    let surfaceRetries = 0;
+    let signedOutRetries = 0;
+    let lastHost: string | undefined;
+    for (let requeues = 0; ; requeues += 1) {
+      const release = await admission.acquire(turn.conversationKey ?? turn.traceId, turn.traceId, turn.abortSignal, {
+        ...(turn.threadId ? { threadId: turn.threadId } : {}),
+        model: turn.modelId,
+      });
+      let failure: unknown;
+      let requeue = false;
+      let refund = false;
+      try {
+        return await this.runAdmitted(observed, host => {
+          lastHost = host;
+          admission.noteHost(turn.traceId, host);
+        });
+      } catch (error) {
+        failure = error;
+        // Once Send was pressed the prompt may already be on its way even when ChatGPT then shows a
+        // rate-limit dialog (seen on Mars: a tool call for the "failed" turn arrived two seconds
+        // later). Running it again could deliver the prompt twice, so only unsent turns go back.
+        const unsent = !submitted && !sendActivated && !turn.abortSignal?.aborted;
+        if (isChatGptRateLimitError(error)) {
+          admission.noteThrottle();
+          requeue = unsent && requeues < MAX_THROTTLE_REQUEUES;
+        } else if (isChatGptSignedOutError(error)) {
+          signedOutRetries += 1;
+          requeue = unsent && signedOutRetries <= MAX_SIGNED_OUT_RETRIES;
+          // Every slot of that browser shares its one login, so they are all out until it is back.
+          const candidates = launcherHostCandidates(this.config);
+          if (lastHost && candidates && candidates.pool.length > 0) {
+            const descriptor = launcherSlotDescriptor(lastHost);
+            const slots = [candidates.primary, ...candidates.pool].filter(slot => launcherSlotDescriptor(slot) === descriptor);
+            for (const slot of slots) quarantineLauncherHost(slot);
+            console.warn(`[chatgpt-web] launcher browser ${descriptor} is signed out; its ${slots.length} slot(s) `
+              + "left out of new turns for 10 minutes. Sign it in to ChatGPT again");
+          }
+          refund = unsent;
+        } else if (isChatGptSurfaceUnavailableError(error)) {
+          if (/retained conversation lost its connector/i.test(
+            error instanceof Error ? error.message : String(error),
+          )) noteChatGptRetainedConnectorLost(turn.threadId);
+          // The turn never reached ChatGPT, so run it again (no account cooldown).
+          surfaceRetries += 1;
+          requeue = unsent && surfaceRetries <= MAX_SURFACE_RETRIES;
+          // A retained chat losing its connector is ChatGPT's per-message binding, not a host fault.
+          // A host refreshing its session after a restart is busy for seconds, not broken.
+          const hostFault = !/retained conversation lost its connector|browser is busy with session refresh/i.test(
+            error instanceof Error ? error.message : String(error),
+          );
+          if (hostFault && lastHost && (launcherHostCandidates(this.config)?.pool.length ?? 0) > 0) {
+            quarantineLauncherHost(lastHost);
+            console.warn(`[chatgpt-web] launcher host ${lastHost} failed before submission; `
+              + "left out of new turns for 10 minutes");
+          }
+          refund = unsent;                  // nothing reached ChatGPT: give the slot back
+        }
+        if (!requeue && isChatGptRateLimitError(error) && !unsent) {
+          // Throttled after Send: the turn had started (on Mars a tool call had already run when the
+          // continuation hit the limit), so it must not be replayed here. Passed through as a rate
+          // limit, Codex treats it as final and blocks the goal. As a retryable failure, Codex's
+          // retry enters this gate and waits out the cooldown in the queue instead.
+          throw new ChatGptWebAdapterError(
+            "ChatGPT throttled this turn after it had started. It will run again once the account's cooldown passes.",
+            { status: 503, errorType: "server_error", code: "chatgpt_throttled_after_send", retryable: true },
+          );
+        }
+        if (!requeue) throw error;
+      } finally {
+        release(failure === undefined ? undefined : failure instanceof Error ? failure.message : String(failure), refund);
+      }
+      console.info(`[chatgpt-web] admission turn ${turn.traceId} failed before ChatGPT accepted it `
+        + `(${failure instanceof Error ? failure.message.slice(0, 80) : "error"}): back in the queue`);
+      if (isChatGptSignedOutError(failure)) {
+        await sleepUnlessAborted(this.surfaceRetryDelayMs * SIGNED_OUT_RETRY_DELAY_FACTOR, turn.abortSignal);
+      } else if (surfaceRetries > IMMEDIATE_SURFACE_RETRIES && isChatGptSurfaceUnavailableError(failure)) {
+        await sleepUnlessAborted(this.surfaceRetryDelayMs, turn.abortSignal);
+      }
+    }
+  }
+
+  private async runAdmitted(turn: BrowserTurn, onHost?: (host: string) => void): Promise<string> {
     return await new Promise<string>((resolveResult, rejectResult) => {
         if (this.pending.has(turn.traceId)) {
           rejectResult(new Error(`Duplicate launcher browser turn: ${turn.traceId}`));
           return;
         }
-        const pending: PendingTurn = { turn, resolve: resolveResult, reject: rejectResult };
+        const candidates = launcherHostCandidates(this.config)!;
+        const host = selectLauncherHost({
+          primary: candidates.primary,
+          pool: candidates.pool,
+          conversationKey: turn.conversationKey,
+          activeTurns: candidate => [...this.pending.values()].filter(item => item.host === candidate).length,
+        });
+        onHost?.(host);
+        const pending: PendingTurn = { turn, resolve: resolveResult, reject: rejectResult, host };
+        pending.releaseHost = markLauncherHostBusy(host);
         this.pending.set(turn.traceId, pending);
+        if (turn.retainConversation && turn.conversationKey) rememberLauncherHostAffinity(turn.conversationKey, host);
+        if (candidates.pool.length) {
+          console.info(`[chatgpt-web] browser turn ${turn.traceId} assigned to launcher host ${host}`);
+        }
         if (turn.abortSignal) {
           const abortListener = () => {
             if (!pending.sent) {
@@ -243,12 +487,17 @@ export class LauncherBrowserHelperClient {
               );
               return;
             }
+            const abortCause = turn.abortSignal?.reason instanceof Error
+              ? turn.abortSignal.reason.message : undefined;
+            console.info(`[chatgpt-web] browser turn ${turn.traceId} aborted by the bridge`
+              + `${abortCause ? `: ${abortCause.slice(0, 160)}` : " with no stated reason"}`);
             void this.send({
               type: "abort",
               id: turn.traceId,
               ...(turn.abortSignal?.reason instanceof ChatGptCompactionHandoffAccepted
                 ? { reason: "compaction_handoff_accepted" }
                 : {}),
+              ...(abortCause ? { cause: abortCause } : {}),
             }).catch(error => {
               this.finishWithError(
                 turn.traceId,
@@ -266,22 +515,29 @@ export class LauncherBrowserHelperClient {
         // Setting this before the synchronous write call makes an abort either prevent dispatch or
         // queue an `abort` after the `run` frame; it can never overtake the run frame in the pipe.
         pending.sent = true;
+        pending.lastHelperEventAt = this.now();
+        this.watchUnresponsiveTurns();
         const progressForwarding = new AbortController();
         pending.progressForwarding = progressForwarding;
         void this.send({
           type: "run",
           id: turn.traceId,
           config: {
-            appName: this.config.appName,
-            browserHostDescriptorPath: this.config.browserHostDescriptorPath!,
+            // Each launcher host can have its own connector (and therefore its own tunnel), so a
+            // long tool call in one browser does not queue the tool calls of turns in another.
+            appName: (pending.host && (launcherSlotAppName(pending.host) ?? this.config.browserHostAppNames?.[pending.host]))
+              || this.config.appName,
+            browserHostDescriptorPath: pending.host ? launcherSlotDescriptor(pending.host) : this.config.browserHostDescriptorPath!,
             browserDiagnosticsPath: this.config.browserDiagnosticsPath,
             turnTimeoutMs: this.config.turnTimeoutMs,
             autoApproveToolCalls: this.config.autoApproveToolCalls,
+            useSavedChats: this.config.useSavedChats,
           },
           turn: {
             traceId: turn.traceId,
             modelId: turn.modelId,
             reasoning: turn.reasoning,
+            ...(turn.modelFamily ? { modelFamily: turn.modelFamily } : {}),
             capabilities: turn.capabilities,
             ...(turn.nativeConnector ? { nativeConnector: true } : {}),
             ...(turn.prepareResume ? { resumeAvailable: true } : {}),
@@ -324,7 +580,8 @@ export class LauncherBrowserHelperClient {
       && this.ready) {
       return this.ready;
     }
-    const descriptor = readLauncherBrowserHostDescriptor(this.config.browserHostDescriptorPath!);
+    const candidates = launcherHostCandidates(this.config)!;
+    const descriptor = readAnyLauncherBrowserHostDescriptor(candidates.primary, candidates.pool);
     const child = spawn(
       descriptor.helper.executable,
       [this.config.browserHelperScriptPath ?? this.bundledHelperScript() ?? descriptor.helper.script],
@@ -412,6 +669,7 @@ export class LauncherBrowserHelperClient {
     }
     const pending = this.pending.get(message.id);
     if (!pending) return;
+    pending.lastHelperEventAt = this.now();
     if (message.type === "event") {
       if (message.event === "heartbeat") pending.turn.onHeartbeat?.();
       else if (message.event === "tool_batch_observed") {
@@ -638,6 +896,8 @@ export class LauncherBrowserHelperClient {
     pending.progressForwarding = undefined;
     pending.prepared?.release();
     pending.prepared = undefined;
+    pending.releaseHost?.();
+    pending.releaseHost = undefined;
     this.pending.delete(id);
   }
 
@@ -658,7 +918,7 @@ export class LauncherBrowserHelperClient {
     for (const id of [...this.pending.keys()]) {
       const pending = this.pending.get(id);
       if (!pending) continue;
-      void notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
+      void notifyLauncherTurn(pending.host ? launcherSlotDescriptor(pending.host) : this.config.browserHostDescriptorPath!, {
         phase: "end",
         traceId: id,
         helperPid: child.pid!,

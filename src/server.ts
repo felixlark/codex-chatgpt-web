@@ -6,7 +6,7 @@ import { chatGptTurnSessions } from "./adapters/chatgpt-web/turn-execution";
 import {
   cancelAllStructuredCompactions,
   cancelStructuredCompactionNativeTurn,
-  cancelStructuredCompactionTrace,
+  beginCancelStructuredCompactionTrace,
 } from "./adapters/chatgpt-web/compaction-handoff";
 import { ChatGptWebAdapterError, chatGptBrowserTabClosedError } from "./adapters/chatgpt-web/adapter-error";
 import {
@@ -17,8 +17,10 @@ import {
 } from "./adapters/chatgpt-web/environment";
 import { rememberCompactionContinuation } from "./adapters/chatgpt-web/compaction-continuation";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./bridge";
+import { readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import type { AppConfig } from "./config";
-import { providerConfig } from "./config";
+import { atomicWriteFile, expandUserPath, getConfigDir, providerConfig } from "./config";
 import { AsyncEventQueue } from "./event-queue";
 import { readJsonRequestBody } from "./http-body";
 import { httpStatusFromTerminalError } from "./lib/errors";
@@ -37,6 +39,7 @@ import {
 } from "./chatgpt-web-models";
 import { forwardNativeCodexRequest, type NativeFetch, type NativeImageEndpoint } from "./native-passthrough";
 import { fetchNativeCodex } from "./native-network";
+import { NativeWebSocketRelay, type NativeWebSocketRelayOptions, type RelayData } from "./native-websocket";
 import {
   buildCompactV1Output,
   COMPACT_PROMPT,
@@ -49,6 +52,8 @@ import { namespacedToolName, type AdapterEvent, type CodexParsedRequest } from "
 import type { CodexProviderConfig } from "./types";
 import type { ProviderAdapter } from "./adapters/base";
 import { VERSION } from "./version";
+import { ChatGptSessionKeepAlive } from "./adapters/chatgpt-web/session-keepalive";
+import { launcherDescriptorHasTurn } from "./adapters/chatgpt-web/launcher-host-pool";
 
 type HttpTrackedEndpoint = "models" | "responses" | "compact" | "search" | "unspecified" | NativeImageEndpoint;
 
@@ -363,7 +368,9 @@ export interface ResponseRequestOptions {
 }
 
 export function routeChatGptWebRequest(parsed: CodexParsedRequest, config: AppConfig): ChatGptWebModelRoute {
-  const route = requireChatGptWebModelRoute(parsed.modelId, config);
+  const route = requireChatGptWebModelRoute(parsed.modelId, config, parsed.options.reasoning);
+  if (route.interactionMode === "automatic" && route.modelFamily) parsed._chatgptModelFamily = route.modelFamily;
+  else delete parsed._chatgptModelFamily;
   parsed.modelId = route.backendModel;
   // Zero Risk preserves a distinct backend identity. Its immutable Codex effort is only a
   // protocol/catalog value; the manual adapter must never reinterpret it as a ChatGPT selection.
@@ -379,8 +386,88 @@ interface ModelCatalogFailure {
 }
 
 function modelCatalogFailure(stage: ModelCatalogFailure["stage"], error: unknown): ModelCatalogFailure {
-  const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
-  return { stage, ...(typeof code === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(code) ? { code } : {}) };
+  if (!error || typeof error !== "object") return { stage };
+  // Fetch can wrap the network error. Keep only bounded codes, never free-form
+  // messages, URLs or paths from either layer in the health snapshot.
+  for (const source of [error, "cause" in error ? error.cause : undefined]) {
+    const code = source && typeof source === "object" && "code" in source ? source.code : undefined;
+    if (typeof code === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(code)) return { stage, code };
+  }
+  const name = "name" in error ? error.name : undefined;
+  // AbortError identifies cancellation, not who initiated it. The upstream request
+  // can also be cancelled by the server, so do not blame the Codex client here.
+  if (name === "AbortError") return { stage, code: "ABORT_ERR" };
+  if (name === "TimeoutError") return { stage, code: "ETIMEDOUT" };
+  return { stage };
+}
+
+/**
+ * Error class and a short message for the journal only (health snapshots never carry messages):
+ * Bearer values and URL credentials are removed first.
+ */
+function modelCatalogErrorForLog(error: unknown): string {
+  const name = error instanceof Error ? error.name : typeof error;
+  const message = (error instanceof Error ? error.message : String(error))
+    .replace(/Bearer\s+\S+/gi, "Bearer <redacted>")
+    .replace(/\/\/[^/\s@]+@/g, "//<redacted>@")
+    .slice(0, 160);
+  return `${name}: ${message}`;
+}
+
+/**
+ * The last native catalog upstream returned, kept so a failing upstream does not take the free
+ * web-route models down with it. When the paid account hits its usage limit, the native catalog
+ * answers 429; passed through, Codex loses every model — chatgpt-web/* included — and goal turns
+ * stop although the free route itself is fine (Mars, 2026-09-25).
+ */
+let lastNativeCatalog: unknown;
+const nativeCatalogCachePath = () => join(getConfigDir(), "runtime", "native-model-catalog.json");
+
+// Tests keep the copy in memory only, so they never write into a real bridge home.
+const persistNativeCatalog = () => process.env.NODE_ENV !== "test";
+
+function rememberNativeCatalog(raw: unknown): void {
+  lastNativeCatalog = raw;
+  if (!persistNativeCatalog()) return;
+  try { atomicWriteFile(nativeCatalogCachePath(), JSON.stringify(raw)); } catch { /* memory copy suffices */ }
+}
+
+function recalledNativeCatalog(): unknown {
+  if (lastNativeCatalog !== undefined || !persistNativeCatalog()) return lastNativeCatalog;
+  try { lastNativeCatalog = JSON.parse(readFileSync(nativeCatalogCachePath(), "utf8")); } catch { /* none yet */ }
+  return lastNativeCatalog;
+}
+
+/** Test hook: forget the remembered native catalog. */
+export function forgetNativeCatalogForTests(): void {
+  lastNativeCatalog = undefined;
+}
+
+function catalogResponse(catalog: Record<string, unknown>, init: { status: number; statusText?: string; headers?: Headers }): Response {
+  const body = JSON.stringify(catalog);
+  const headers = new Headers(init.headers);
+  headers.delete("content-encoding");
+  headers.delete("content-length");
+  headers.set("content-type", "application/json");
+  headers.set("etag", `W/\"${createHash("sha256").update(body).digest("base64url")}\"`);
+  return new Response(body, { status: init.status, ...(init.statusText ? { statusText: init.statusText } : {}), headers });
+}
+
+/**
+ * Upstream failed: answer with the last good native catalog plus the web routes, so the free models
+ * stay selectable. Web-route entries are built from a native template, so without a remembered
+ * catalog there is nothing to serve and upstream's error goes through. Native models from the
+ * remembered catalog still fail at request time with upstream's own error, where it belongs.
+ */
+function fallbackCatalog(config: AppConfig, contextOverride?: () => CodexModelContextOverride | undefined): Response | undefined {
+  try {
+    const base = recalledNativeCatalog();
+    if (base === undefined) return undefined;
+    const headers = new Headers({ "x-codex-chatgpt-web-catalog": "remembered" });
+    return catalogResponse(augmentNativeModelCatalog(base, config, contextOverride?.()), { status: 200, headers });
+  } catch {
+    return undefined;
+  }
 }
 
 export async function modelsRequest(
@@ -388,7 +475,7 @@ export async function modelsRequest(
   config: AppConfig,
   fetchUpstream?: NativeFetch,
   contextOverride?: () => CodexModelContextOverride | undefined,
-  onFailure?: (failure: ModelCatalogFailure) => void,
+  onFailure?: (failure: ModelCatalogFailure, detail?: string) => void,
 ): Promise<Response> {
   let upstream: Response;
   let sent = false;
@@ -398,27 +485,27 @@ export async function modelsRequest(
       return (fetchUpstream ?? fetchNativeCodex)(input);
     });
   } catch (error) {
-    onFailure?.(modelCatalogFailure(sent ? "transport" : "request", error));
-    return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
+    onFailure?.(modelCatalogFailure(sent ? "transport" : "request", error), modelCatalogErrorForLog(error));
+    // A request that never left (no credentials) is the caller's own error; only an upstream that
+    // could not be reached is covered by the remembered catalog.
+    return (sent ? fallbackCatalog(config, contextOverride) : undefined)
+      ?? formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
   }
   if (!upstream.ok) {
     onFailure?.({ stage: "upstream" });
-    return upstream;
+    return fallbackCatalog(config, contextOverride) ?? upstream;
   }
+  let raw: unknown;
   let catalog: Record<string, unknown>;
   try {
-    catalog = augmentNativeModelCatalog(await upstream.json(), config, contextOverride?.());
+    raw = await upstream.json();
+    catalog = augmentNativeModelCatalog(raw, config, contextOverride?.());
   } catch (error) {
     onFailure?.(modelCatalogFailure("catalog", error));
     return formatErrorResponse(502, "invalid_response_error", error instanceof Error ? error.message : String(error));
   }
-  const body = JSON.stringify(catalog);
-  const headers = new Headers(upstream.headers);
-  headers.delete("content-encoding");
-  headers.delete("content-length");
-  headers.set("content-type", "application/json");
-  headers.set("etag", `W/\"${createHash("sha256").update(body).digest("base64url")}\"`);
-  return new Response(body, { status: upstream.status, statusText: upstream.statusText, headers });
+  rememberNativeCatalog(raw);
+  return catalogResponse(catalog, { status: upstream.status, statusText: upstream.statusText, headers: upstream.headers });
 }
 
 export async function nativeSearchRequest(
@@ -532,6 +619,7 @@ export async function responseRequest(
   }
 
   const compaction = parsed._compactionRequest === true;
+  const compactionItem = compaction && parsed._compactionResponseFormat !== "message";
   const rememberCompletedResponse = (response: Record<string, unknown>): void => {
     if (!compaction) {
       if (options.rememberState !== false) rememberResponseState(parsed._rawBody, response, { force: true });
@@ -539,10 +627,16 @@ export async function responseRequest(
     }
     if (response.status !== "completed") return;
     const identity = extractChatGptTurnIdentity(parsed);
-    if (!identity.threadId || !identity.turnId || !Array.isArray(response.output) || response.output.length !== 1) return;
-    const item = response.output[0];
-    if (item?.type !== "compaction" || typeof item.encrypted_content !== "string") return;
-    const summary = decodeCompactionSummary(item.encrypted_content);
+    if (!identity.threadId || !identity.turnId || !Array.isArray(response.output)) return;
+    const items = response.output.filter(item => item?.type === (compactionItem ? "compaction" : "message"));
+    if (items.length !== 1 || (compactionItem && response.output.length !== 1)) return;
+    const item = items[0];
+    const summary = compactionItem
+      ? (typeof item?.encrypted_content === "string" ? decodeCompactionSummary(item.encrypted_content) : null)
+      : (item?.role === "assistant" && Array.isArray(item.content)
+        ? item.content.filter((part: { type?: string; text?: unknown }) => part.type === "output_text" && typeof part.text === "string")
+          .map((part: { text: string }) => part.text).join("")
+        : null);
     if (!summary) return;
     const source = extractChatGptCompactionSourceRevision(parsed);
     const body = parsed._rawBody as { input?: unknown[] };
@@ -644,7 +738,7 @@ export async function responseRequest(
         ...(provider.chatgptWeb?.stallTimeoutSec !== undefined
           ? { stallTimeoutSec: provider.chatgptWeb.stallTimeoutSec }
           : {}),
-        ...(compaction ? { compaction: true } : {}),
+        ...(compactionItem ? { compaction: true } : {}),
         onCompletedResponse: rememberCompletedResponse,
       },
     );
@@ -665,7 +759,7 @@ export async function responseRequest(
     toolNsMap: maps.toolNsMap,
     freeformToolNames: maps.freeformToolNames,
     toolSearchToolNames: maps.toolSearchToolNames,
-    ...(compaction ? { compaction: true } : {}),
+    ...(compactionItem ? { compaction: true } : {}),
   });
   rememberCompletedResponse(json);
   return Response.json(json);
@@ -790,12 +884,35 @@ export async function compactRequest(
 
 export function startServer(
   config: AppConfig,
-  dependencies: { fetchUpstream?: NativeFetch; adapterFactory?: ChatGptWebAdapterFactory } = {},
+  dependencies: {
+    fetchUpstream?: NativeFetch;
+    adapterFactory?: ChatGptWebAdapterFactory;
+    nativeWebSocket?: NativeWebSocketRelayOptions;
+  } = {},
 ): ReturnType<typeof Bun.serve> {
   if (config.purpose === "dev-harness") {
     throw new Error("DEV harness configuration cannot start a Responses listener");
   }
   const startedAt = Date.now();
+  // Hosts sit idle between turns and quietly lose their ChatGPT session; keep them warm and make a
+  // signed-out host visible before a goal pays for it. Off in tests, which have no launcher.
+  const keepAlive = config.mode === "full" && config.browserHostDescriptorPath && process.env.NODE_ENV !== "test"
+    ? new ChatGptSessionKeepAlive({
+      // Keep-alive works on browsers, not slots: several slots can share one launcher.
+      hosts: () => [...new Set(config.browserHostSlots?.length
+        ? config.browserHostSlots.map(slot => resolve(expandUserPath(slot.descriptor)))
+        : [config.browserHostDescriptorPath!, ...(config.browserHostPool ?? [])])],
+      busy: launcherDescriptorHasTurn,
+      record: results => {
+        try {
+          atomicWriteFile(join(getConfigDir(), "runtime", "chatgpt-keepalive.json"),
+            JSON.stringify({ version: 1, checkedAt: Date.now(), hosts: results }));
+        } catch {
+          // The console simply shows nothing when the file is missing.
+        }
+      },
+    }).start()
+    : undefined;
   const turnBroker = config.mode === "full" ? TurnBroker.forSocket(config.brokerSocketPath) : undefined;
   if (config.mode === "full") {
     void turnBroker!.listen().catch(error => {
@@ -813,6 +930,7 @@ export function startServer(
     request: number; at: string; status: number; failure?: ModelCatalogFailure;
   } | null = null;
   const httpTurns = new HttpTurnCounter();
+  const nativeWebSocket = new NativeWebSocketRelay(dependencies.nativeWebSocket);
   const activity = () => ({
     active_http_turns: httpTurns.count(),
     active_browser_turns: chatGptTurnSessions.activeCount() + (turnBroker?.externalOwnerActiveCount() ?? 0),
@@ -823,11 +941,12 @@ export function startServer(
     const actual = Buffer.from(header);
     return actual.length === expected.length && timingSafeEqual(actual, expected);
   };
-  const server = Bun.serve({
+  const server = Bun.serve<RelayData, never>({
     hostname: config.host,
     port: config.port,
     idleTimeout: 0,
-    async fetch(req) {
+    websocket: nativeWebSocket.handlers,
+    async fetch(req, bunServer) {
       const url = new URL(req.url);
       if (req.method === "GET" && url.pathname === "/healthz") {
         return Response.json({
@@ -882,19 +1001,21 @@ export function startServer(
           : chatGptBrowserTabClosedError();
         // Revoke the owner first. This prevents a compaction callback that observes its retained
         // source being cancelled below from starting a fresh fallback during operator shutdown.
-        const compactionCancellation = cancelStructuredCompactionTrace(traceId, reason);
-        const browserCancellation = chatGptTurnSessions.cancelTrace(traceId, reason);
-        const [cancelledBrowserTurns, cancelledCompactionRuns] = await Promise.all([
-          browserCancellation,
-          compactionCancellation,
-        ]);
+        const compactionCancellation = beginCancelStructuredCompactionTrace(traceId, reason);
+        const browserCancellation = chatGptTurnSessions.beginCancelTrace(traceId, reason);
         const cancelledBrokerTurns = turnBroker?.revokeTrace(traceId, reason) ?? 0;
+        const settlement = Promise.all([browserCancellation.settlement, compactionCancellation.settlement]);
+        // Explicit tab close acknowledges revoked authority, then destroys its document. Waiting
+        // for that document's helper first can deadlock the UI behind a stalled browser operation.
+        // Lease cleanup still requires physical settlement before declaring the runtime idle.
+        if (leaseFailure) await settlement;
+        else void settlement.catch(error => console.error(`[chatgpt-web] cancelled turn cleanup failed: ${error instanceof Error ? error.message : String(error)}`));
         return Response.json({
           status: "ok",
           trace_id: traceId,
-          cancelled_browser_turns: cancelledBrowserTurns,
+          cancelled_browser_turns: browserCancellation.cancelled,
           cancelled_broker_turns: cancelledBrokerTurns,
-          cancelled_compaction_runs: cancelledCompactionRuns,
+          cancelled_compaction_runs: compactionCancellation.cancelled,
           ...activity(),
         });
       }
@@ -995,13 +1116,22 @@ export function startServer(
         return httpTurns.track(async signal => {
           const request = ++modelCatalogRequests;
           const started = Date.now();
+          let failureDetail: string | undefined;
           const recordResult = (response: Response, failure?: ModelCatalogFailure): Response => {
+            // The client hung up first (Codex drops superseded catalog refreshes): nothing failed here.
+            if (!response.ok && req.signal.aborted) return response;
             const result = { request, at: new Date().toISOString(), status: response.status, ...(failure ? { failure } : {}) };
             // An older, slower request must not replace a newer completed result.
             if (!lastModelCatalogResult || request > lastModelCatalogResult.request) lastModelCatalogResult = result;
             if (!response.ok) {
               try {
-                console.warn(`[codex-chatgpt-web] model_catalog_failed ${JSON.stringify({ ...result, elapsedMs: Date.now() - started })}`);
+                console.warn(`[codex-chatgpt-web] model_catalog_failed ${JSON.stringify({
+                  ...result,
+                  elapsedMs: Date.now() - started,
+                  ...(failureDetail ? { error: failureDetail } : {}),
+                  client: (req.headers.get("user-agent") ?? "").slice(0, 80),
+                  clientAborted: req.signal.aborted,
+                })}`);
               } catch { /* Logging must not replace the catalog result. */ }
             }
             return response;
@@ -1025,7 +1155,7 @@ export function startServer(
             catalogConfig,
             dependencies.fetchUpstream,
             readCodexModelContextOverride,
-            value => { failure = value; },
+            (value, detail) => { failure = value; failureDetail = detail; },
           );
           if (response.ok) {
             successfulModelCatalogRequests += 1;
@@ -1035,6 +1165,10 @@ export function startServer(
         }, req.signal, process.platform, "models");
       }
       if (req.method === "GET" && url.pathname === "/v1/responses") {
+        // Native models relay over WebSocket; ChatGPT Web models and anything else get 426 → HTTP.
+        if (!draining && req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+          return await nativeWebSocket.upgrade(req, bunServer);
+        }
         return new Response("Responses WebSocket transport is not enabled on this local route", {
           status: 426,
           headers: { "content-type": "text/plain; charset=utf-8" },
@@ -1096,6 +1230,7 @@ export function startServer(
   function shutdown(): void {
     if (shutdownPromise) return;
     draining = true;
+    keepAlive?.stop();
     chatGptTurnSessions.clear();
     flushResponseState();
     shutdownPromise = (async () => {

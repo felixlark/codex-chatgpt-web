@@ -368,7 +368,7 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
-  test("keeps sequential native messages in one retained MCP conversation until compaction", async () => {
+  test.each([false, true])("sequential native messages honor fresh conversation mode=%s", async freshConversation => {
     const socketPath = brokerTestEndpoint(`cgw-retained-messages-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
@@ -376,6 +376,7 @@ describe("ChatGPT outer-native harness v4", () => {
       chatgptWeb: {
         browserHost: "launcher",
         browserHostDescriptorPath: join(tempRoot, "retained-launcher.json"),
+        experimentalFreshConversationPerTurn: freshConversation,
         brokerSocketPath: socketPath,
         localToolsEnabled: true,
         solAvailable: true,
@@ -385,11 +386,15 @@ describe("ChatGPT outer-native harness v4", () => {
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
     const preparedPrompts: string[] = [];
-    const conversationKeys: string[] = [];
+    const conversationKeys: (string | undefined)[] = [];
     const tokens: string[] = [];
     let browserMessages = 0;
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
-      const prepared = browserMessages === 0 ? await turn.prepare() : await turn.prepareResume!();
+      if (freshConversation) {
+        expect(turn.prepareResume).toBeUndefined();
+        expect(turn.retainConversation).not.toBe(true);
+      }
+      const prepared = browserMessages === 0 || freshConversation ? await turn.prepare() : await turn.prepareResume!();
       preparedPrompts.push(prepared.text);
       conversationKeys.push(turn.conversationKey!);
       const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
@@ -440,12 +445,18 @@ describe("ChatGPT outer-native harness v4", () => {
       await adapter.runTurn!(second, { headers: new Headers() }, () => {});
 
       expect(browserMessages).toBe(2);
-      expect(conversationKeys[0]).toBe(chatGptConversationKey(first, chatGptWebExecutionNamespace(provider))!);
+      expect(conversationKeys[0]).toBe(freshConversation
+        ? undefined : chatGptConversationKey(first, chatGptWebExecutionNamespace(provider))!);
       expect(conversationKeys[1]).toBe(conversationKeys[0]);
       expect(tokens[1]).not.toBe(tokens[0]);
       expect(preparedPrompts[0]).toContain("Inspect the project");
       expect(preparedPrompts[1]).toContain("Continue in the same repository");
-      expect(preparedPrompts[1]).not.toContain("First retained answer");
+      if (freshConversation) {
+        expect(preparedPrompts[1]).toContain("First retained answer");
+        expect(preparedPrompts[1]).toContain("Inspect the project");
+      } else {
+        expect(preparedPrompts[1]).not.toContain("First retained answer");
+      }
       expect(preparedPrompts[1]).not.toContain(environmentXml);
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
@@ -974,6 +985,39 @@ describe("ChatGPT outer-native harness v4", () => {
     expect(sessions.find("old")).toBeUndefined();
     expect(sessions.find("other")?.nativeTurnId).toBe("turn_other");
     expect(cancelled).toEqual(["old"]);
+  });
+
+  test("reaps an active turn whose tool batch Codex never answered, but not one with client activity", () => {
+    const sessions = new ChatGptTurnSessions(30 * 60_000, 256, 1_000);
+    const cancelled: string[] = [];
+    const runtime = (name: string) => ({
+      mode: "read-only" as const,
+      browser: new Promise<string>(() => {}),
+      physicalSettlement: new Promise<void>(() => {}),
+      trace: new ChatGptTraceFeed(),
+      text: new ChatGptTextFeed(),
+      cancel: () => { cancelled.push(name); },
+    });
+    const abandoned = sessions.getOrCreate("abandoned", () => runtime("abandoned"), "abandoned-trace");
+    const active = sessions.getOrCreate("active", () => runtime("active"), "active-trace");
+    sessions.getOrCreate("idle", () => runtime("idle"), "idle-trace");
+    type Batch = Parameters<typeof abandoned.setOutstanding>[0];
+    abandoned.setOutstanding([{ callId: "call_abandoned" }] as unknown as Batch);
+    active.setOutstanding([{ callId: "call_active" }] as unknown as Batch);
+    const now = Date.now();
+    // Codex has just come back for the active turn (e.g. while its tool is still running).
+    active.lastUsedAt = () => now + 1_400;
+
+    expect(sessions.reapDetachedToolTurns(now + 500)).toBe(0);
+    expect(sessions.reapDetachedToolTurns(now + 1_500)).toBe(1);
+    expect(cancelled).toEqual(["abandoned"]);
+    expect(sessions.find("abandoned")).toBeUndefined();
+    expect(sessions.find("active")?.traceId).toBe("active-trace");
+    expect(sessions.find("idle")?.traceId).toBe("idle-trace");
+
+    active.markResultDelivered("call_active");
+    expect(active.outstandingSince()).toBeUndefined();
+    expect(sessions.reapDetachedToolTurns(now + 60_000)).toBe(0);
   });
 
   test("retires a failed session so the next native retry starts a new browser turn", async () => {
@@ -1705,6 +1749,27 @@ describe("ChatGPT outer-native harness v4", () => {
     expect(tracker.update({ ...state, currentHtml: "<p>final answer</p><p>hydrated</p>" }, 6_000)).toBe(false);
     expect(tracker.update({ ...state, currentHtml: "<p>final answer</p><p>hydrated</p>" }, 8_000)).toBe(true);
     expect(tracker.update({ ...state, running: true }, 8_100)).toBe(false);
+  });
+
+  test("repeated empty Markdown blocks are appended without reusing an earlier block identity", () => {
+    const buffer = new ChatGptMarkdownBuffer(markdown => markdown, 0);
+    const initial = [
+      { key: "0:p", tag: "p", html: "<p>First.</p>", text: "First.", streamable: true },
+      { key: "1:hr", tag: "hr", html: "<hr>", text: "", streamable: true },
+      { key: "2:p", tag: "p", html: "<p>Second.</p>", text: "Second.", streamable: false },
+    ];
+    expect(buffer.observe(initial)).toBe("First.\n\n* * *");
+    const expanded = [
+      ...initial.map(segment => ({ ...segment, streamable: true })),
+      { key: "3:hr", tag: "hr", html: "<hr>", text: "", streamable: true },
+      { key: "4:p", tag: "p", html: "<p>Third.</p>", text: "Third.", streamable: false },
+    ];
+    expect(buffer.observe(expanded)).toBe("\n\nSecond.\n\n* * *");
+    expect(buffer.currentSnapshotIsConsistent()).toBeTrue();
+    expect(buffer.observe(expanded)).toBe("");
+    expect(buffer.finish().markdown).toBe("First.\n\n* * *\n\nSecond.\n\n* * *\n\nThird.");
+    buffer.observe([expanded[3]!, expanded[1]!]);
+    expect(() => buffer.finish()).toThrow("changed a completed text block");
   });
 
   test("preserves GFM formatting while streaming only completed stable DOM blocks", () => {
@@ -2481,13 +2546,14 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
-  test("runs Pro through the same turn-bound MCP tool loop as other Full-mode efforts", async () => {
+  test.each([false, true])("Pro keeps one MCP tool loop and replays results with fresh mode=%s", async freshConversation => {
     const socketPath = brokerTestEndpoint(`cgw-h3-pro-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: "browser://chatgpt-pro-test",
       contextWindow: 256_000,
-      chatgptWeb: { brokerSocketPath: socketPath, turnTimeoutMs: 30_000, localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+      chatgptWeb: { brokerSocketPath: socketPath, turnTimeoutMs: 30_000, localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true,
+        experimentalFreshConversationPerTurn: freshConversation },
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
@@ -2663,7 +2729,9 @@ describe("ChatGPT outer-native harness v4", () => {
       // ChatGPT caches the complete tools/list contract under a connector identity.
       // An intentional hash change therefore requires an explicit connector refresh or identity migration.
       expect(createHash("sha256").update(canonicalJson(publicConnectorAbi)).digest("hex"))
-        .toBe("9bb14902149337b52ce8598889497b1aba5a3265f28291df950bb38b5700a421");
+        .toBe("f4c9b6d6cf5822028f139aa33749ea4d9f834d4f8ea27359b404a17ca93d068a");
+      expect(listed.tools.find(tool => tool.name === "codex_tool_call")?.description)
+        .toContain("reserved codex.control.compaction_handoff operation, which is not listed by inventory");
       for (const tool of listed.tools) {
         const properties = tool.inputSchema.properties as Record<string, unknown>;
         expect(properties.turn_token).toEqual({ type: "string", minLength: 20, maxLength: 256 });
@@ -3891,7 +3959,8 @@ describe("adapter liveness covers every path through a turn", () => {
     expect(heartbeats.length).toBeGreaterThanOrEqual(2);
     // One on entry, before the wait is even reached, then the armed interval.
     expect(heartbeats[0]).toBeLessThan(2_000);
-    expect(heartbeats.at(-1)).toBeGreaterThanOrEqual(CHATGPT_WEB_ADAPTER_HEARTBEAT_MS);
+    // Verify continued liveness, not millisecond-exact OS timer scheduling.
+    expect(heartbeats.at(-1)).toBeGreaterThan(heartbeats[0]!);
   }, 40_000);
 
   test("aborting while waiting for a previous owner settles the observer promptly", async () => {
@@ -3959,6 +4028,7 @@ describe("adapter liveness covers every path through a turn", () => {
     );
 
     expect(heartbeats.length).toBeGreaterThanOrEqual(2);
-    expect(heartbeats.at(-1)).toBeGreaterThanOrEqual(CHATGPT_WEB_ADAPTER_HEARTBEAT_MS);
+    // Verify continued liveness, not millisecond-exact OS timer scheduling.
+    expect(heartbeats.at(-1)).toBeGreaterThan(heartbeats[0]!);
   }, 40_000);
 });

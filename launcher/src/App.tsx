@@ -7,11 +7,15 @@ import {
   useMemo,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
 import { copyFor, localizeRuntimeMessage, type Copy } from "./i18n";
 import { Icon, type IconName } from "./icons";
+import { LimitsSurface } from "./LimitsSurface";
+import { limitsCopyFor } from "./limits-copy";
+import { useLimits } from "./useLimits";
 import type {
   BrowserInteractionMode,
   BrowserState,
@@ -68,6 +72,9 @@ export function App() {
           }
         : current);
     });
+    const unsubscribeConnectorNames = api.onConnectorNamesChanged(names => {
+      setSnapshot(current => current ? { ...current, ...names } : current);
+    });
     const unsubscribeBrowser = api.onBrowserState(setBrowser);
     const unsubscribeOperation = api.onOperation((next) => {
       setOperation(next);
@@ -80,6 +87,7 @@ export function App() {
     return () => {
       cancelled = true;
       unsubscribeState();
+      unsubscribeConnectorNames();
       unsubscribeBrowser();
       unsubscribeOperation();
       unsubscribeLog();
@@ -102,7 +110,7 @@ export function App() {
   if (!snapshot) return <LaunchLoading />;
 
   const language = snapshot.state.language ?? "en";
-  const copy = copyFor(language);
+  const copy = copyFor(language, snapshot.connectorNames);
 
   return (
     <div
@@ -336,8 +344,11 @@ function LauncherShell({
       || snapshot.state.codexCatalogVerified === true);
   const firstRunZeroRiskSetup = snapshot.state.browserInteractionMode === "manual"
     && snapshot.state.coreSetupComplete !== true;
+  // A pool host: the bridge runs in another process, so anything that would install or start one
+  // here is hidden — this window exists to sign in to ChatGPT and to host turns.
+  const browserHostOnly = snapshot.browserHostOnly === true;
   const [surface, setSurface] = useState<Surface>(
-    firstRunZeroRiskSetup ? "mcp" : interactionSetupComplete ? "browser" : "setup",
+    firstRunZeroRiskSetup ? "mcp" : interactionSetupComplete || browserHostOnly ? "browser" : "setup",
   );
   const devProfile = snapshot.profile === "development";
   const compactAtMount = useRef(window.matchMedia(COMPACT_SIDEBAR_QUERY).matches).current;
@@ -359,7 +370,7 @@ function LauncherShell({
     && !biggerContextRecommendationOpen;
   const needsBrowser = snapshot.state.browserInteractionMode === "automatic"
     && browser?.authenticated !== true;
-  const needsSetup = !needsBrowser && !interactionSetupComplete;
+  const needsSetup = !needsBrowser && !interactionSetupComplete && !browserHostOnly;
   const mcpOptional = snapshot.state.browserInteractionMode === "automatic"
     && snapshot.state.codexCatalogVerified === true
     && snapshot.state.mcpSetupComplete !== true;
@@ -367,6 +378,8 @@ function LauncherShell({
   const updateBusy = snapshot.update.status === "downloading" || snapshot.update.status === "installing";
   const updateVersion = "version" in snapshot.update ? snapshot.update.version : null;
   const selectedManualTab = browser?.tabs.find(tab => tab.active && tab.interactionMode === "manual");
+  const limits = useLimits(api!, snapshot.state.browserInteractionMode === "manual");
+  const limitsCopy = limitsCopyFor(language);
 
   useEffect(() => {
     if (snapshot.state.browserInteractionMode === "manual") {
@@ -591,7 +604,7 @@ function LauncherShell({
                   label={copy.setup}
                   onClick={() => navigateSurface("setup")}
                 />
-                <SidebarItem
+                {browserHostOnly ? null : <SidebarItem
                   active={surface === "mcp"}
                   badge={mcpOptional ? <ActionDot tone="optional" /> : null}
                   icon="mcp"
@@ -600,10 +613,21 @@ function LauncherShell({
                     setMcpTargetMode(null);
                     navigateSurface("mcp");
                   }}
-                />
+                />}
               </SidebarGroup>
               <SidebarGroup label={copy.runtime}>
                 <SidebarItem active={surface === "activity"} icon="activity" label={copy.activity} onClick={() => navigateSurface("activity")} />
+                <SidebarItem
+                  active={surface === "limits"}
+                  badge={limits.needsAttention ? (
+                    <span role="img" aria-label={limitsCopy.nearLimit} title={limitsCopy.nearLimit}>
+                      <ActionDot tone="optional" />
+                    </span>
+                  ) : null}
+                  icon="logs"
+                  label={limitsCopy.title}
+                  onClick={() => navigateSurface("limits")}
+                />
               </SidebarGroup>
             </nav>
 
@@ -654,6 +678,7 @@ function LauncherShell({
               <SetupSurface
                 activateBrowser={activateBrowser}
                 browser={browser}
+                browserHostOnly={browserHostOnly}
                 copy={copy}
                 devProfile={devProfile}
                 operation={operation}
@@ -684,6 +709,19 @@ function LauncherShell({
             ) : null}
             {surface === "activity" ? (
               <ActivitySurface copy={copy} language={language} logs={logs} setError={setError} />
+            ) : null}
+            {surface === "limits" ? (
+              <LimitsSurface
+                api={api!}
+                tracker={limits}
+                language={language}
+                manualMode={snapshot.state.browserInteractionMode === "manual"}
+                runtimeBusy={operation?.status === "running"
+                  || browser?.status === "running" || browser?.status === "testing" || browser?.status === "loading"
+                  || browser?.loading === true
+                  || browser?.tabs.some((tab) => tab.status === "running" || tab.status === "testing" || tab.loading) === true}
+                setError={setError}
+              />
             ) : null}
             {surface === "settings" ? (
               <SettingsSurface
@@ -1078,6 +1116,7 @@ function ManualTurnGuide({
 function SetupSurface({
   activateBrowser,
   browser,
+  browserHostOnly,
   copy,
   devProfile,
   operation,
@@ -1088,6 +1127,7 @@ function SetupSurface({
 }: {
   activateBrowser: (show?: boolean) => Promise<void>;
   browser: BrowserState | null;
+  browserHostOnly: boolean;
   copy: Copy;
   devProfile: boolean;
   operation: OperationState | null;
@@ -1138,10 +1178,12 @@ function SetupSurface({
   return (
     <ContentSurface
       eyebrow={copy.required}
-      subtitle={devProfile
-        ? copy.devSetupSubtitle
-        : manualInteraction ? copy.manualInteractionBody : copy.setupSubtitle}
-      title={devProfile ? copy.devSetupTitle : copy.setupTitle}
+      subtitle={browserHostOnly
+        ? copy.hostOnlySetupSubtitle
+        : devProfile
+          ? copy.devSetupSubtitle
+          : manualInteraction ? copy.manualInteractionBody : copy.setupSubtitle}
+      title={browserHostOnly ? copy.hostOnlySetupTitle : devProfile ? copy.devSetupTitle : copy.setupTitle}
     >
       <SectionHeading label={devProfile ? copy.devCoreSetup : copy.coreSetup} />
       <div className="setup-list">
@@ -1167,7 +1209,7 @@ function SetupSurface({
             title={copy.stepSmoke}
           />
         </> : null}
-        <SetupRow
+        {browserHostOnly ? null : <SetupRow
           action={snapshot.state.coreSetupComplete
             ? devProfile ? copy.devReinstall : copy.reinstall
             : devProfile ? copy.devInstall : copy.install}
@@ -1186,15 +1228,16 @@ function SetupSurface({
               onChange={(enabled) => void setZeroRiskPro(enabled)}
             />
           ) : undefined}
-        />
+        />}
       </div>
 
-      {!devProfile && snapshot.state.codexRestartRequired ? (
+      {!devProfile && !browserHostOnly && snapshot.state.codexRestartRequired ? (
         <NoticeRow icon="alert" tone="warning">
           {copy.restartCodex}
         </NoticeRow>
       ) : null}
 
+      {browserHostOnly ? null : <>
       <SectionHeading label="MCP" meta={manualInteraction ? copy.required : copy.optional} spaced />
       <button
         className="next-surface-row"
@@ -1210,6 +1253,7 @@ function SetupSurface({
         <em>{snapshot.state.mcpSetupComplete ? copy.mcpReady : copy.configureMcp}</em>
         <Icon name="chevron" />
       </button>
+      </>}
     </ContentSurface>
   );
 }
@@ -1586,6 +1630,27 @@ function SettingsSurface({
   const [busy, setBusy] = useState(false);
   const [turnsCancelled, setTurnsCancelled] = useState(false);
   const [integrationRemoved, setIntegrationRemoved] = useState(false);
+  const currentPluginName = snapshot.connectorNames[snapshot.state.browserInteractionMode];
+  const [nameSuffix, setNameSuffix] = useState(currentPluginName.slice(6));
+  const [confirmNameChange, setConfirmNameChange] = useState(false);
+  const proposedName = `Codex ${nameSuffix.trim()}`;
+  useEffect(() => {
+    setNameSuffix(currentPluginName.slice(6));
+    setConfirmNameChange(false);
+  }, [currentPluginName]);
+  const changePluginName = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      updateState(await api!.setConnectorNameSuffix(nameSuffix.trim()));
+      setConfirmNameChange(false);
+      configureInteractionMode(snapshot.state.browserInteractionMode);
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const updateLanguage = async (next: Language) => {
     try {
@@ -1632,6 +1697,28 @@ function SettingsSurface({
     setError(null);
     try {
       updateState(await api!.setSkillAttachments(enabled));
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const setFreshConversationPerTurn = async (enabled: boolean) => {
+    setBusy(true);
+    setError(null);
+    try {
+      updateState(await api!.setFreshConversationPerTurn(enabled));
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const setUseSavedChats = async (enabled: boolean) => {
+    setBusy(true);
+    setError(null);
+    try {
+      updateState(await api!.setUseSavedChats(enabled));
     } catch (cause) {
       setError(messageOf(cause));
     } finally {
@@ -1685,6 +1772,31 @@ function SettingsSurface({
           mode={snapshot.state.browserInteractionMode}
           onChange={(mode) => void setInteractionMode(mode)}
         />
+        <div className="plugin-name-setting">
+          <SettingRow body={copy.pluginNameBody} label={copy.pluginName}>
+            <div className="plugin-name-input">
+              <span aria-hidden="true">Codex</span>
+              <input
+                aria-label={copy.pluginName}
+                disabled={busy || !snapshot.state.coreSetupComplete}
+                maxLength={74}
+                onChange={event => { setNameSuffix(event.target.value); setConfirmNameChange(false); }}
+                value={nameSuffix}
+              />
+            </div>
+          </SettingRow>
+          <code>{proposedName}</code>
+          {confirmNameChange ? <>
+            <p>{copy.pluginNameWarning}</p>
+            <div className="manual-turn-actions">
+              <SecondaryButton disabled={busy} onClick={() => setConfirmNameChange(false)}>{copy.previous}</SecondaryButton>
+              <PrimaryButton disabled={busy} onClick={() => void changePluginName()}>{copy.pluginNameConfirm}</PrimaryButton>
+            </div>
+          </> : <SecondaryButton
+            disabled={busy || !snapshot.state.coreSetupComplete || !nameSuffix.trim() || proposedName === currentPluginName}
+            onClick={() => setConfirmNameChange(true)}
+          >{copy.pluginNameChange}</SecondaryButton>}
+        </div>
         <SettingRow body={devProfile ? copy.devKeepRunningBody : copy.keepRunningOnCloseBody} label={copy.keepRunningOnClose}>
           <Switch
             checked={snapshot.state.keepRunningOnClose}
@@ -1722,6 +1834,21 @@ function SettingsSurface({
             checked={snapshot.state.experimentalSkillAttachments}
             disabled={busy || snapshot.state.browserInteractionMode === "manual" || !snapshot.state.coreSetupComplete}
             onChange={(checked) => void setSkillAttachments(checked)}
+          />
+        </SettingRow>
+        <SettingRow body={snapshot.state.browserInteractionMode === "manual"
+          ? copy.manualFreshConversationUnavailable : copy.freshConversationBody} label={copy.freshConversation}>
+          <Switch
+            checked={snapshot.state.experimentalFreshConversationPerTurn}
+            disabled={busy || snapshot.state.browserInteractionMode === "manual" || snapshot.state.coreSetupComplete !== true}
+            onChange={(checked) => void setFreshConversationPerTurn(checked)}
+          />
+        </SettingRow>
+        <SettingRow body={copy.savedChatsBody} label={copy.savedChats}>
+          <Switch
+            checked={snapshot.state.useSavedChats}
+            disabled={busy || snapshot.state.coreSetupComplete !== true}
+            onChange={(checked) => void setUseSavedChats(checked)}
           />
         </SettingRow>
         <SettingRow body={copy.chooseLanguageHint} label={copy.language}>
@@ -1956,9 +2083,31 @@ function ZeroRiskModelMenu({
 
 function TutorialVideo({ copy, label, src }: { copy: Copy; label: string; src: string }) {
   const [expanded, setExpanded] = useState(false);
+  const [paused, setPaused] = useState(false);
   const inlineVideo = useRef<HTMLVideoElement>(null);
   const expandedVideo = useRef<HTMLVideoElement>(null);
   const expandedAt = useRef(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    const active = expanded ? expandedVideo.current : inlineVideo.current;
+    if (expanded) inlineVideo.current?.pause();
+    if (paused) active?.pause();
+    else if (active) void active.play().catch(() => { if (!cancelled) setPaused(true); });
+    return () => { cancelled = true; };
+  }, [expanded, paused]);
+
+  const playbackControl = {
+    "aria-label": `${label}: ${paused ? copy.playGuideVideo : copy.pauseGuideVideo}`,
+    role: "button",
+    tabIndex: 0,
+    onClick: () => setPaused(value => !value),
+    onKeyDown: (event: ReactKeyboardEvent<HTMLVideoElement>) => {
+      if (event.repeat || (event.key !== " " && event.key !== "Enter")) return;
+      event.preventDefault();
+      setPaused(value => !value);
+    },
+  };
 
   const closeExpanded = () => {
     const currentTime = expandedVideo.current?.currentTime;
@@ -1980,7 +2129,10 @@ function TutorialVideo({ copy, label, src }: { copy: Copy; label: string; src: s
   return (
     <>
       <div className="guide-media">
-        <video aria-label={label} autoPlay loop muted playsInline ref={inlineVideo} src={src} />
+        <video {...playbackControl} autoPlay={!paused && !expanded} loop muted playsInline ref={inlineVideo} src={src} />
+        <span aria-hidden="true" className={`guide-media-pause${paused ? " is-visible" : ""}`}>
+          <Icon name="pause" />
+        </span>
         <button
           aria-label={copy.expandGuideVideo}
           className="guide-media-expand"
@@ -2001,8 +2153,8 @@ function TutorialVideo({ copy, label, src }: { copy: Copy; label: string; src: s
           role="dialog"
         >
           <video
-            aria-label={label}
-            autoPlay
+            {...playbackControl}
+            autoPlay={!paused}
             loop
             muted
             onLoadedMetadata={(event) => {
@@ -2012,6 +2164,9 @@ function TutorialVideo({ copy, label, src }: { copy: Copy; label: string; src: s
             ref={expandedVideo}
             src={src}
           />
+          <span aria-hidden="true" className={`guide-media-pause${paused ? " is-visible" : ""}`}>
+            <Icon name="pause" />
+          </span>
           <button
             aria-label={copy.closeGuideVideo}
             autoFocus

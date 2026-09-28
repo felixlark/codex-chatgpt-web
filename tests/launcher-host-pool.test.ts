@@ -1,0 +1,169 @@
+import { afterEach, expect, test } from "bun:test";
+import {
+  availableLauncherHosts,
+  readAnyLauncherBrowserHostDescriptor,
+  clearLauncherHostAffinity,
+  launcherHostForConversation,
+  quarantineLauncherHost,
+  rememberLauncherHostAffinity,
+  selectLauncherHost, usableLauncherHostCount,
+  launcherDescriptorHasTurn, launcherSlot, launcherSlotAppName, launcherSlotDescriptor, markLauncherHostBusy,
+} from "../src/adapters/chatgpt-web/launcher-host-pool";
+
+afterEach(() => clearLauncherHostAffinity());
+
+const alive = new Set(["/hosts/alpha.json", "/hosts/beta.json", "/hosts/gamma.json"]);
+const read = (path: string) => {
+  if (!alive.has(path)) throw new Error(`descriptor is not live: ${path}`);
+  return {};
+};
+
+test("every launcher, primary included, is available only while its descriptor is live", () => {
+  expect(availableLauncherHosts("/hosts/alpha.json", ["/hosts/beta.json", "/hosts/dead.json", "/hosts/alpha.json"], read))
+    .toEqual(["/hosts/alpha.json", "/hosts/beta.json"]);
+  expect(availableLauncherHosts("/hosts/dead-primary.json", [], read)).toEqual(["/hosts/dead-primary.json"]);
+});
+
+test("a dead primary hands its turns to a live pool member", () => {
+  expect(availableLauncherHosts("/hosts/dead-primary.json", ["/hosts/beta.json", "/hosts/gamma.json"], read))
+    .toEqual(["/hosts/beta.json", "/hosts/gamma.json"]);
+  expect(selectLauncherHost({
+    primary: "/hosts/dead-primary.json",
+    pool: ["/hosts/beta.json", "/hosts/gamma.json"],
+    activeTurns: host => (host === "/hosts/beta.json" ? 2 : 0),
+    read,
+  })).toBe("/hosts/gamma.json");
+});
+
+test("a conversation pinned to a launcher that died falls back to a live one", () => {
+  rememberLauncherHostAffinity("conversation-dead", "/hosts/dead-primary.json");
+  expect(selectLauncherHost({
+    primary: "/hosts/dead-primary.json",
+    pool: ["/hosts/beta.json"],
+    activeTurns: () => 0,
+    conversationKey: "conversation-dead",
+    read,
+  })).toBe("/hosts/beta.json");
+});
+
+test("a new turn goes to the launcher with the fewest turns in flight, preferring the primary on ties", () => {
+  const load: Record<string, number> = { "/hosts/alpha.json": 1, "/hosts/beta.json": 0, "/hosts/gamma.json": 0 };
+  const pick = () => selectLauncherHost({
+    primary: "/hosts/alpha.json",
+    pool: ["/hosts/beta.json", "/hosts/gamma.json"],
+    activeTurns: host => load[host] ?? 0,
+    read,
+  });
+  expect(pick()).toBe("/hosts/beta.json");
+  load["/hosts/alpha.json"] = 0;
+  expect(pick()).toBe("/hosts/alpha.json");
+});
+
+test("a retained conversation stays on its launcher while that launcher is live", () => {
+  rememberLauncherHostAffinity("conversation-1", "/hosts/gamma.json");
+  expect(launcherHostForConversation("conversation-1")).toBe("/hosts/gamma.json");
+  const select = () => selectLauncherHost({
+    primary: "/hosts/alpha.json",
+    pool: ["/hosts/beta.json", "/hosts/gamma.json"],
+    activeTurns: host => (host === "/hosts/gamma.json" ? 3 : 0),
+    conversationKey: "conversation-1",
+    read,
+  });
+  expect(select()).toBe("/hosts/gamma.json");
+  alive.delete("/hosts/gamma.json");
+  try {
+    expect(select()).toBe("/hosts/alpha.json");
+  } finally {
+    alive.add("/hosts/gamma.json");
+  }
+});
+
+test("the browser helper starts from any live launcher, not only the primary", () => {
+  const descriptors = (path: string) => {
+    if (!alive.has(path)) throw new Error(`descriptor is not live: ${path}`);
+    return { host: path };
+  };
+  expect(readAnyLauncherBrowserHostDescriptor("/hosts/alpha.json", ["/hosts/beta.json"], descriptors))
+    .toEqual({ host: "/hosts/alpha.json" });
+  expect(readAnyLauncherBrowserHostDescriptor("/hosts/dead-primary.json", ["/hosts/beta.json"], descriptors))
+    .toEqual({ host: "/hosts/beta.json" });
+  expect(() => readAnyLauncherBrowserHostDescriptor("/hosts/dead-primary.json", ["/hosts/dead.json"], descriptors))
+    .toThrow("descriptor is not live: /hosts/dead-primary.json");
+});
+
+test("a quarantined host is skipped, even by a conversation that stuck to it, until every host is", () => {
+  clearLauncherHostAffinity();
+  const read = () => ({});
+  const idle = () => 0;
+  rememberLauncherHostAffinity("conv", "/gamma");
+  quarantineLauncherHost("/gamma");
+  expect(selectLauncherHost({ primary: "/alpha", pool: ["/beta", "/gamma"], activeTurns: idle, conversationKey: "conv", read }))
+    .toBe("/alpha");
+  quarantineLauncherHost("/alpha");
+  expect(selectLauncherHost({ primary: "/alpha", pool: ["/beta", "/gamma"], activeTurns: idle, read })).toBe("/beta");
+  quarantineLauncherHost("/beta");
+  // Nothing healthy is left: fall back to every live host instead of failing.
+  expect(selectLauncherHost({ primary: "/alpha", pool: ["/beta", "/gamma"], activeTurns: idle, conversationKey: "conv", read }))
+    .toBe("/gamma");
+  clearLauncherHostAffinity();
+});
+
+test("with every host quarantined the oldest quarantine is tried first, not the idlest host", () => {
+  clearLauncherHostAffinity();
+  const read = () => ({});
+  // A signed-out host fails in a second, so it is always the idlest: choosing by load sent every
+  // turn back to the broken hosts while the working one carried a turn (Mars, 2026-09-23 09:21).
+  const busy = (host: string) => (host === "/beta" ? 1 : 0);
+  quarantineLauncherHost("/beta", Date.now() - 9 * 60_000);
+  quarantineLauncherHost("/alpha", Date.now() - 60_000);
+  quarantineLauncherHost("/gamma", Date.now());
+  expect(selectLauncherHost({ primary: "/alpha", pool: ["/beta", "/gamma"], activeTurns: busy, read })).toBe("/beta");
+  clearLauncherHostAffinity();
+});
+
+test("only live, unquarantined launchers count toward how many turns may run at once", () => {
+  clearLauncherHostAffinity();
+  const read = () => ({});
+  expect(usableLauncherHostCount("/alpha", ["/beta", "/gamma"], read)).toBe(3);
+  quarantineLauncherHost("/alpha");
+  quarantineLauncherHost("/gamma");
+  expect(usableLauncherHostCount("/alpha", ["/beta", "/gamma"], read)).toBe(1);
+  quarantineLauncherHost("/beta");
+  expect(usableLauncherHostCount("/alpha", ["/beta", "/gamma"], read)).toBe(1);   // never zero
+  clearLauncherHostAffinity();
+});
+
+test("slots of one browser share its descriptor but are placed, counted and quarantined apart", () => {
+  const [a, b, c] = ["Codex Mars Alpha", "Codex Mars Beta", "Codex Mars Gamma"].map(name => launcherSlot("/hosts/alpha.json", name));
+  expect(launcherSlotDescriptor(b!)).toBe("/hosts/alpha.json");
+  expect(launcherSlotAppName(b!)).toBe("Codex Mars Beta");
+  expect(launcherSlotAppName("/hosts/alpha.json")).toBeUndefined();
+  // Every slot is live while its browser is, and each takes a turn of its own.
+  expect(availableLauncherHosts(a!, [b!, c!], read)).toEqual([a, b, c]);
+  expect(usableLauncherHostCount(a!, [b!, c!], read)).toBe(3);
+  const busy = new Map([[a!, 1], [b!, 1]]);
+  expect(selectLauncherHost({ primary: a!, pool: [b!, c!], activeTurns: slot => busy.get(slot) ?? 0, read })).toBe(c);
+  // A connector-specific failure leaves the other connectors of the same browser in use.
+  quarantineLauncherHost(c!);
+  expect(usableLauncherHostCount(a!, [b!, c!], read)).toBe(2);
+  // A dead browser takes all of its slots with it.
+  expect(availableLauncherHosts(launcherSlot("/hosts/dead.json", "X"), [launcherSlot("/hosts/dead.json", "Y"), b!], read)).toEqual([b]);
+});
+
+test("a browser counts as busy while any of its slots has a turn", () => {
+  const release = markLauncherHostBusy(launcherSlot("/hosts/alpha.json", "Codex Mars Beta"));
+  expect(launcherDescriptorHasTurn("/hosts/alpha.json")).toBe(true);
+  expect(launcherDescriptorHasTurn("/hosts/beta.json")).toBe(false);
+  release();
+  expect(launcherDescriptorHasTurn("/hosts/alpha.json")).toBe(false);
+  // The keep-alive holds the browser itself by its descriptor.
+  const hold = markLauncherHostBusy("/hosts/alpha.json");
+  expect(launcherDescriptorHasTurn("/hosts/alpha.json")).toBe(true);
+  hold();
+});
+
+test("the browser helper starts from a slot's browser", () => {
+  const seen: string[] = [];
+  readAnyLauncherBrowserHostDescriptor(launcherSlot("/hosts/alpha.json", "Codex Mars Alpha"), [], path => { seen.push(path); return read(path); });
+  expect(seen.every(path => path === "/hosts/alpha.json")).toBe(true);
+});

@@ -207,12 +207,50 @@ export async function inspectLauncherBrowserHostLiveness(
   return descriptor;
 }
 
+/** Per-page bound for reading native target ownership during page selection. */
+export const LAUNCHER_PAGE_INSPECTION_TIMEOUT_MS = 2_000;
+
+async function inspectLauncherCandidateTarget(
+  context: BrowserContext,
+  page: Page,
+  timeoutMs: number,
+): Promise<string | undefined> {
+  let expired = false;
+  const inspection = (async () => {
+    const session = await context.newCDPSession(page).catch(() => undefined);
+    if (!session) return undefined;
+    try {
+      if (expired) return undefined;
+      const { targetInfo } = await session.send("Target.getTargetInfo");
+      return targetInfo.targetId as string;
+    } catch {
+      return undefined;
+    } finally {
+      // A late session from an expired inspection is released as soon as it arrives.
+      await session.detach().catch(() => {});
+    }
+  })();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expiry = new Promise<undefined>(resolveExpiry => {
+    timer = setTimeout(() => {
+      expired = true;
+      resolveExpiry(undefined);
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([inspection, expiry]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export async function selectLauncherPage(
   browser: Browser,
   descriptor: LauncherBrowserHostDescriptor,
   timeoutMs: number,
   surfaceId = descriptor.surfaceId,
   abortSignal?: AbortSignal,
+  inspectionTimeoutMs = LAUNCHER_PAGE_INSPECTION_TIMEOUT_MS,
 ): Promise<{ context: BrowserContext; page: Page }> {
   if (abortSignal?.aborted) {
     throw new DOMException("Launcher browser connection aborted", "AbortError");
@@ -227,18 +265,13 @@ export async function selectLauncherPage(
     const candidates = browser.contexts().flatMap(context => context.pages().map(page => ({ context, page })));
     // Target metadata belongs to the browser process. Evaluating every page here makes an
     // unrelated busy/paused renderer block acquisition of an already-responsive owned page.
-    const inspected = await Promise.all(candidates.map(async candidate => {
-      const session = await candidate.context.newCDPSession(candidate.page).catch(() => undefined);
-      if (!session) return { ...candidate, targetId: undefined };
-      try {
-        const { targetInfo } = await session.send("Target.getTargetInfo");
-        return { ...candidate, targetId: targetInfo.targetId };
-      } catch {
-        return { ...candidate, targetId: undefined };
-      } finally {
-        await session.detach().catch(() => {});
-      }
-    }));
+    // Attaching a session can still wait on a renderer that is busy with another turn, so each
+    // candidate gets its own bound: a page that cannot answer in time is simply not the owned one
+    // on this pass, and the loop retries until the overall deadline.
+    const inspected = await Promise.all(candidates.map(async candidate => ({
+      ...candidate,
+      targetId: await inspectLauncherCandidateTarget(candidate.context, candidate.page, inspectionTimeoutMs),
+    })));
     const owned = inspected.filter(candidate => candidate.targetId === targetId);
     if (owned.length === 1) {
       return { context: owned[0].context, page: owned[0].page };
@@ -251,6 +284,37 @@ export async function selectLauncherPage(
   throw new Error("Launcher browser host did not expose its owned browser surface");
 }
 
+/**
+ * Diagnostic only: per-renderer CPU share over ~1 s, read from the browser process so that a busy
+ * or paused renderer cannot block the measurement itself.
+ */
+export async function sampleLauncherRendererCpu(browser: Pick<Browser, "newBrowserCDPSession"> | undefined): Promise<string> {
+  if (!browser) return "no-connection";
+  const within = <T>(promise: Promise<T>, ms: number) => Promise.race([
+    promise,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms)),
+  ]);
+  try {
+    const session = await within(browser.newBrowserCDPSession(), 2_000);
+    try {
+      type ProcessInfo = { processInfo: Array<{ type: string; id: number; cpuTime: number }> };
+      const read = async () => (await within(session.send("SystemInfo.getProcessInfo") as Promise<ProcessInfo>, 2_000))
+        .processInfo.filter(item => item.type === "renderer");
+      const before = await read();
+      await new Promise(resolve => setTimeout(resolve, 1_000));
+      const after = await read();
+      return after.map(item => {
+        const previous = before.find(candidate => candidate.id === item.id);
+        return `${item.id}:${previous ? Math.round((item.cpuTime - previous.cpuTime) * 100) : "new"}%`;
+      }).join(",") || "no-renderers";
+    } finally {
+      await session.detach().catch(() => {});
+    }
+  } catch (error) {
+    return `unavailable(${error instanceof Error ? error.message : String(error)})`;
+  }
+}
+
 export async function connectLauncherBrowserHost(
   descriptorPath: string,
   timeoutMs = 20_000,
@@ -261,13 +325,18 @@ export async function connectLauncherBrowserHost(
     throw new DOMException("Launcher browser connection aborted", "AbortError");
   }
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
+  const startedAt = performance.now();
   await assertCdpReady(descriptor, Math.min(timeoutMs, 5_000));
+  const readyAt = performance.now();
   let browser: Browser;
   try {
     browser = await chromium.connectOverCDP(descriptor.endpoint, { timeout: timeoutMs });
   } catch (error) {
+    console.info(`[chatgpt-web] launcher connect timing surface=${surfaceId ?? "-"} readyMs=${Math.round(readyAt - startedAt)}`
+      + ` cdpMs=${Math.round(performance.now() - readyAt)} result=cdp-failed`);
     throw new Error(`Could not connect Playwright to the launcher browser: ${error instanceof Error ? error.message : String(error)}`);
   }
+  const connectedAt = performance.now();
   const closeOnAbort = () => { void browser.close().catch(() => {}); };
   abortSignal?.addEventListener("abort", closeOnAbort, { once: true });
   try {
@@ -281,6 +350,9 @@ export async function connectLauncherBrowserHost(
       surfaceId,
       abortSignal,
     );
+    console.info(`[chatgpt-web] launcher connect timing surface=${surfaceId ?? "-"} readyMs=${Math.round(readyAt - startedAt)}`
+      + ` cdpMs=${Math.round(connectedAt - readyAt)} selectMs=${Math.round(performance.now() - connectedAt)}`
+      + ` pages=${browser.contexts().reduce((count, item) => count + item.pages().length, 0)} result=ok`);
     return { descriptor, browser, context, page };
   } catch (error) {
     await browser.close().catch(() => {});
@@ -358,6 +430,18 @@ export const LAUNCHER_CAPABILITY_INSPECTION_TIMEOUT_MS = 120_000;
 
 export type LauncherTurnActivity =
   | {
+      phase: "usage";
+      traceId: string;
+      helperPid: number;
+      receipt?: {
+        id: string;
+        accountKey: string;
+        model: "gpt-6-pro" | "gpt-5.6-pro" | "pro-unknown" | "other";
+        at: number;
+      };
+      trackingError?: "account-unavailable";
+    }
+  | {
       phase: "start";
       traceId: string;
       helperPid: number;
@@ -382,7 +466,8 @@ export type LauncherTurnActivity =
       connectorBound?: boolean;
     };
 
-export const LAUNCHER_TURN_START_TIMEOUT_MS = 5_000;
+// Startup must outlast the launcher's ten-second idle bootstrap. This is not a model-turn budget.
+export const LAUNCHER_TURN_START_TIMEOUT_MS = 30_000;
 export const LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS = 10_000;
 export const LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS = 5_000;
 export const LAUNCHER_TURN_END_TIMEOUT_MS = 15_000;
@@ -617,11 +702,14 @@ export async function notifyLauncherTurn(
     : activity.phase === "heartbeat"
       ? LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS
       : LAUNCHER_TURN_START_TIMEOUT_MS,
+  signal?: AbortSignal,
 ): Promise<{
   surfaceId?: string;
   reused?: boolean;
   connectorBound?: boolean;
   cancelledByUser?: boolean;
+  authenticationRequired?: boolean;
+  trackUsage?: boolean;
 }> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
   const controller = new AbortController();
@@ -634,7 +722,7 @@ export async function notifyLauncherTurn(
         "content-type": "application/json",
       },
       body: JSON.stringify(activity),
-      signal: controller.signal,
+      signal: signal ? AbortSignal.any([controller.signal, signal]) : controller.signal,
     });
     if (!response.ok) {
       const body = await response.json().catch(() => ({})) as Record<string, unknown>;
@@ -666,16 +754,25 @@ export async function notifyLauncherTurn(
         surfaceId: body.surfaceId,
         reused: body.reused,
         connectorBound: body.connectorBound,
+        trackUsage: body.trackUsage === true,
       };
     }
     if (activity.phase === "end") {
       if (typeof body.cancelledByUser !== "boolean") {
         throw new Error("Launcher browser control channel returned an invalid turn release result");
       }
-      return { cancelledByUser: body.cancelledByUser };
+      if (body.authenticationRequired !== undefined && typeof body.authenticationRequired !== "boolean") {
+        throw new Error("Launcher browser control channel returned an invalid authentication state");
+      }
+      return {
+        cancelledByUser: body.cancelledByUser,
+        ...(body.authenticationRequired === true ? { authenticationRequired: true } : {}),
+      };
     }
     return {};
   } catch (error) {
+    if (signal?.aborted) throw new DOMException("Launcher browser acquisition cancelled", "AbortError");
+    if (controller.signal.aborted) throw new Error(`Launcher browser control ${activity.phase} timed out after ${timeoutMs}ms`);
     if (error instanceof LauncherBrowserTurnCancelledError
       || error instanceof LauncherRetainedConversationUnavailableError) throw error;
     throw new Error(`Launcher browser control channel failed: ${error instanceof Error ? error.message : String(error)}`);

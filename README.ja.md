@@ -3,13 +3,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v5.0.8/codex-web-gpt-5.0.8-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v5.0.8/codex-web-gpt-5.0.8-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v5.0.8/codex-web-gpt-5.0.8-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.2/codex-web-gpt-6.1.2-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.2/codex-web-gpt-6.1.2-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.2/codex-web-gpt-6.1.2-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v5.0.8/codex-web-gpt-5.0.8-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">すべてのリリース</a>
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.2/codex-web-gpt-6.1.2-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">すべてのリリース</a>
 </p>
 
 <p align="center">
@@ -28,6 +28,12 @@
 
 Full ハーネスモードでは、MCP を通じて ChatGPT を現在のタスクのファイル、ターミナル、ツール、承認に接続します。会話は Codex タスクに紐付いたままなので、コンテキストが増えても作業を続けられます。
 
+<a id="what-this-fork-changes"></a>
+
+## この fork の変更点
+
+1 つのブリッジが複数のランチャーブラウザーとコネクターをプールし、会話の所有権、ホスト障害時の切り替え、リモート Codex 環境を維持します。一般利用向けのアプリ、インストーラー、サポートは引き続きアップストリームが提供します。
+
 <div id="get-started"><a id="quick-start"></a></div>
 
 ## 使い始める
@@ -36,7 +42,7 @@ Full ハーネスモードでは、MCP を通じて ChatGPT を現在のタス�
 
 1. **ランチャーをインストール**：上のボタンから、お使いの OS 向けのアプリをダウンロードします。
 2. **ChatGPT にサインイン**：内蔵ブラウザーでログインし、ブラウザーのスモークテストを実行します。
-3. **モデルをインストール**：Codex を一度再起動し、**ChatGPT Web — …** モデルを選択します。
+3. **モデルをインストール**：Codex を一度再起動します。自動モードでは、名前の末尾が **(Web)** のモデルを選択します。Pro はバージョン別の項目、Sol の推論レベルは Effort で選択します。Zero Risk は専用の項目を引き続き使用します。
 4. **ツールを使って開発する場合**：ランチャーの **MCP** を開き、下記の Full ハーネス設定を完了します。
 
 ブラウザーとランタイムはアプリに含まれています。Chrome、Node、Bun の別途インストールは不要です。
@@ -73,7 +79,7 @@ irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install
 | **Full harness (With Automation)** | 自動 | MCP 経由で利用可能 |
 | **Zero Risk** | 手動で貼り付けて送信 | 専用 MCP コネクタ経由で利用可能 |
 
-Zero Risk は ChatGPT ページを読み取ったり操作したりしません。モデルと `Codex Zero Risk` コネクタを自分で選び、用意されたプロンプトを貼り付けて送信し、ランチャーで **Sent** を確認してください。自動モードの各モデル項目は固定の ChatGPT モードに対応し、Codex の Effort や Speed では上書きされません。
+Zero Risk は ChatGPT ページを読み取ったり操作したりしません。モデルと `Codex Zero Risk` コネクタを自分で選び、用意されたプロンプトを貼り付けて送信し、ランチャーで **Sent** を確認してください。名前の末尾が **(Web)** の自動モデルでは、対応する Effort を Codex で選択できます。コンテキスト上限を維持するため、Instant と各 Pro バージョンは別の項目になります。既存のタスクに保存された旧モデル項目は、従来の固定モードを維持します。
 
 <a id="full-harness"></a>
 
@@ -201,3 +207,13 @@ bun run app:package
 [トラブルシューティング](TROUBLESHOOTING.md) · [セキュリティ](SECURITY.md) · [コントリビューション](CONTRIBUTING.md) · [MIT ライセンス](LICENSE) · [CI](https://github.com/miuuyy/codex-chatgpt-web/actions/workflows/ci.yml)
 
 もう一つの自作アプリ：<img src="assets/readme/persona-voice.svg" width="20" height="20" alt=""> [ChatGPT Persona Voice](https://github.com/miuuyy/ChatGPT-Persona-Voice) — ChatGPT と Codex に、ローカルでほぼリアルタイムのカスタム音声を。
+> ### これは fork です
+>
+> アップストリーム：**[miuuyy/codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web)** — オリジナル、各プラットフォームのインストーラー、サポートはアップストリームを利用してください。
+>
+> この fork は、アップストリームが明示的にサポートしていない構成、つまり **Codex とは別のマシンでブリッジを動かし、複数のランチャーブラウザーを同時に扱う構成** のために存在します。
+>
+> - **相違点：**[この fork の変更点](#what-this-fork-changes)
+> - **リリース：** タグは `mars-vX.Y.Z`（アップストリームは `vX.Y.Z`）。最新は、アップストリーム v5.0.8 ベースの **[mars-v1.0.0](https://github.com/longbiaochen/codex-chatgpt-web/releases/tag/mars-v1.0.0)** です。
+> - **ここではインストーラーを配布しません。** リリースには 2 つのランタイムバンドル（`cli.js`、`browser-helper.cjs`）のみが含まれます。アップストリームのアプリをインストールしてから、この 2 ファイルを差し替えてください。
+> - この配置に固有でない変更はアップストリームへ提案し、それ以外は `mars-6.1` ブランチに残します。

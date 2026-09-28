@@ -1,0 +1,491 @@
+import { existsSync, readFileSync } from "node:fs";
+import { atomicWriteFile } from "../../config";
+
+/**
+ * Account-level admission for ChatGPT Web turns.
+ *
+ * Every browser host in the launcher pool drives the same ChatGPT account, and ChatGPT throttles
+ * that account on how many prompts it receives, whichever host or Codex task sent them. On Mars
+ * two goals resumed together sent 109 requests in 18 minutes and both failed with
+ * "too many requests"; one goal alone hit it at 33 requests in 10 minutes. Codex tasks, the
+ * desktop app's own goal continuation and anything else a user starts all arrive here, so this is
+ * the one place that can pace them.
+ *
+ * A turn waits in a fair queue until the account has budget and a host is free. The adapter keeps
+ * heartbeating while it waits, so Codex sees a slow turn, never an error. A throttle observed by the
+ * browser starts a cooldown and tightens the budget; retries of the throttled turn then wait out
+ * the cooldown here instead of spending Codex's retry budget against a closed door.
+ *
+ * After a throttle the gate cools down briefly and then reopens by slow start: turns go one at a
+ * time, each admitted only once ChatGPT has accepted the previous one's prompt, and the gate opens
+ * fully after PROBES_TO_REOPEN acceptances in a row. ChatGPT's own message is "try again in a few
+ * minutes", but on Mars (2026-09-22) the first prompt after a cooldown got through while the two
+ * sent right behind it were refused, so one acceptance is not enough. Any throttle during the
+ * probes doubles the cooldown (cap 60 minutes) and restarts the count. Acceptance, not completion,
+ * is the evidence: a probe turn can then run for minutes of tool calls without holding the queue.
+ * Only turns admitted after the latest throttle count; one already running when it hit never does.
+ */
+
+export interface AdmissionBudget {
+  /** Maximum turns admitted in any 10-minute window. */
+  req10: number;
+  /** Maximum turns admitted in any 30-minute window. */
+  req30: number;
+  /**
+   * Maximum turns admitted in any 60-minute window. On Mars (2026-09-22) the long throttles came
+   * after about 20 accepted prompts within an hour, which the 10/30-minute windows still allowed.
+   */
+  req60: number;
+}
+
+export const ADMISSION_SEED: AdmissionBudget = { req10: 14, req30: 30, req60: 20 };
+export const ADMISSION_FLOOR: AdmissionBudget = { req10: 6, req30: 15, req60: 10 };
+export const ADMISSION_CEILING: AdmissionBudget = { req10: 24, req30: 60, req60: 40 };
+const TEN_MINUTES = 10 * 60_000;
+const THIRTY_MINUTES = 30 * 60_000;
+const SIXTY_MINUTES = 60 * 60_000;
+const WINDOWS: Array<[keyof AdmissionBudget, number]> = [
+  ["req10", TEN_MINUTES], ["req30", THIRTY_MINUTES], ["req60", SIXTY_MINUTES],
+];
+export /** A browser turn that has not finished in this long is not going to; its slot goes back. */
+const STALE_SLOT_MS = 20 * 60_000;
+export const COOLDOWN_MS = 3 * 60_000;
+export const PROBES_TO_REOPEN = 3;
+const COOLDOWN_CAP_MS = 60 * 60_000;
+const LOOSEN_AFTER_MS = 30 * 60_000;
+const RECENT_MS = 24 * 60 * 60_000;
+const RECENT_CAP = 500;
+
+/** One admitted browser turn, kept for a day so a status page can show who used the account. */
+export interface AdmissionTurnRecord {
+  traceId: string;
+  key: string;
+  threadId?: string;
+  model?: string;
+  host?: string;
+  queuedAt: number;
+  startedAt: number;
+  endedAt?: number;
+  error?: string;
+}
+
+export interface AdmissionTurnInfo {
+  threadId?: string;
+  model?: string;
+}
+
+interface AdmissionState {
+  version: 1;
+  budget: AdmissionBudget;
+  cooldownUntil: number;
+  cooldownMs: number;
+  /** Accepted prompts still needed, one at a time, before the gate opens fully; 0 = open. */
+  probesNeeded: number;
+  lastThrottleAt: number;
+  lastAdjustAt: number;
+  admitted: number[];
+  recent: AdmissionTurnRecord[];
+}
+
+interface Waiter {
+  key: string;
+  traceId: string;
+  enqueuedAt: number;
+  info?: AdmissionTurnInfo;
+  admit: (release: (error?: string, refund?: boolean) => void) => void;
+  reject: (error: unknown) => void;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+}
+
+export interface AdmissionOptions {
+  statePath?: string;
+  /** A function is re-read on every decision, so the gate follows hosts that come and go. */
+  maxConcurrent: number | (() => number);
+  now?: () => number;
+  log?: (message: string) => void;
+  setTimer?: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+}
+
+export class ChatGptAdmission {
+  private state: AdmissionState;
+  /**
+   * Turns holding a slot right now. A slot that is never released blocks the whole gate: on Mars
+   * the queue sat still for thirteen hours behind one such slot while nothing ran. Keep enough per
+   * slot to reclaim it, and count the set rather than a number that can drift.
+   */
+  private readonly runningTurns = new Map<string, { admittedAt: number; record: AdmissionTurnRecord }>();
+  /** The current probe, admitted but not yet accepted by ChatGPT; nothing else is admitted meanwhile. */
+  private probeTraceId?: string;
+  /** Waiters per task, served round-robin so one busy task cannot starve the others. */
+  private readonly queues = new Map<string, Waiter[]>();
+  private readonly order: string[] = [];
+  private timer?: ReturnType<typeof setTimeout>;
+  private readonly now: () => number;
+  private readonly log: (message: string) => void;
+  private readonly setTimer: NonNullable<AdmissionOptions["setTimer"]>;
+  private readonly clearTimer: NonNullable<AdmissionOptions["clearTimer"]>;
+
+  private get maxConcurrent(): number {
+    const value = this.options.maxConcurrent;
+    return typeof value === "function" ? Math.max(1, value()) : value;
+  }
+
+  constructor(private readonly options: AdmissionOptions) {
+    this.now = options.now ?? Date.now;
+    this.log = options.log ?? (message => console.info(message));
+    // Unref'd: the listener keeps a live bridge running, and a queued turn's wake-up must not keep a
+    // stopping one alive (on Mars a restart with three turns queued waited out the 90s stop timeout).
+    this.setTimer = options.setTimer ?? ((callback, ms) => {
+      const timer = setTimeout(callback, ms);
+      timer.unref?.();
+      return timer;
+    });
+    this.clearTimer = options.clearTimer ?? (timer => clearTimeout(timer));
+    this.state = this.read();
+  }
+
+  /**
+   * Resolve with a release function once the turn may run; reject if its signal aborts first.
+   * Pass the turn's error message to release when it failed, so the status record shows it, and
+   * refund=true when nothing reached ChatGPT so the slot does not count against the budget.
+   */
+  acquire(
+    key: string,
+    traceId: string,
+    signal?: AbortSignal,
+    info?: AdmissionTurnInfo,
+  ): Promise<(error?: string, refund?: boolean) => void> {
+    if (signal?.aborted) return Promise.reject(new DOMException("ChatGPT web turn aborted", "AbortError"));
+    return new Promise((resolve, reject) => {
+      const waiter: Waiter = { key, traceId, enqueuedAt: this.now(), info, admit: resolve, reject, signal };
+      if (signal) {
+        waiter.onAbort = () => {
+          this.remove(waiter);
+          reject(new DOMException("ChatGPT web turn aborted", "AbortError"));
+        };
+        signal.addEventListener("abort", waiter.onAbort, { once: true });
+      }
+      if (!this.queues.has(key)) {
+        this.queues.set(key, []);
+        this.order.push(key);
+      }
+      this.queues.get(key)!.push(waiter);
+      this.write();
+      this.pump();
+    });
+  }
+
+  /** ChatGPT accepted a turn's prompt: during slow start that is the probe's evidence. */
+  noteAccepted(traceId: string): void {
+    if (traceId !== this.probeTraceId) return;
+    this.probeTraceId = undefined;
+    this.state.probesNeeded = Math.max(0, this.state.probesNeeded - 1);
+    if (this.state.probesNeeded === 0) {
+      this.state.cooldownMs = COOLDOWN_MS;
+      this.log(`[chatgpt-web] admission probe ${traceId} accepted: gate open`);
+    } else {
+      this.log(`[chatgpt-web] admission probe ${traceId} accepted: ${this.state.probesNeeded} more before the gate opens`);
+    }
+    this.write();
+    this.pump();
+  }
+
+  /** Record which pool host an admitted turn landed on. */
+  noteHost(traceId: string, host: string): void {
+    const record = this.findRecord(traceId);
+    if (!record) return;
+    record.host = host;
+    this.write();
+  }
+
+  /** The browser saw ChatGPT refuse a prompt for rate: cool down and tighten. */
+  noteThrottle(): void {
+    const now = this.now();
+    if (now < this.state.cooldownUntil) {
+      // Turns sent together are refused together: one episode, not one per turn. Only a throttle
+      // after the cooldown (i.e. during the probes) says the account is still closed.
+      this.log("[chatgpt-web] admission throttled again during the cooldown: same episode");
+      return;
+    }
+    // A throttle before the gate opened fully (cooldown or probes) means the account is still closed.
+    const repeat = this.state.probesNeeded > 0;
+    this.state.cooldownMs = repeat ? Math.min(COOLDOWN_CAP_MS, this.state.cooldownMs * 2) : COOLDOWN_MS;
+    this.state.probesNeeded = PROBES_TO_REOPEN;
+    this.probeTraceId = undefined;   // whatever was probing is now stale
+    this.state.cooldownUntil = now + this.state.cooldownMs;
+    this.state.lastThrottleAt = now;
+    this.state.lastAdjustAt = now;
+    this.state.budget = scaleBudget(this.state.budget, 0.7);
+    this.write();
+    this.log(`[chatgpt-web] admission throttled: cooldown ${Math.round(this.state.cooldownMs / 60_000)}m, `
+      + `budget ${this.state.budget.req10}/10m ${this.state.budget.req30}/30m ${this.state.budget.req60}/60m`);
+    this.schedule();
+  }
+
+  snapshot(): {
+    budget: AdmissionBudget; running: number; queued: number; cooldownUntil: number;
+    recent10: number; recent30: number; recent60: number;
+  } {
+    const now = this.now();
+    this.prune(now);
+    return {
+      budget: { ...this.state.budget },
+      running: this.runningTurns.size,
+      queued: [...this.queues.values()].reduce((sum, queue) => sum + queue.length, 0),
+      cooldownUntil: this.state.cooldownUntil,
+      recent10: this.admittedWithin(now, TEN_MINUTES),
+      recent30: this.admittedWithin(now, THIRTY_MINUTES),
+      recent60: this.state.admitted.length,
+    };
+  }
+
+  private pump(): void {
+    const now = this.now();
+    this.reapStaleSlots(now);
+    this.prune(now);
+    this.loosen(now);
+    while (this.canAdmit(now)) {
+      const waiter = this.next();
+      if (!waiter) break;
+      if (this.state.probesNeeded > 0) this.probeTraceId = waiter.traceId;
+      this.state.admitted.push(now);
+      const admittedAt = now;
+      const record: AdmissionTurnRecord = {
+        traceId: waiter.traceId, key: waiter.key, queuedAt: waiter.enqueuedAt, startedAt: now,
+        ...(waiter.info?.threadId ? { threadId: waiter.info.threadId } : {}),
+        ...(waiter.info?.model ? { model: waiter.info.model } : {}),
+      };
+      this.runningTurns.set(waiter.traceId, { admittedAt: now, record });
+      this.state.recent.push(record);
+      this.write();
+      if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
+      const waited = now - waiter.enqueuedAt;
+      if (waited >= 1_000) {
+        this.log(`[chatgpt-web] admission turn ${waiter.traceId} admitted after ${Math.round(waited / 1_000)}s`);
+      }
+      let released = false;
+      waiter.admit((error, refund) => {
+        if (released) return;
+        released = true;
+        this.runningTurns.delete(waiter.traceId);
+        if (refund) {
+          // The turn failed before any prompt reached ChatGPT: it must not count against the budget.
+          const at = this.state.admitted.lastIndexOf(admittedAt);
+          if (at >= 0) this.state.admitted.splice(at, 1);
+        }
+        record.endedAt = this.now();
+        if (error) record.error = error.slice(0, 200);
+        if (this.probeTraceId === waiter.traceId) {
+          // Ended without an acceptance event. Success still proves the prompt got through; any
+          // other failure proves nothing, so the next waiter becomes the probe.
+          if (error) this.probeTraceId = undefined;
+          else this.noteAccepted(waiter.traceId);
+        }
+        this.write();
+        this.pump();
+      });
+    }
+    this.schedule();
+  }
+
+  /**
+   * A turn whose release never arrives (a hung browser turn, a client that vanished mid-flight)
+   * would otherwise hold its slot forever. Reclaiming it only allows one more turn to start; the
+   * budget windows still bound the rate, so the cost of being wrong here is small and the cost of
+   * not doing it is a gate that stops for hours.
+   */
+  private reapStaleSlots(now: number): void {
+    for (const [traceId, slot] of this.runningTurns) {
+      if (now - slot.admittedAt < STALE_SLOT_MS) continue;
+      this.runningTurns.delete(traceId);
+      slot.record.endedAt = now;
+      slot.record.error ??= `slot reclaimed after ${Math.round(STALE_SLOT_MS / 60_000)} minutes without a result`;
+      this.log(`[chatgpt-web] admission reclaimed the slot of turn ${traceId}: no result in `
+        + `${Math.round((now - slot.admittedAt) / 60_000)} minutes`);
+      this.write();
+    }
+  }
+
+  private findRecord(traceId: string): AdmissionTurnRecord | undefined {
+    for (let index = this.state.recent.length - 1; index >= 0; index -= 1) {
+      if (this.state.recent[index]!.traceId === traceId) return this.state.recent[index];
+    }
+    return undefined;
+  }
+
+  private canAdmit(now: number): boolean {
+    if (this.runningTurns.size >= this.maxConcurrent || now < this.state.cooldownUntil) return false;
+    if (this.state.probesNeeded > 0 && this.probeTraceId !== undefined) return false;
+    return WINDOWS.every(([key, span]) => this.admittedWithin(now, span) < this.state.budget[key]);
+  }
+
+  private admittedWithin(now: number, span: number): number {
+    return this.state.admitted.filter(at => at > now - span).length;
+  }
+
+  private next(): Waiter | undefined {
+    for (let tries = 0; tries < this.order.length; tries += 1) {
+      const key = this.order.shift()!;
+      const queue = this.queues.get(key);
+      if (!queue?.length) {
+        this.queues.delete(key);
+        continue;
+      }
+      const waiter = queue.shift()!;
+      if (queue.length) this.order.push(key);
+      else this.queues.delete(key);
+      return waiter;
+    }
+    return undefined;
+  }
+
+  private remove(waiter: Waiter): void {
+    const queue = this.queues.get(waiter.key);
+    if (!queue) return;
+    const index = queue.indexOf(waiter);
+    if (index >= 0) queue.splice(index, 1);
+    if (!queue.length) {
+      this.queues.delete(waiter.key);
+      const at = this.order.indexOf(waiter.key);
+      if (at >= 0) this.order.splice(at, 1);
+    }
+    this.write();
+  }
+
+  /** Wake exactly when budget or the cooldown next frees up, if anyone is waiting. */
+  private schedule(): void {
+    if (this.timer) this.clearTimer(this.timer);
+    this.timer = undefined;
+    if (!this.queues.size) return;
+    if (this.runningTurns.size >= this.maxConcurrent) {
+      // Every slot is taken. Normally a release pumps us again, but a turn that never returns would
+      // otherwise stop the gate for good, so wake when the oldest slot becomes reclaimable.
+      const oldest = Math.min(...[...this.runningTurns.values()].map(slot => slot.admittedAt));
+      const at = oldest + STALE_SLOT_MS;
+      this.timer = this.setTimer(() => this.pump(), Math.max(50, at - this.now() + 50));
+      return;
+    }
+    if (this.state.probesNeeded > 0 && this.probeTraceId !== undefined) return;   // acceptance or release pumps
+    const now = this.now();
+    const candidates: number[] = [];
+    if (now < this.state.cooldownUntil) candidates.push(this.state.cooldownUntil);
+    for (const [key, span] of WINDOWS) {
+      const inWindow = this.state.admitted.filter(at => at > now - span);
+      const limit = this.state.budget[key];
+      if (inWindow.length >= limit) candidates.push(inWindow[inWindow.length - limit]! + span);
+    }
+    if (!candidates.length) return;
+    const at = Math.max(...candidates);
+    this.timer = this.setTimer(() => this.pump(), Math.max(50, at - now + 50));
+  }
+
+  /** After 30 quiet minutes spent near the limit without a throttle, allow 10% more. */
+  private loosen(now: number): void {
+    if (now - this.state.lastAdjustAt < LOOSEN_AFTER_MS) return;
+    // Busy when any window ran at 60% of its own budget. Checking only the 30-minute window meant
+    // a budget pinned by the 60-minute window (10/h caps 30 minutes well below 60% of 15) could
+    // never loosen again after a throttle.
+    const busy = WINDOWS.some(([key, span]) => this.admittedWithin(now, span) >= 0.6 * this.state.budget[key]);
+    this.state.lastAdjustAt = now;
+    if (!busy) return;
+    this.state.budget = scaleBudget(this.state.budget, 1.1);
+    this.write();
+  }
+
+  private prune(now: number): void {
+    const cutoff = now - SIXTY_MINUTES;
+    while (this.state.admitted.length && this.state.admitted[0]! <= cutoff) this.state.admitted.shift();
+    const recentCutoff = now - RECENT_MS;
+    this.state.recent = this.state.recent
+      .filter(record => record.endedAt === undefined || record.endedAt > recentCutoff)
+      .slice(-RECENT_CAP);
+  }
+
+  private read(): AdmissionState {
+    const fresh: AdmissionState = {
+      version: 1, budget: { ...ADMISSION_SEED }, cooldownUntil: 0, cooldownMs: COOLDOWN_MS, probesNeeded: 0,
+      lastThrottleAt: 0, lastAdjustAt: this.now(), admitted: [], recent: [],
+    };
+    const path = this.options.statePath;
+    if (!path || !existsSync(path)) return fresh;
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<AdmissionState>;
+      if (parsed.version !== 1 || !parsed.budget) return fresh;
+      const clamp = (value: unknown, key: keyof AdmissionBudget) => typeof value === "number" && Number.isFinite(value)
+        ? Math.min(ADMISSION_CEILING[key], Math.max(ADMISSION_FLOOR[key], Math.floor(value))) : ADMISSION_SEED[key];
+      return {
+        version: 1,
+        budget: {
+          req10: clamp(parsed.budget.req10, "req10"),
+          req30: clamp(parsed.budget.req30, "req30"),
+          req60: clamp((parsed.budget as Partial<AdmissionBudget>).req60, "req60"),
+        },
+        cooldownUntil: typeof parsed.cooldownUntil === "number" ? parsed.cooldownUntil : 0,
+        cooldownMs: typeof parsed.cooldownMs === "number"
+          ? Math.min(COOLDOWN_CAP_MS, Math.max(COOLDOWN_MS, parsed.cooldownMs)) : COOLDOWN_MS,
+        probesNeeded: typeof parsed.probesNeeded === "number"
+          ? Math.min(PROBES_TO_REOPEN, Math.max(0, Math.floor(parsed.probesNeeded)))
+          : (parsed as { halfOpen?: unknown }).halfOpen === true ? PROBES_TO_REOPEN : 0,
+        lastThrottleAt: typeof parsed.lastThrottleAt === "number" ? parsed.lastThrottleAt : 0,
+        lastAdjustAt: typeof parsed.lastAdjustAt === "number" ? parsed.lastAdjustAt : this.now(),
+        admitted: Array.isArray(parsed.admitted)
+          ? parsed.admitted.filter((at): at is number => typeof at === "number").sort((a, b) => a - b) : [],
+        recent: this.readRecent(parsed.recent),
+      };
+    } catch {
+      // A damaged state file must not stop turns; start from the conservative seed.
+      return fresh;
+    }
+  }
+
+  /** Turns still open when the bridge stopped did not finish; close them as such. */
+  private readRecent(value: unknown): AdmissionTurnRecord[] {
+    if (!Array.isArray(value)) return [];
+    const now = this.now();
+    return value
+      .filter((record): record is AdmissionTurnRecord => Boolean(record) && typeof record === "object"
+        && typeof record.traceId === "string" && typeof record.key === "string"
+        && typeof record.queuedAt === "number" && typeof record.startedAt === "number")
+      .map(record => record.endedAt === undefined ? { ...record, endedAt: now, error: "bridge restarted" } : record)
+      .filter(record => record.endedAt! > now - RECENT_MS)
+      .slice(-RECENT_CAP);
+  }
+
+  /**
+   * Persist learning plus a live view for status pages. `live` is informational only: it is
+   * rebuilt from nothing after a restart and never read back.
+   */
+  private write(): void {
+    if (!this.options.statePath) return;
+    const live = {
+      running: this.runningTurns.size,
+      maxConcurrent: this.maxConcurrent,
+      queued: [...this.queues.values()].flat().map(waiter => ({
+        key: waiter.key, traceId: waiter.traceId, since: waiter.enqueuedAt,
+      })),
+      updatedAt: this.now(),
+    };
+    try {
+      atomicWriteFile(this.options.statePath, `${JSON.stringify({ ...this.state, live })}\n`);
+    } catch {
+      // Losing persistence only resets learning; it must never fail a turn.
+    }
+  }
+}
+
+/** Scale every window by the same factor, within its floor and ceiling. */
+function scaleBudget(budget: AdmissionBudget, factor: number): AdmissionBudget {
+  const round = factor < 1 ? Math.floor : Math.ceil;
+  const scaled = {} as AdmissionBudget;
+  for (const [key] of WINDOWS) {
+    scaled[key] = Math.min(ADMISSION_CEILING[key], Math.max(ADMISSION_FLOOR[key], round(budget[key] * factor)));
+  }
+  return scaled;
+}
+
+export function isChatGptRateLimitError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /too many requests|rate limit/i.test(message);
+}

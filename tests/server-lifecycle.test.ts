@@ -9,7 +9,7 @@ import { ChatGptTextFeed, ChatGptTraceFeed, chatGptTurnSessions } from "../src/a
 import { callTurnBroker, closeTurnBrokers, RemoteTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { defaultBrokerEndpoint, defaultConfig, providerConfig } from "../src/config";
 import { parseRequest } from "../src/responses/parser";
-import { compactRequest, HttpTurnCounter, responseRequest, routeChatGptWebRequest, startServer } from "../src/server";
+import { compactRequest, HttpTurnCounter, responseRequest, routeChatGptWebRequest, startServer, forgetNativeCatalogForTests } from "../src/server";
 
 test("DEV harness configuration cannot bind a Responses listener", () => {
   const config = { ...defaultConfig("browser-only"), purpose: "dev-harness" as const, port: 0 };
@@ -723,10 +723,12 @@ test(`targeted cancellation preserves peer turns and its cause: ${reason ?? "use
   let targetCancelled = 0;
   let otherCancelled = 0;
   const targetBrowser = new Promise<string>((_resolve, reject) => { rejectTarget = reject; });
+  let releaseHelper!: () => void;
+  const helperCleanup = new Promise<void>(resolve => { releaseHelper = resolve; });
   const target = chatGptTurnSessions.getOrCreate("target-key", () => ({
     mode: "read-only",
     browser: targetBrowser,
-    physicalSettlement: targetBrowser.then(() => undefined, () => undefined),
+    physicalSettlement: reason ? targetBrowser.then(() => undefined, () => undefined) : helperCleanup,
     trace: new ChatGptTraceFeed(),
     text: new ChatGptTextFeed(),
     cancel: reason => {
@@ -753,6 +755,7 @@ test(`targeted cancellation preserves peer turns and its cause: ${reason ?? "use
 
     const response = await fetch(`http://127.0.0.1:${server.port}/admin/cancel-turn`, {
       method: "POST",
+      signal: AbortSignal.timeout(1_000),
       headers: {
         "content-type": "application/json",
         authorization: `Bearer ${config.controlToken}`,
@@ -765,7 +768,8 @@ test(`targeted cancellation preserves peer turns and its cause: ${reason ?? "use
       trace_id: "trace_target",
       cancelled_browser_turns: 1,
       cancelled_broker_turns: 0,
-      active_browser_turns: 1,
+      // The receipt acknowledges cancellation before the browser's promise microtasks settle.
+      active_browser_turns: reason ? 1 : 2,
     });
     expect(targetCancelled).toBe(1);
     expect(otherCancelled).toBe(0);
@@ -774,6 +778,7 @@ test(`targeted cancellation preserves peer turns and its cause: ${reason ?? "use
       throw new Error("cancelled trace must remain terminal");
     }, "trace_target")).toBe(target);
   } finally {
+    releaseHelper();
     chatGptTurnSessions.clear();
     await server.stop(true);
   }
@@ -1307,6 +1312,8 @@ test("authenticated shutdown requires a verified idle drain", async () => {
 });
 
 test("model catalog health distinguishes no request, transport failure, upstream denial, and recovery without secrets", async () => {
+  // This checks the behaviour with nothing remembered; another test may have left a catalog.
+  forgetNativeCatalogForTests();
   let outcome: "transport" | "denied" | "invalid" | "ready" = "transport";
   const server = startServer({ ...defaultConfig("browser-only"), port: 0 }, {
     fetchUpstream: async () => {
