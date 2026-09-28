@@ -1000,7 +1000,6 @@ describe("ChatGPT outer-native harness v4", () => {
     });
     const abandoned = sessions.getOrCreate("abandoned", () => runtime("abandoned"), "abandoned-trace");
     const active = sessions.getOrCreate("active", () => runtime("active"), "active-trace");
-    sessions.getOrCreate("idle", () => runtime("idle"), "idle-trace");
     type Batch = Parameters<typeof abandoned.setOutstanding>[0];
     abandoned.setOutstanding([{ callId: "call_abandoned" }] as unknown as Batch);
     active.setOutstanding([{ callId: "call_active" }] as unknown as Batch);
@@ -1010,6 +1009,7 @@ describe("ChatGPT outer-native harness v4", () => {
 
     expect(sessions.reapDetachedToolTurns(now + 500)).toBe(0);
     expect(sessions.reapDetachedToolTurns(now + 1_500)).toBe(1);
+    sessions.getOrCreate("idle", () => runtime("idle"), "idle-trace");
     expect(cancelled).toEqual(["abandoned"]);
     expect(sessions.find("abandoned")).toBeUndefined();
     expect(sessions.find("active")?.traceId).toBe("active-trace");

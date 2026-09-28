@@ -2714,42 +2714,18 @@ test("a required retained conversation fails before creating a browser tab", asy
   assert.equal(created, false);
 });
 
-test("five browser tabs are a hard account-safety limit", async () => {
-  const turnTabs = new Map(Array.from({ length: 5 }, (_unused, index) => [
+test("two browser task tabs are a hard limit", async () => {
+  const turnTabs = new Map(Array.from({ length: 2 }, (_unused, index) => [
     `tab-${index + 1}`,
-    { ordinal: index + 1 },
+    { id: `tab-${index + 1}`, ordinal: index + 1, status: "ready", lastHeartbeatAt: index },
   ]));
+  let evicted = false;
 
   await assert.rejects(
-    BrowserHost.prototype.createTurnTab.call({ turnTabs }, "trace_six", 444),
-    /already has 5 browser tabs.*avoid excessive parallel traffic/,
+    BrowserHost.prototype.createTurnTab.call({ turnTabs, removeTurnTab() { evicted = true; } }, "trace_three", 444),
+    /already has 2 browser tabs.*avoid excessive parallel traffic/,
   );
-});
-
-test("a full browser host evicts only its oldest ready tab", () => {
-  const oldest = { id: "oldest", ordinal: 1, status: "ready", lastHeartbeatAt: 10 };
-  const newer = { id: "newer", ordinal: 2, status: "ready", lastHeartbeatAt: 20 };
-  const running = [3, 4, 5].map((ordinal) => ({
-    id: `running-${ordinal}`,
-    ordinal,
-    status: "running",
-    lastHeartbeatAt: 1,
-  }));
-  const removed = [];
-  const fixture = {
-    turnTabs: new Map([oldest, newer, ...running].map(tab => [tab.id, tab])),
-    removeTurnTab(tab, abortRunning) {
-      removed.push([tab.id, abortRunning]);
-      this.turnTabs.delete(tab.id);
-    },
-    window: {
-      contentView: { addChildView() {} },
-    },
-  };
-
-  assert.equal(BrowserHost.prototype.evictOldestRetainedTurnTab.call(fixture), true);
-  assert.deepEqual(removed, [["oldest", false]]);
-  assert.equal(fixture.turnTabs.has("running-3"), true);
+  assert.equal(evicted, false, "a new task must not evict a retained long-running conversation");
 });
 
 test("ending one browser turn does not stop another running tab", async () => {
@@ -3127,7 +3103,7 @@ test("manual completion is idempotent and cannot be downgraded after a lost ackn
   assert.equal(JSON.stringify(logs).includes("a".repeat(64)), false);
 });
 
-test("terminal Zero Risk tabs are reclaimed before retained conversations", () => {
+test("terminal Zero Risk tabs are reclaimed without evicting retained conversations", () => {
   const { fixture } = manualTurnFixture();
   fixture.turnTabs.set("manual-timeout", {
     id: "manual-timeout",
@@ -3144,7 +3120,7 @@ test("terminal Zero Risk tabs are reclaimed before retained conversations", () =
     lastHeartbeatAt: 0,
   });
 
-  assert.equal(fixture.evictOldestReclaimableTurnTab(), true);
+  assert.equal(fixture.evictTerminalManualTurnTab(), true);
   assert.equal(fixture.turnTabs.has("manual-timeout"), false);
   assert.equal(fixture.turnTabs.has("manual-retained"), true);
 });
