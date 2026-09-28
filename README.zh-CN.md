@@ -4,7 +4,7 @@
 >
 > 这个 fork 只为一种上游明确不支持的部署而存在：**桥跑在与 Codex 不同的机器上**，并且同时驱动多个启动器浏览器。这里的改动都是为这个形态做的，其中几个补丁正是因此被上游拒绝。
 >
-> - **差异说明：**[这个 fork 改了什么](#这个-fork-改了什么)
+> - **差异说明：**[这个 fork 改了什么](#what-this-fork-changes)
 > - **发布：** 标签形如 `mars-vX.Y.Z`（上游是 `vX.Y.Z`）。最新：**[mars-v1.0.0](https://github.com/longbiaochen/codex-chatgpt-web/releases/tag/mars-v1.0.0)**，基于上游 v5.0.8。
 > - **这里没有安装包。** 发布里只有两个运行时产物（`cli.js`、`browser-helper.cjs`）：先从上游装好应用，再把这两个文件换进去。
 > - 与该部署无关的通用修复会提给上游，其余留在 `mars-5.0.8` 分支。
@@ -14,13 +14,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.0/codex-web-gpt-6.1.0-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.0/codex-web-gpt-6.1.0-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.0/codex-web-gpt-6.1.0-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.2/codex-web-gpt-6.1.2-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.2/codex-web-gpt-6.1.2-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.2/codex-web-gpt-6.1.2-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.0/codex-web-gpt-6.1.0-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">所有版本</a>
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.2/codex-web-gpt-6.1.2-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">所有版本</a>
 </p>
 
 <p align="center">
@@ -40,6 +40,8 @@
 完整 harness 模式通过 MCP 将 ChatGPT 连接到当前任务的文件、终端、工具和审批流程。对话始终关联到你的 Codex 任务，上下文增长时也能继续工作。
 
 <div id="get-started"><a id="quick-start"></a></div>
+
+<a id="what-this-fork-changes"></a>
 
 ## 这个 fork 改了什么
 

@@ -8,6 +8,39 @@ import {
 } from "../src/chatgpt-web-models";
 import { modelsRequest } from "../src/server";
 
+test("catalog diagnostics preserve safe causes without attributing an upstream abort to the client", async () => {
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { forgetNativeCatalogForTests } = await import("../src/server");
+  const home = mkdtempSync(join(tmpdir(), "catalog-diagnostics-"));
+  const previous = process.env.CODEX_CHATGPT_WEB_HOME;
+  process.env.CODEX_CHATGPT_WEB_HOME = home;
+  try {
+    forgetNativeCatalogForTests();
+    for (const [error, code] of [
+      [new DOMException("internal cancellation", "AbortError"), "ABORT_ERR"],
+      [new DOMException("deadline", "TimeoutError"), "ETIMEDOUT"],
+      [new TypeError("private error message", { cause: { code: "ECONNRESET" } }), "ECONNRESET"],
+      [{ code: "ConnectionRefused" }, "ConnectionRefused"],
+      [{ code: "https://private.example/token", cause: { code: "/private/key" } }, undefined],
+    ] as const) {
+      const request = new Request("http://127.0.0.1/v1/models", { headers: { authorization: "Bearer fixture" } });
+      let failure: unknown;
+      const response = await modelsRequest(request, defaultConfig("browser-only"), async () => { throw error; },
+        undefined, result => { failure = result; });
+      expect(request.signal.aborted).toBeFalse();
+      expect(response.status).toBe(502);
+      expect(failure).toEqual({ stage: "transport", ...(code ? { code } : {}) });
+    }
+  } finally {
+    forgetNativeCatalogForTests();
+    if (previous === undefined) delete process.env.CODEX_CHATGPT_WEB_HOME;
+    else process.env.CODEX_CHATGPT_WEB_HOME = previous;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("proxies official /models auth and query, then appends grouped and legacy Web models", async () => {
   const request = new Request("http://127.0.0.1:17841/v1/models?client_version=1.2.3", {
     headers: { authorization: "Bearer codex-oauth-token", "if-none-match": "native-etag" },

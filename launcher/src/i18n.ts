@@ -3,6 +3,11 @@ import type { Language } from "./types";
 const en = {
   hostOnlySetupTitle: "Browser host",
   hostOnlySetupSubtitle: "This launcher only hosts the browser. Sign in to ChatGPT here; the bridge runs as a separate service.",
+  pluginName: "Plugin name",
+  pluginNameBody: "Codex stays fixed. Edit the rest of the name.",
+  pluginNameChange: "Change name",
+  pluginNameWarning: "Create a new plugin with the displayed name, then verify MCP again. This changes only the current mode. Tunnel credentials and your ChatGPT login are kept.",
+  pluginNameConfirm: "Change and configure",
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "Set up the isolated DEV profile",
@@ -214,6 +219,11 @@ const en = {
 const zh: Record<keyof typeof en, string> = {
   hostOnlySetupTitle: "浏览器宿主",
   hostOnlySetupSubtitle: "这个启动器只承载浏览器：在这里登录 ChatGPT，桥作为独立服务在别处运行。",
+  pluginName: "插件名称",
+  pluginNameBody: "Codex 保持不变，可以修改其后的名称。",
+  pluginNameChange: "更改名称",
+  pluginNameWarning: "请使用显示的名称创建新插件，然后重新验证 MCP。仅更改当前模式，隧道凭据和 ChatGPT 登录状态将保留。",
+  pluginNameConfirm: "更改并配置",
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "设置隔离的 DEV 配置",
@@ -425,6 +435,11 @@ const zh: Record<keyof typeof en, string> = {
 const ja: Record<keyof typeof en, string> = {
   hostOnlySetupTitle: "ブラウザーホスト",
   hostOnlySetupSubtitle: "このランチャーはブラウザーのみをホストします。ここで ChatGPT にサインインしてください。ブリッジは別のサービスとして動作します。",
+  pluginName: "プラグイン名",
+  pluginNameBody: "Codex は固定です。それ以降の名前を編集できます。",
+  pluginNameChange: "名前を変更",
+  pluginNameWarning: "表示された名前で新しいプラグインを作成し、MCP を再確認してください。現在のモードだけが変わります。トンネルの認証情報と ChatGPT のログインは保持されます。",
+  pluginNameConfirm: "変更して設定",
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "隔離された DEV プロファイルをセットアップ",
@@ -636,6 +651,11 @@ const ja: Record<keyof typeof en, string> = {
 const ko: Record<keyof typeof en, string> = {
   hostOnlySetupTitle: "브라우저 호스트",
   hostOnlySetupSubtitle: "이 런처는 브라우저만 호스팅합니다. 여기에서 ChatGPT에 로그인하세요. 브리지는 별도의 서비스로 실행됩니다.",
+  pluginName: "플러그인 이름",
+  pluginNameBody: "Codex는 고정입니다. 뒤에 오는 이름을 변경하세요.",
+  pluginNameChange: "이름 변경",
+  pluginNameWarning: "표시된 이름으로 새 플러그인을 만들고 MCP를 다시 확인하세요. 현재 모드에만 적용됩니다. 터널 인증 정보와 ChatGPT 로그인은 유지됩니다.",
+  pluginNameConfirm: "변경 및 설정",
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "격리된 DEV 프로필 설정",
@@ -847,6 +867,11 @@ const ko: Record<keyof typeof en, string> = {
 const zhTW: Record<keyof typeof en, string> = {
   hostOnlySetupTitle: "瀏覽器宿主",
   hostOnlySetupSubtitle: "這個啟動器只承載瀏覽器：在這裡登入 ChatGPT，橋接會以獨立服務在別處執行。",
+  pluginName: "外掛程式名稱",
+  pluginNameBody: "Codex 保持不變，可以修改後面的名稱。",
+  pluginNameChange: "變更名稱",
+  pluginNameWarning: "請使用顯示的名稱建立新的外掛程式，再重新驗證 MCP。僅變更目前模式，隧道憑證和 ChatGPT 登入狀態將保留。",
+  pluginNameConfirm: "變更並設定",
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "設定隔離的 DEV 設定檔",
@@ -1055,9 +1080,20 @@ const zhTW: Record<keyof typeof en, string> = {
   doctorMacTunnelRunning: "macOS 隧道服務已安裝、載入並執行",
 };
 
-export type Copy = typeof en;
+export type Copy = { [Key in keyof typeof en]: string };
 
-export function copyFor(language: Language): Copy {
+export function copyFor(language: Language, names?: { automatic: string; manual: string }): Copy {
+  const copy = baseCopyFor(language);
+  if (!names) return copy;
+  const localized = { ...copy };
+  for (const key of ["manualMcpStepThreeBody", "manualConnectorNotice", "manualPromptInstruction", "manualPromptWaiting"] as const) {
+    localized[key] = copy[key].replaceAll("Codex Zero Risk", () => names.manual);
+  }
+  localized.connectorMigrationNotice = copy.connectorMigrationNotice.replaceAll("Codex Native2", () => names.automatic);
+  return localized;
+}
+
+function baseCopyFor(language: Language): Copy {
   if (language === "zh-CN") return zh as Copy;
   if (language === "ja") return ja as Copy;
   if (language === "ko") return ko as Copy;

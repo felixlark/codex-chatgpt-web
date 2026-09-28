@@ -3,13 +3,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.0/codex-web-gpt-6.1.0-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.0/codex-web-gpt-6.1.0-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.0/codex-web-gpt-6.1.0-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.2/codex-web-gpt-6.1.2-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.2/codex-web-gpt-6.1.2-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.2/codex-web-gpt-6.1.2-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.0/codex-web-gpt-6.1.0-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">모든 릴리스</a>
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.2/codex-web-gpt-6.1.2-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">모든 릴리스</a>
 </p>
 
 <p align="center">
@@ -27,6 +27,12 @@
 Codex의 네이티브 모델 선택기에서 Pro를 포함해 계정에 제공되는 ChatGPT Web 모델을 사용하세요. ChatGPT Web의 별도 사용 한도를 사용하므로 Work나 Codex의 사용량은 차감되지 않습니다. 기존 인터페이스, 작업, 이미지, 스트리밍은 그대로 유지됩니다.
 
 Full harness 모드는 MCP를 통해 ChatGPT를 현재 작업의 파일, 터미널, 도구 및 승인 절차에 연결합니다. 대화는 Codex 작업에 계속 연결되어 있으므로 컨텍스트가 늘어나도 작업을 이어갈 수 있습니다.
+
+<a id="what-this-fork-changes"></a>
+
+## 이 fork의 변경 사항
+
+하나의 브리지가 여러 런처 브라우저와 커넥터를 풀로 관리하며, 대화 소유권, 호스트 장애 전환, 원격 Codex 환경을 유지합니다. 일반 사용자용 앱, 설치 프로그램과 지원은 계속 업스트림에서 제공합니다.
 
 <div id="get-started"><a id="quick-start"></a></div>
 
@@ -204,3 +210,13 @@ bun run app:package
 [문제 해결](TROUBLESHOOTING.md) · [보안](SECURITY.md) · [기여](CONTRIBUTING.md) · [MIT 라이선스](LICENSE) · [CI](https://github.com/miuuyy/codex-chatgpt-web/actions/workflows/ci.yml)
 
 제가 만든 또 다른 앱: <img src="assets/readme/persona-voice.svg" width="20" height="20" alt=""> [ChatGPT Persona Voice](https://github.com/miuuyy/ChatGPT-Persona-Voice) — ChatGPT와 Codex를 위한 로컬, 거의 실시간의 사용자 지정 음성.
+> ### 이 저장소는 fork입니다
+>
+> 업스트림: **[miuuyy/codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web)** — 원본, 플랫폼별 설치 프로그램과 지원은 업스트림을 이용하세요.
+>
+> 이 fork는 업스트림이 명시적으로 지원하지 않는 구성, 즉 **Codex와 다른 컴퓨터에서 브리지를 실행하면서 여러 런처 브라우저를 동시에 제공하는 구성**을 위해 존재합니다.
+>
+> - **차이점:** [이 fork의 변경 사항](#what-this-fork-changes)
+> - **릴리스:** 태그는 `mars-vX.Y.Z` 형식입니다(업스트림은 `vX.Y.Z`). 최신 릴리스는 업스트림 v5.0.8 기반의 **[mars-v1.0.0](https://github.com/longbiaochen/codex-chatgpt-web/releases/tag/mars-v1.0.0)** 입니다.
+> - **여기서는 설치 프로그램을 제공하지 않습니다.** 릴리스에는 런타임 번들 두 개(`cli.js`, `browser-helper.cjs`)만 있습니다. 업스트림 앱을 설치한 뒤 이 두 파일을 교체하세요.
+> - 이 배포에만 한정되지 않는 변경은 업스트림에 제안하고, 나머지는 `mars-6.1` 브랜치에 유지합니다.
