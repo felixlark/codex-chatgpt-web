@@ -280,6 +280,55 @@ function verifyHistoricalEnvironmentMessages(
   throw new Error("Codex rollout has no current task boundary for environment history");
 }
 
+/** Authenticate an exact native environment item after this turn's task_started boundary. */
+function verifyCurrentEnvironmentMessage(
+  fd: number, size: number, turnId: string, message: ChatGptUnattributedEnvironmentMessage,
+): void {
+  let position = size;
+  let carry = Buffer.alloc(0);
+  let atEof = true;
+  let matched = false;
+  const lastByte = Buffer.alloc(1);
+  const endsWithNewline = readSync(fd, lastByte, 0, 1, size - 1) === 1 && lastByte[0] === 0x0a;
+  while (position > 0) {
+    const length = Math.min(ROLLOUT_READ_CHUNK_BYTES, position);
+    position -= length;
+    const chunk = Buffer.alloc(length);
+    if (readSync(fd, chunk, 0, length, position) !== length) throw new Error("Codex rollout changed during current environment lookup");
+    const data = Buffer.concat([chunk, carry]);
+    let end = data.length;
+    for (let index = data.length - 1; index >= 0; index -= 1) {
+      if (data[index] !== 0x0a) continue;
+      const line = data.subarray(index + 1, end);
+      end = index;
+      const partial = atEof && !endsWithNewline;
+      atEof = false;
+      if (partial || !line.length) continue;
+      if (line.length > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
+      const item = parseJsonLine(line);
+      const payload = record(item.payload);
+      if (item.type === "event_msg" && payload?.type === "task_started") {
+        if (payload.turn_id === turnId && matched) return;
+        throw new Error("Codex rollout does not authenticate the current environment message");
+      }
+      if (item.type !== "response_item" || payload?.id !== message.id) continue;
+      const provenance = record(payload.internal_chat_message_metadata_passthrough);
+      if (matched || payload.type !== "message" || payload.role !== "user"
+        || provenance?.turn_id !== turnId
+        || !Array.isArray(provenance.content_item_kinds)
+        || provenance.content_item_kinds.length !== 1
+        || provenance.content_item_kinds[0] !== "environments.environment_context"
+        || !isDeepStrictEqual(payload.content, message.content)) {
+        throw new Error("Current environment message differs from its native Codex record");
+      }
+      matched = true;
+    }
+    carry = Buffer.from(data.subarray(0, end));
+    if (carry.length > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
+  }
+  throw new Error("Codex rollout has no current task boundary for environment proof");
+}
+
 function validateSessionMeta(
   item: Record<string, unknown>,
   identity: RolloutIdentity,
@@ -610,6 +659,7 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
   compactionSourceTurnId?: string;
   tools?: readonly CodexTool[];
   historicalEnvironmentMessages?: ChatGptUnattributedEnvironmentMessage[];
+  currentEnvironmentMessage?: ChatGptUnattributedEnvironmentMessage;
 }): ChatGptTurnEnvironment | undefined {
   const { codexHome, lineage, turnId, tools, compactionSourceTurnId } = options;
   const nativeThreadId = CODEX_ID.test(lineage.threadId);
@@ -649,6 +699,9 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
       validateMetadataConsistency(lineage, environment);
       if (options.historicalEnvironmentMessages) {
         verifyHistoricalEnvironmentMessages(fd, size, turnId, options.historicalEnvironmentMessages);
+      }
+      if (options.currentEnvironmentMessage) {
+        verifyCurrentEnvironmentMessage(fd, size, turnId, options.currentEnvironmentMessage);
       }
       matching.push(environment);
     } finally {

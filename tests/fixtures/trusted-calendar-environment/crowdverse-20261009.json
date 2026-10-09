@@ -1,0 +1,54 @@
+[
+  {
+    "type": "session_meta",
+    "payload": {
+      "id": "01a00000-0000-7000-8000-000000000001",
+      "source": "vscode"
+    }
+  },
+  {
+    "timestamp": "2026-10-09T10:23:04.972Z",
+    "type": "event_msg",
+    "payload": {
+      "type": "task_started",
+      "turn_id": "01a00000-0000-7000-8000-000000000002"
+    }
+  },
+  {
+    "timestamp": "2026-10-09T10:23:05.027Z",
+    "ordinal": 63627,
+    "type": "response_item",
+    "payload": {
+      "type": "message",
+      "id": "msg_redacted_native_environment",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "<environment_context>\n  <current_date>2026-10-09</current_date>\n  <timezone>Asia/Shanghai</timezone>\n  <filesystem><permission_profile type=\"disabled\"><file_system type=\"unrestricted\" /></permission_profile></filesystem>\n</environment_context>"
+        }
+      ],
+      "internal_chat_message_metadata_passthrough": {
+        "turn_id": "01a00000-0000-7000-8000-000000000002",
+        "content_item_kinds": [
+          "environments.environment_context"
+        ]
+      }
+    }
+  },
+  {
+    "timestamp": "2026-10-09T10:23:05.028Z",
+    "type": "turn_context",
+    "payload": {
+      "turn_id": "01a00000-0000-7000-8000-000000000002",
+      "cwd": "/private/tmp/native-project",
+      "permission_profile": {
+        "type": "disabled"
+      },
+      "sandbox_policy": {
+        "type": "danger-full-access"
+      },
+      "approval_policy": "never"
+    }
+  }
+]
