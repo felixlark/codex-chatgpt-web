@@ -1,0 +1,13 @@
+# codex-ops: intentional-profile
+# Escape hatch: force Sol's own local codex-chatgpt-web bridge instead of Janus.
+# Use when off the office LAN or when Janus is down: codex --profile sol-local ...
+model = "chatgpt-web/high"
+model_provider = "sol_local"
+model_reasoning_effort = "high"
+
+[model_providers.sol_local]
+name = "Sol local Codex Web GPT"
+base_url = "http://127.0.0.1:17841/v1"
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = false

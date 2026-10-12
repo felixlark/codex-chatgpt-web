@@ -585,3 +585,48 @@ test("refuses a ChatGPT Web continuation when local previous-response state is u
   const body = await response.json() as { error: { message: string } };
   expect(body.error.message).toContain("partial Codex context");
 });
+
+test("delegated-only memento compaction completes and authenticates summary continuation", async () => {
+  const metadata = {
+    request_kind: "compaction", thread_id: "thread_delegated_memento", turn_id: "turn_delegated_memento",
+    compaction: { trigger: "auto", reason: "context_limit", implementation: "responses", phase: "pre_turn", strategy: "memento" },
+  };
+  const body = {
+    model, client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) },
+    tools: [{ type: "function", name: "exec_command", parameters: { type: "object" } }],
+    input: [{ type: "function_call_output", id: "fco_source", name: "create_thread", namespace: "codex_app", output: "<codex_delegation><source_thread_id>parent</source_thread_id><input>Continue authorized task</input></codex_delegation>" }],
+  };
+  expect(parseRequest(body)._compactionRequest).toBe(true);
+  for (const stream of [false, true]) {
+    const response = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+      method: "POST", body: JSON.stringify({ ...body, stream }),
+    }), defaultConfig("full"), compactionAdapterFactory());
+    expect(response.status).toBe(200);
+    const text = await response.text();
+    const result = stream
+      ? JSON.parse(text.split("\n").find(line => line.startsWith('data: {"type":"response.completed"'))!.slice(6)).response
+      : JSON.parse(text);
+    expect(result.output).toHaveLength(1);
+    expect(result.output[0]).toMatchObject({ type: "message", role: "assistant", content: [{ type: "output_text", text: summary }] });
+  }
+  const cwd = process.cwd();
+  const continuation = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+    method: "POST", body: JSON.stringify({ model, stream: false,
+      client_metadata: { "x-codex-turn-metadata": JSON.stringify({ ...metadata, request_kind: "turn", sandbox: "none", workspaces: { [cwd]: {} } }) },
+      input: [
+        { type: "message", role: "user", id: "msg_environment", content: [{ type: "input_text",
+          text: `<environment_context><cwd>${cwd}</cwd><sandbox_mode>danger-full-access</sandbox_mode></environment_context>` }] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: `${SUMMARY_PREFIX}\n${summary}` }] },
+      ],
+    }),
+  }), defaultConfig("full"), () => ({ name: "verified-continuation", async runTurn(parsed, _incoming, emit) {
+    expect(extractChatGptTurnEnvironment(parsed).cwd).toBe(cwd);
+    expect(extractChatGptTurnUserRevision(parsed)).toEqual(body.input[0]!.output);
+    emit({ type: "text_delta", text: "Continued", phase: "final_answer" });
+    emit({ type: "done", stopReason: "stop", endTurn: true });
+  } }));
+  expect(continuation.status).toBe(200);
+  expect((await continuation.json()).status).toBe("completed");
+  expect(parseRequest({ ...body, client_metadata: { "x-codex-turn-metadata": JSON.stringify({ ...metadata, request_kind: "turn" }) } })._compactionRequest).toBeUndefined();
+  expect(() => parseRequest({ ...body, client_metadata: { "x-codex-turn-metadata": JSON.stringify({ ...metadata, compaction: { strategy: "unknown" } }) } })).toThrow("Unsupported native text compaction");
+});

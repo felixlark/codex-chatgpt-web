@@ -104,7 +104,20 @@ export function recoverCompactionInstruction(
   identity: ChatGptTurnIdentity,
 ): { source: ChatGptTurnUserRevision; summaryIndex: number } | undefined {
   const accepted = acceptedCheckpoint(parsed, identity);
-  return accepted ? { source: structuredClone(accepted.checkpoint.source), summaryIndex: accepted.summaryIndex } : undefined;
+  if (accepted) return { source: structuredClone(accepted.checkpoint.source), summaryIndex: accepted.summaryIndex };
+  // A new turn may compact the preceding completed summary before its new instruction
+  // enters the wire history. This recovers a summarization source, not turn authority.
+  if (!parsed._compactionRequest || !identity.threadId || !identity.turnId) return undefined;
+  for (const key of [...checkpoints.keys()].reverse()) {
+    let parts: unknown;
+    try { parts = JSON.parse(key); } catch { continue; }
+    if (!Array.isArray(parts) || parts.length !== 4
+      || parts[0] !== identity.threadId || typeof parts[1] !== "string"
+      || parts[2] !== parsed.modelId || parts[3] !== (parsed.options.reasoning ?? null)) continue;
+    const historical = acceptedCheckpoint(parsed, { ...identity, turnId: parts[1] });
+    if (historical) return { source: structuredClone(historical.checkpoint.source), summaryIndex: historical.summaryIndex };
+  }
+  return undefined;
 }
 
 function acceptedCheckpoint(

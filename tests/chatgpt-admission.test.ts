@@ -319,7 +319,7 @@ describe("ChatGPT account admission turn records", () => {
   });
 });
 
-test("a slot whose turn never finishes is reclaimed, so the queue cannot sit still", async () => {
+test("a long-running physical turn retains its slot until actual release", async () => {
   let now = 1_000_000;
   let timer: (() => void) | undefined;
   const admission = new ChatGptAdmission({
@@ -329,7 +329,7 @@ test("a slot whose turn never finishes is reclaimed, so the queue cannot sit sti
     setTimer: callback => { timer = callback; return 0 as unknown as ReturnType<typeof setTimeout>; },
     clearTimer: () => {},
   });
-  await admission.acquire("key-a", "trace-a");            // admitted, and never released
+  const releaseFirst = await admission.acquire("key-a", "trace-a");
   const second = admission.acquire("key-b", "trace-b");
   let admitted = false;
   void second.then(() => { admitted = true; });
@@ -338,6 +338,13 @@ test("a slot whose turn never finishes is reclaimed, so the queue cannot sit sti
   now += 21 * 60_000;                                      // past the stale-slot deadline
   timer?.();                                               // the scheduled wake-up pumps again
   await Bun.sleep(1);
+  expect(admitted).toBe(false);
+  expect(admission.snapshot().running).toBe(1);
+  releaseFirst();
+  const releaseSecond = await second;
   expect(admitted).toBe(true);
-  expect(admission.snapshot().running).toBe(1);            // only the second turn holds a slot now
+  releaseFirst(); // A late duplicate release cannot remove the new owner's slot.
+  expect(admission.snapshot().running).toBe(1);
+  releaseSecond();
+  expect(admission.snapshot().running).toBe(0);
 });

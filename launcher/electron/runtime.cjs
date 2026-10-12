@@ -1095,6 +1095,9 @@ class RuntimeHost {
     if (!current.configured) {
       throw new Error("Initialize the runtime before changing Bigger Context");
     }
+    if (enabled === true && current.config?.solAvailable !== true) {
+      throw new Error("Bigger Context requires Sol or Pro in the launcher's model list. It is unavailable for Luna and Think.");
+    }
     const mode = current.mode;
     const contextFlag = enabled === true ? "--bigger-context" : "--standard-context";
     if (this.launcherProfile === "development") {
@@ -1162,6 +1165,35 @@ class RuntimeHost {
       ? await this.runDevSetup("skill-attachments", args, options)
       : await this.runSetup("skill-attachments", args, options);
     return { ...result, enabled: enabled === true };
+  }
+
+  async setAutoApproveToolCalls(enabled) {
+    if (typeof enabled !== "boolean") throw new Error("Tool approval preference must be a boolean");
+    const current = this.runtimeConfigSnapshot();
+    if (!current.configured) throw new Error("Initialize the runtime before changing tool approvals");
+    if ((current.config?.browserInteractionMode ?? "automatic") !== "automatic") {
+      throw new Error("Automatic tool approvals are unavailable in Zero Risk mode");
+    }
+    const development = this.launcherProfile === "development";
+    const args = [
+      ...(development ? ["dev", "setup"] : ["setup"]),
+      current.mode === "full" ? "--full" : "--browser-only",
+      "--browser-host-descriptor", this.browserDescriptorPath,
+      ...this.browserInteractionArgs(),
+      "--acknowledge-unofficial",
+      ...(development ? [] : ["--replace-codex-route", "--restart-service"]),
+      // Setup explicitly writes false when this opt-in flag is absent.
+      ...(enabled ? ["--auto-approve-tool-calls"] : []),
+    ];
+    const options = {
+      message: "Updating ChatGPT tool approvals",
+      successMessage: enabled ? "One-time tool requests will be approved automatically" : "Manual tool approvals restored",
+      timeoutMs: CORE_SETUP_TIMEOUT_MS,
+    };
+    const result = development
+      ? await this.runDevSetup("auto-approve-tool-calls", args, options)
+      : await this.runSetup("auto-approve-tool-calls", args, options);
+    return { ...result, enabled };
   }
 
   async setFreshConversationPerTurn(enabled) {
@@ -1289,9 +1321,9 @@ class RuntimeHost {
       existing.mode === "full" ? "--full" : "--browser-only",
       "--browser-host-descriptor",
       this.browserDescriptorPath,
-      // A release may repair capability detection. Reusing the previous result can
-      // keep eligible models disabled even after the corrected probe is installed.
-      ...this.browserInteractionArgs({ mode: interactionMode, refreshCapabilities: true }),
+      // Preserve the installed model selection during an update. Account refresh is
+      // a separate Setup action and must not prevent the local bridge from starting.
+      ...this.browserInteractionArgs({ mode: interactionMode }),
       "--acknowledge-unofficial",
       "--restart-service",
     ];
@@ -1303,6 +1335,7 @@ class RuntimeHost {
         ? `${interactionMode === "manual" ? "Zero Risk" : "Automatic"} MCP profile migrated`
         : `Launcher runtime upgraded to ${currentVersion}`,
       timeoutMs: existing.mode === "full" ? MCP_SETUP_TIMEOUT_MS : CORE_SETUP_TIMEOUT_MS,
+      previousRuntimeCompatible: existing.config.releaseVersion === currentVersion,
     });
     return {
       updated: true,
@@ -1465,6 +1498,7 @@ class RuntimeHost {
     this.lifecycleOperation = name;
     let setupCommandStarted = false;
     let runtimeTransitionStarted = false;
+    let runtimeStartAttempted = false;
     try {
       if (this.launcherProfile === "production") {
         await this.run(name, [...args, "--preflight-only"], {
@@ -1479,6 +1513,7 @@ class RuntimeHost {
       else await this.supervisor.stopForSetup();
       setupCommandStarted = true;
       const result = await this.run(name, args, options);
+      runtimeStartAttempted = true;
       const runtime = await this.supervisor.startIfConfigured();
       if (runtime.status !== "ready") {
         throw new Error(`Setup completed, but the launcher-owned runtime is ${runtime.status}: ${runtime.detail || "not ready"}`);
@@ -1490,6 +1525,7 @@ class RuntimeHost {
       const failures = [];
       let rolledBack = false;
       let checkpointChanged = false;
+      let checkpointRestored = false;
       if (!previousRuntime.configured && setupCommandStarted) {
         try {
           rolledBack = await this.rollbackFirstSetup(checkpoint);
@@ -1509,13 +1545,25 @@ class RuntimeHost {
           );
         }
         try {
+          if (options.previousRuntimeCompatible === false && runtimeStartAttempted) {
+            // Stop any incomplete new runtime while its own configuration is still
+            // available. Never restore old process inputs underneath a live candidate.
+            await this.supervisor.stopForSetup();
+          }
           this.restoreSetupCheckpoint(checkpoint);
+          checkpointRestored = true;
         } catch (caught) {
           failures.push(caught instanceof Error ? caught.message : String(caught));
         }
       }
       let recoveryError;
-      if (runtimeTransitionStarted) {
+      if (runtimeTransitionStarted && options.previousRuntimeCompatible === false) {
+        // The installed launcher cannot run an older configuration. Keep the restored
+        // inputs for a retry instead of attempting an impossible runtime rollback.
+        if (checkpointRestored) {
+          failures.push("The saved configuration was preserved. Restart the launcher to retry the update.");
+        }
+      } else if (runtimeTransitionStarted) {
         try {
           await this.restorePreviousRuntime(previousRuntime, name, {
             repairExternal: previousRuntime.owner === "external" && checkpointChanged,

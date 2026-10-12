@@ -28,6 +28,42 @@ export const CHATGPT_EFFORT_ITEM_SELECTOR = '[role="menuitemradio"]';
 export const CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR = '[data-model-reasoning-effort-slider], [data-model-picker-power-slider]';
 export const CHATGPT_EFFORT_SLIDER_SELECTOR = '[data-model-reasoning-effort-slider] [role="slider"], [data-model-picker-power-slider] [role="slider"]';
 export const CHATGPT_EFFORT_SLIDER_MAX_OPTIONS = 5;
+
+/** Read model evidence only from the slider's own active picker. */
+export async function readChatGptModelAnnouncements(slider: Locator): Promise<string[]> {
+  return slider.evaluate(element => {
+    const doc = element.ownerDocument;
+    const descriptions = (element.closest('[role="menuitem"]')?.getAttribute("aria-describedby") ?? "")
+      .split(/\s+/).filter(Boolean).map(id => doc.getElementById(id)?.textContent ?? "");
+    // Some accounts now announce only the effort ("Pro, 5 of 5"); the model
+    // version is shown in the picker header as adjacent text nodes ("6" + "Pro").
+    const menu = element.closest('[role="menu"]');
+    const rendered = (node: Element): boolean => {
+      for (let parent: Element | null = node; parent; parent = parent.parentElement) {
+        if (parent.matches('[hidden], [inert], [aria-hidden="true"]')) return false;
+        const style = getComputedStyle(parent);
+        if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+      }
+      return true;
+    };
+    const headers = [...(menu?.querySelectorAll('[data-model-picker-view-toggle="true"]') ?? [])]
+      .filter(header => header.closest('[role="menu"]') === menu && rendered(header));
+    if (headers.length > 1) throw new Error("ChatGPT model picker exposes multiple active model headers");
+    if (headers.length === 1) {
+      const content = headers[0]!.querySelector("[data-menu-row-content]") ?? headers[0]!;
+      const words: string[] = [];
+      const walker = doc.createTreeWalker(content, NodeFilter.SHOW_TEXT);
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        if (node.parentElement && rendered(node.parentElement)) {
+          const word = node.textContent?.trim();
+          if (word) words.push(word);
+        }
+      }
+      descriptions.push(words.join(" "));
+    }
+    return descriptions;
+  });
+}
 /** Resolve only inside the verified composer's form; multiple submitters are an error. */
 export const CHATGPT_SEND_BUTTON_SELECTOR = '[data-testid="send-button"], button[type="submit"]';
 export const CHATGPT_STOP_BUTTON_SELECTOR = '[data-testid="stop-button"], form[data-chatgpt-composer] button[type="button"][aria-label="Stop"]';
@@ -214,6 +250,18 @@ async function anyVisible(locator: Locator): Promise<boolean> {
     if (await locator.nth(index).isVisible().catch(() => false)) return true;
   }
   return false;
+}
+
+/** Guest landing pages now remain at chatgpt.com instead of redirecting to /auth. */
+export async function isChatGptSignedOutLandingPage(page: Page): Promise<boolean> {
+  let url: URL;
+  try { url = new URL(page.url()); } catch { return false; }
+  if (url.origin !== "https://chatgpt.com") return false;
+  // Account-independent product cards and hidden auth dialogs also contain
+  // login text. Require the visible stage login AND signup entry controls.
+  const login = page.locator('button[data-login-button][data-mobile-auth-entry-action="login"]');
+  const signup = page.locator('button[data-mobile-auth-entry-point="mobile_chat_stage_header"][data-mobile-auth-entry-action="signup"]');
+  return await anyVisible(login) && await anyVisible(signup);
 }
 
 export async function assertAuthenticatedChatGptPage(page: Page): Promise<void> {

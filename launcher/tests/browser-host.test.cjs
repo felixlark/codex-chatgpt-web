@@ -5,6 +5,7 @@ const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const { resolve } = require("node:path");
 const {
+  boundedBrowserTitle,
   browserViewVisible,
   constrainBrowserBounds,
   navigateBrowser,
@@ -26,9 +27,130 @@ const {
   navigationOriginForLog,
 } = require("../electron/browser-host.cjs");
 
+test("transport-sized page titles never reach browser navigation state", () => {
+  const title = "PRIVATE_TRANSPORT ".repeat(10000);
+  assert.equal(boundedBrowserTitle(title), "ChatGPT");
+  assert.equal(boundedBrowserTitle("  Useful title  "), "Useful title");
+  const state = readBrowserNavigationState({
+    isDestroyed: () => false, getURL: () => "https://chatgpt.com/",
+    getTitle: () => title, isLoading: () => false,
+    navigationHistory: { canGoBack: () => false, canGoForward: () => false },
+  }, { title });
+  assert.equal(state.title, "ChatGPT");
+  assert.ok(!JSON.stringify(state).includes("PRIVATE_TRANSPORT"));
+  });
+
+function primaryLoginFixture() {
+  let loads = 0;
+  let probes = 0;
+  const contents = Object.assign(new EventEmitter(), {
+    setWindowOpenHandler() {}, isDestroyed: () => false, isLoadingMainFrame: () => true, stop() {},
+    getURL: () => "https://chatgpt.com/?temporary-chat=true",
+    loadURL: async url => { loads++; contents.emit("did-start-navigation", {}, url, false, true); },
+  });
+  const host = Object.assign(Object.create(BrowserHost.prototype), {
+    state: { authenticated: false }, turnTabs: new Map(), view: { webContents: contents },
+    setState(patch) { Object.assign(this.state, patch); }, snapshot() { return { ...this.state }; },
+    logger: { info() {}, error() {} }, show() {}, activateHomeSurface() {},
+    armHomeNavigationTimeout() {}, clearHomeNavigationTimeout() {},
+    withManualOperation: async (_name, action) => action(),
+    probeAuthentication: async () => { probes++; return { authenticated: true }; },
+    runSessionInspection: async () => {},
+  });
+  host.bindWebContents();
+  return { host, contents, loads: () => loads, probes: () => probes };
+}
+
+test("failed primary navigation rejects login and an explicit retry replaces the failed document", async () => {
+  const { host, contents, loads, probes } = primaryLoginFixture();
+  contents.emit("did-fail-load", {}, -331, "ERR_NETWORK_IO_SUSPENDED", contents.getURL(), true);
+  await assert.rejects(host.waitForAuthenticated(), /ERR_NETWORK_IO_SUSPENDED/);
+  assert.equal(probes(), 0, "cached authentication cannot validate a failed page");
+  contents.emit("did-finish-load"); // Chromium's error document is not a recovered ChatGPT page.
+  assert.equal(host.state.status, "error");
+  host.state.authenticated = true; // The account cookie can outlive the failed document.
+  await host.openLogin();
+  assert.equal(loads(), 1);
+  assert.equal(host.primaryNavigationError, null);
+  await host.openLogin();
+  assert.equal(loads(), 1, "an authenticated, valid document is preserved");
+});
+
+test("only failed main-frame loads and renderer exits invalidate the primary login document", async () => {
+  const { host, contents, loads } = primaryLoginFixture();
+  contents.emit("did-fail-load", {}, -331, "ERR_NETWORK_IO_SUSPENDED", contents.getURL(), false);
+  contents.emit("did-fail-load", {}, -3, "ERR_ABORTED", contents.getURL(), true);
+  await host.openLogin();
+  assert.equal(loads(), 0);
+  contents.emit("render-process-gone", {}, { reason: "crashed", exitCode: 1 });
+  await assert.rejects(host.waitForAuthenticated(), /renderer stopped: crashed/);
+  contents.emit("did-start-navigation", {}, contents.getURL(), true, true);
+  await assert.rejects(host.waitForAuthenticated(), /renderer stopped: crashed/);
+  await host.openLogin();
+  assert.equal(loads(), 1);
+});
+
+test("the primary navigation deadline is reported to the login waiter", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000_000 });
+  const { host, contents } = primaryLoginFixture();
+  BrowserHost.prototype.armHomeNavigationTimeout.call(host, contents, contents.getURL());
+  t.mock.timers.tick(60_000);
+  await assert.rejects(host.waitForAuthenticated(), /did not finish loading within 60 seconds/);
+});
+
 test("manual prompt handoff keeps ordinary turns at one minute and compaction at two minutes", () => {
   assert.equal(MANUAL_SUBMIT_TIMEOUT_MS, 60_000);
   assert.equal(MANUAL_COMPACTION_SUBMIT_TIMEOUT_MS, 120_000);
+});
+
+test("idle startup trims only oversized unowned temporary-chat cookies, preserving login", async () => {
+  const removed = [];
+  const cookieRows = [
+    { domain: ".chatgpt.com", name: "conv_key_old", path: "/", value: "x".repeat(13 * 1024) },
+    { domain: ".chatgpt.com", name: "__Secure-next-auth.session-token", path: "/", value: "session" },
+    { domain: "other.example", name: "conv_key_foreign", path: "/", value: "other" },
+    { domain: ".chatgpt.com", name: "conv_key", path: "/", value: "unrecognized" },
+  ];
+  const fixture = {
+    turnTabs: new Map(), logger: { info() {} },
+    view: { webContents: {
+      getURL: () => IDLE_BROWSER_URL, isDestroyed: () => false,
+      session: { cookies: {
+        get: async () => cookieRows,
+        remove: async (url, name) => removed.push([url, name]), flushStore: async () => {},
+      } },
+    } },
+  };
+  const prune = () => BrowserHost.prototype.pruneUnownedTemporaryConversationCookies.call(fixture);
+  for (const status of ["running", "ready", "authentication-required"]) {
+    fixture.turnTabs.set("protected", { status });
+    assert.equal(await prune(), 0);
+  }
+  fixture.turnTabs.clear();
+  fixture.getBrowserInteractionMode = () => "manual";
+  assert.equal(await prune(), 0);
+  fixture.getBrowserInteractionMode = () => "automatic";
+  fixture.view.webContents.getURL = () => "https://chatgpt.com/?temporary-chat=true";
+  assert.equal(await prune(), 0);
+  fixture.view.webContents.getURL = () => IDLE_BROWSER_URL;
+  assert.equal(await prune(), 1);
+  assert.deepEqual(removed, [["https://chatgpt.com/", "conv_key_old"]]);
+  cookieRows[0].value = "small";
+  assert.equal(await prune(), 0);
+});
+
+test("cookie cleanup rechecks idle state after reading the cookie jar", async () => {
+  const fixture = {
+    turnTabs: new Map(), logger: { info() {} },
+    view: { webContents: {
+      getURL: () => IDLE_BROWSER_URL, isDestroyed: () => false,
+      session: { cookies: {
+        get: async () => { fixture.turnTabs.set("new", { status: "running" }); return []; },
+        remove: async () => { throw new Error("must preserve newly owned conversation"); },
+      } },
+    } },
+  };
+  assert.equal(await BrowserHost.prototype.pruneUnownedTemporaryConversationCookies.call(fixture), 0);
 });
 
 test("Electron and Bun agree on the exact launcher idle surface", () => {
@@ -614,6 +736,37 @@ test("hidden turn tabs receive an explicit renderer viewport before moving offsc
   assert.equal(tab.deviceEmulationDirty, false);
 });
 
+test("background tabs retain the measured browser pane size across selection and window visibility", () => {
+  const host = Object.assign(Object.create(BrowserHost.prototype), {
+    boundsReady: true,
+    bounds: { x: 280, y: 64, width: 710, height: 568 },
+    window: { getContentSize: () => [1120, 720] },
+  });
+  const hidden = host.hiddenTurnBounds();
+  assert.deepEqual(hidden, { x: 1121, y: 721, width: 710, height: 568 });
+  assert.ok(hidden.x > 1120 && hidden.y > 720, "the pane remains entirely offscreen");
+  const sizes = [];
+  const tab = {
+    status: "running", rendererReady: true, deviceEmulationDirty: true,
+    view: {
+      setBounds: ({ width, height }) => sizes.push([width, height]),
+      setVisible() {},
+      webContents: {
+        enableDeviceEmulation: ({ viewSize }) => sizes.push([viewSize.width, viewSize.height]),
+        disableDeviceEmulation() {},
+      },
+    },
+  };
+  host.presentTurnView(tab, false);
+  host.presentTurnView(tab, true);
+  host.presentTurnView(tab, false);
+  assert.ok(sizes.every(([width, height]) => width === 710 && height === 568));
+  // A real pane resize still updates every background renderer.
+  host.bounds = { ...host.bounds, width: 900, height: 640 };
+  host.presentTurnView(tab, false);
+  assert.deepEqual(tab.deviceEmulationViewport, { width: 900, height: 640 });
+});
+
 test("hidden primary checks retain a renderer viewport across resize and navigation, then restore native bounds", () => {
   const calls = [];
   let size = [1120, 720];
@@ -691,20 +844,20 @@ test("turn tabs use the hidden viewport when the launcher window is hidden", () 
   BrowserHost.prototype.syncViewVisibility.call(fixture);
 
   assert.deepEqual(events, [
-    ["home-bounds", { x: 1121, y: 721, width: 1120, height: 720 }],
+    ["home-bounds", { x: 1121, y: 721, width: 840, height: 656 }],
     ["home-visible", true],
     ["emulate", {
       screenPosition: "desktop",
-      screenSize: { width: 1120, height: 720 },
+      screenSize: { width: 840, height: 656 },
       viewPosition: { x: 0, y: 0 },
       deviceScaleFactor: 0,
-      viewSize: { width: 1120, height: 720 },
+      viewSize: { width: 840, height: 656 },
       scale: 1,
     }],
-    ["bounds", { x: 1121, y: 721, width: 1120, height: 720 }],
+    ["bounds", { x: 1121, y: 721, width: 840, height: 656 }],
     ["visible", true],
   ]);
-  assert.deepEqual(tab.deviceEmulationViewport, { width: 1120, height: 720 });
+  assert.deepEqual(tab.deviceEmulationViewport, { width: 840, height: 656 });
 });
 
 test("new turn tabs defer device emulation until their renderer finishes loading", () => {
@@ -742,14 +895,14 @@ test("new turn tabs defer device emulation until their renderer finishes loading
   assert.equal(tab.deviceEmulationDirty, true);
 });
 
-test("visible turn tabs establish native bounds before clearing background emulation", () => {
+test("visible turn tabs keep the explicit viewport across background transitions", () => {
   const events = [];
   const tab = {
     id: "tab-visible-viewport",
     status: "running",
     rendererReady: true,
-    deviceEmulationViewport: { width: 1120, height: 720 },
-    deviceEmulationDirty: true,
+    deviceEmulationViewport: { width: 840, height: 656 },
+    deviceEmulationDirty: false,
     view: {
       setBounds: bounds => events.push(["bounds", bounds]),
       setVisible: visible => events.push(["visible", visible]),
@@ -781,13 +934,12 @@ test("visible turn tabs establish native bounds before clearing background emula
   BrowserHost.prototype.syncViewVisibility.call(fixture);
 
   assert.deepEqual(events, [
-    ["home-bounds", { x: 1121, y: 721, width: 1120, height: 720 }],
+    ["home-bounds", { x: 1121, y: 721, width: 840, height: 656 }],
     ["home-visible", true],
     ["bounds", { x: 280, y: 64, width: 840, height: 656 }],
-    ["disable-emulation"],
     ["visible", true],
   ]);
-  assert.equal(tab.deviceEmulationViewport, null);
+  assert.deepEqual(tab.deviceEmulationViewport, { width: 840, height: 656 });
   assert.equal(tab.deviceEmulationDirty, false);
 });
 
@@ -2001,7 +2153,7 @@ test("a viewport-refresh heartbeat reapplies hidden emulation before CDP reconne
     status: "running",
     lastHeartbeatAt: 1,
     rendererReady: true,
-    deviceEmulationViewport: { width: 1120, height: 720 },
+    deviceEmulationViewport: { width: 840, height: 656 },
     deviceEmulationDirty: false,
     view: {
       setBounds: bounds => events.push(["bounds", bounds]),
@@ -2036,7 +2188,7 @@ test("a viewport-refresh heartbeat reapplies hidden emulation before CDP reconne
   BrowserHost.prototype.heartbeatTurn.call(fixture, tab.traceId, tab.helperPid, true);
 
   assert.equal(events.filter(([kind]) => kind === "emulate").length, 1);
-  assert.deepEqual(tab.deviceEmulationViewport, { width: 1120, height: 720 });
+  assert.deepEqual(tab.deviceEmulationViewport, { width: 840, height: 656 });
   assert.equal(tab.deviceEmulationDirty, false);
 });
 
@@ -2321,6 +2473,39 @@ test("concurrent launcher session refresh requests share one browser operation",
   finishProbe({ authenticated: true });
   await first;
   assert.equal(fixture.sessionRefreshOperation, null);
+});
+
+test("startup sign-in redirects become signed-out state while real navigation errors remain errors", async () => {
+  for (const redirected of [true, false]) {
+    let url = IDLE_BROWSER_URL;
+    const failure = Object.assign(new Error("navigation stopped"), { code: -3 });
+    const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+      state: { authenticated: true },
+      snapshot() { return { ...this.state }; },
+      setState(patch) { Object.assign(this.state, patch); },
+      withManualOperation: async (_name, action) => await action(),
+      view: { webContents: {
+        isDestroyed: () => false,
+        getURL: () => url,
+        loadURL: async () => {
+          if (redirected) url = "https://chatgpt.com/auth/login?next=%2F";
+          throw failure;
+        },
+        executeJavaScript: async () => { throw new Error("must not probe a login page"); },
+      } },
+    });
+    if (redirected) {
+      const state = await fixture.refreshAuthentication();
+      assert.equal(state.status, "signed-out");
+      assert.equal(state.authenticated, false);
+      assert.equal(state.message, "Sign in to ChatGPT");
+    } else {
+      await assert.rejects(fixture.refreshAuthentication(), error => error === failure);
+      assert.equal(fixture.state.status, "error");
+      assert.equal(fixture.state.loading, false);
+    }
+    assert.equal(fixture.sessionRefreshOperation, null);
+  }
 });
 
 test("manual browser operations disable background throttling until completion", async () => {
@@ -2776,18 +2961,47 @@ test("a required retained conversation fails before creating a browser tab", asy
   assert.equal(created, false);
 });
 
-test("two browser task tabs are a hard limit", async () => {
-  const turnTabs = new Map(Array.from({ length: 2 }, (_unused, index) => [
+test("five occupied browser task tabs remain a hard limit", async () => {
+  const turnTabs = new Map(Array.from({ length: 5 }, (_unused, index) => [
     `tab-${index + 1}`,
     { id: `tab-${index + 1}`, ordinal: index + 1, status: "ready", lastHeartbeatAt: index },
   ]));
   let evicted = false;
 
   await assert.rejects(
-    BrowserHost.prototype.createTurnTab.call({ turnTabs, removeTurnTab() { evicted = true; } }, "trace_three", 444),
-    /already has 2 browser tabs.*avoid excessive parallel traffic/,
+    BrowserHost.prototype.createTurnTab.call({ turnTabs, removeTurnTab() { evicted = true; } }, "trace_six", 444),
+    /already has 5 browser tabs.*avoid excessive parallel traffic/,
   );
   assert.equal(evicted, false, "a new task must not evict a retained long-running conversation");
+});
+
+test("capacity reclamation only removes the oldest completed automatic conversation", () => {
+  const tab = (id, interactionMode, status, lastHeartbeatAt, extra = {}) => ({
+    id, traceId: id, interactionMode, status, lastHeartbeatAt,
+    conversationKey: id.repeat(64), ...extra,
+  });
+  const tabs = [
+    tab("running", "automatic", "running", 0),
+    tab("manual", "manual", "ready", 0),
+    tab("auth", "automatic", "ready", 0, { authenticationRequired: true }),
+    tab("newer", "automatic", "ready", 200),
+    tab("oldest", "automatic", "ready", 100),
+  ];
+  const removed = [];
+  const fixture = {
+    turnTabs: new Map(tabs.map(tab => [tab.id, tab])), logger: { info() {} },
+    removeTurnTab(tab, abort) {
+      assert.equal(abort, false);
+      removed.push(tab.id);
+      this.turnTabs.delete(tab.id);
+    },
+  };
+  assert.equal(BrowserHost.prototype.evictRetainedAutomaticTurnTab.call(fixture), true);
+  assert.deepEqual(removed, ["oldest"]);
+  assert.equal(BrowserHost.prototype.evictRetainedAutomaticTurnTab.call(fixture), true);
+  assert.deepEqual(removed, ["oldest", "newer"]);
+  assert.equal(BrowserHost.prototype.evictRetainedAutomaticTurnTab.call(fixture), false);
+  assert.deepEqual([...fixture.turnTabs.keys()], ["running", "manual", "auth"]);
 });
 
 test("ending one browser turn does not stop another running tab", async () => {
@@ -3398,7 +3612,7 @@ test("manual hidden tabs use native view placement without DOM or device-emulati
   const fixture = Object.assign(Object.create(BrowserHost.prototype), {
     bounds: { x: 1, y: 2, width: 640, height: 480 },
     hiddenTurnBounds: () => ({ x: 1000, y: 1000, width: 800, height: 600 }),
-    enableHiddenTurnViewport: () => { throw new Error("manual tabs must not enable device emulation"); },
+    enableBrowserViewport: () => { throw new Error("manual tabs must not enable device emulation"); },
   });
   const tab = {
     interactionMode: "manual",
@@ -3711,7 +3925,7 @@ test("off-on-off fresh conversation changes retire completed history before it c
     const property = savedChats ? "useSavedChats" : "experimentalFreshConversationPerTurn";
     const method = savedChats ? "setUseSavedChats" : "setFreshConversationPerTurn";
     const channel = savedChats ? "launcher:use-saved-chats" : "launcher:fresh-conversation-per-turn";
-    const nextChannel = savedChats ? "launcher:zero-risk-pro" : "launcher:use-saved-chats";
+    const nextChannel = savedChats ? "launcher:auto-approve-tool-calls" : "launcher:use-saved-chats";
     const key = "a".repeat(64);
     const stale = { id: "old-chat", traceId: "old-turn", status: "ready", interactionMode: "automatic",
       conversationKey: key, connectorIdentity: "Codex Native2", connectorBound: true };
@@ -3732,7 +3946,7 @@ test("off-on-off fresh conversation changes retire completed history before it c
       },
       createTurnTab: async () => ({ id: "new-chat", surfaceId: "new-surface" }),
     });
-    vm.runInNewContext(main.slice(main.indexOf("function syncFreshConversationPreference("), main.indexOf("function registerIpc(")) +
+    vm.runInNewContext(main.slice(main.indexOf("function syncBrowserPreferences("), main.indexOf("function registerIpc(")) +
       main.slice(main.indexOf(`handle("${channel}",`),
       main.indexOf(`handle("${nextChannel}",`)), {
       handle: (_channel, callback) => { handler = callback; }, browserHost: fixture, releaseRetainedConversation,

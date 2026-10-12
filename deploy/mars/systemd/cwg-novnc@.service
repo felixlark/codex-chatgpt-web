@@ -1,0 +1,14 @@
+[Unit]
+Description=Loopback-only noVNC for Codex Web GPT instance %i
+After=cwg-vnc@%i.service
+Requires=cwg-vnc@%i.service
+
+[Service]
+User=longbiao
+EnvironmentFile=/etc/codex-web-gpt/%i.env
+ExecStart=/usr/bin/websockify --heartbeat=30 --web=/usr/local/share/codex-web-gpt-novnc-1.3/ 127.0.0.1:${CWG_NOVNC_PORT} 127.0.0.1:${CWG_VNC_PORT}
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

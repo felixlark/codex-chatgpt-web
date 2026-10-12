@@ -14,6 +14,7 @@ import {
   extractChatGptTurnIdentity,
   extractCodexTurnIdentityFromBody,
   extractChatGptCompactionSourceRevision,
+  chatGptTurnUserRevisionHistory,
 } from "./adapters/chatgpt-web/environment";
 import { rememberCompactionContinuation } from "./adapters/chatgpt-web/compaction-continuation";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./bridge";
@@ -26,6 +27,7 @@ import { readJsonRequestBody } from "./http-body";
 import { httpStatusFromTerminalError } from "./lib/errors";
 import { createHash } from "node:crypto";
 import { augmentNativeModelCatalog } from "./model-catalog";
+import { webCatalogDescriptor } from "./model-catalog-sync";
 import {
   readCodexModelContextOverride,
   readCodexSubagentProtocol,
@@ -33,6 +35,7 @@ import {
 } from "./codex-integration";
 import {
   CHATGPT_WEB_LUNA_BACKEND_MODEL,
+  CHATGPT_WEB_LUNA_BIGGER_CONTEXT_ERROR,
   isChatGptWebModelSlug,
   requireChatGptWebModelRoute,
   type ChatGptWebModelRoute,
@@ -51,9 +54,10 @@ import { expandPreviousResponseInput, flushResponseState, rememberResponseState 
 import { namespacedToolName, type AdapterEvent, type CodexParsedRequest } from "./types";
 import type { CodexProviderConfig } from "./types";
 import type { ProviderAdapter } from "./adapters/base";
-import { VERSION } from "./version";
+import { chatGptAdmissionSnapshot } from "./adapters/chatgpt-web/launcher-helper-client";
+import { VERSION, FORK_REVISION, UPSTREAM_COMMIT } from "./version";
 import { ChatGptSessionKeepAlive } from "./adapters/chatgpt-web/session-keepalive";
-import { launcherDescriptorHasTurn } from "./adapters/chatgpt-web/launcher-host-pool";
+import { launcherDescriptorHasTurn } from "./adapters/chatgpt-web/launcher-host-activity";
 
 type HttpTrackedEndpoint = "models" | "responses" | "compact" | "search" | "unspecified" | NativeImageEndpoint;
 
@@ -246,6 +250,15 @@ export class HttpTurnCounter {
         await response.body.cancel(abort.signal.reason).catch(() => {});
         release();
         return new Response(null, { status: 499, statusText: "Client Closed Request" });
+      }
+
+      if (endpoint === "models") {
+        // modelsRequest has already read, validated and materialized this finite JSON catalog.
+        // Hand its native body to Bun directly: a slow/disconnected metadata reader must not
+        // retain a model-turn owner or strand the deployment drain behind a JS pull wrapper.
+        // The upstream catalog fetch remains tracked until run() above has completed.
+        release();
+        return response;
       }
 
       if (platform !== "win32") {
@@ -477,6 +490,11 @@ export async function modelsRequest(
   contextOverride?: () => CodexModelContextOverride | undefined,
   onFailure?: (failure: ModelCatalogFailure, detail?: string) => void,
 ): Promise<Response> {
+  const authorization = req.headers.get("authorization") ?? "";
+  if (!authorization.startsWith("Bearer ") || authorization.length <= "Bearer ".length) {
+    onFailure?.({ stage: "request" }, "Native model catalog requires incoming Codex Bearer authorization");
+    return formatErrorResponse(401, "authentication_error", "Native model catalog requires incoming Codex Bearer authorization");
+  }
   let upstream: Response;
   let sent = false;
   try {
@@ -595,6 +613,9 @@ export async function responseRequest(
   try {
     parsed = parseRequest(expanded);
     route = routeChatGptWebRequest(parsed, config);
+    if (config.experimentalBiggerContext && route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) {
+      throw new Error(CHATGPT_WEB_LUNA_BIGGER_CONTEXT_ERROR);
+    }
     const identity = extractChatGptTurnIdentity(parsed);
     if (identity.threadId && identity.turnId) {
       options.onTurnIdentity?.({ threadId: identity.threadId, turnId: identity.turnId });
@@ -642,11 +663,13 @@ export async function responseRequest(
     const body = parsed._rawBody as { input?: unknown[] };
     // v1 installs the bounded user-message output, whereas v2 retains the original source.
     // Authenticate both exact producer-defined representations, never arbitrary rewrites.
-    const v1Source = extractChatGptCompactionSourceRevision({
+    const v1Source = chatGptTurnUserRevisionHistory({
       ...parsed,
       _rawBody: { ...body, input: buildCompactV1Output(extractCompactUserMessages(body.input), summary) },
     });
-    rememberCompactionContinuation(parsed, identity, [source, v1Source], summary);
+    // Delegated-only tasks have no retained v1 human message. Their validated original
+    // source still authenticates the completed checkpoint and summary continuation.
+    rememberCompactionContinuation(parsed, identity, [source, ...v1Source.slice(-1)], summary);
   };
   if (compaction && route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) {
     return formatErrorResponse(
@@ -898,10 +921,7 @@ export function startServer(
   // signed-out host visible before a goal pays for it. Off in tests, which have no launcher.
   const keepAlive = config.mode === "full" && config.browserHostDescriptorPath && process.env.NODE_ENV !== "test"
     ? new ChatGptSessionKeepAlive({
-      // Keep-alive works on browsers, not slots: several slots can share one launcher.
-      hosts: () => [...new Set(config.browserHostSlots?.length
-        ? config.browserHostSlots.map(slot => resolve(expandUserPath(slot.descriptor)))
-        : [config.browserHostDescriptorPath!, ...(config.browserHostPool ?? [])])],
+      hosts: () => [resolve(expandUserPath(config.browserHostDescriptorPath!))],
       busy: launcherDescriptorHasTurn,
       record: results => {
         try {
@@ -953,15 +973,19 @@ export function startServer(
           status: "ok",
           service: "codex-chatgpt-web",
           version: VERSION,
+          fork_revision: FORK_REVISION,
+          upstream_commit: UPSTREAM_COMMIT,
           mode: config.mode,
           pid: process.pid,
           port: config.port,
           uptime: (Date.now() - startedAt) / 1_000,
           accepting_turns: !draining,
+          admission: chatGptAdmissionSnapshot() ?? null,
           successful_model_catalog_requests: successfulModelCatalogRequests,
           last_successful_model_catalog_request_at: lastSuccessfulModelCatalogRequestAt,
           model_catalog_requests: modelCatalogRequests,
           last_model_catalog_result: lastModelCatalogResult,
+          web_model_catalog: webCatalogDescriptor(config),
           ...activity(),
         });
       }
@@ -1097,6 +1121,7 @@ export function startServer(
             {
               status: "refused",
               accepting_turns: !draining,
+              admission: chatGptAdmissionSnapshot() ?? null,
               ...current,
             },
             { status: 409 },

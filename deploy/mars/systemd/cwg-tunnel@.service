@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenAI tunnel-client for Codex Web GPT single host %i
+After=network-online.target cwg-bridge.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=longbiao
+ExecStart=/home/longbiao/.codex-chatgpt-web/bin/tunnel-client run --profile-dir /home/longbiao/.codex-chatgpt-web/tunnel/profiles --profile codex-chatgpt-web-%i
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

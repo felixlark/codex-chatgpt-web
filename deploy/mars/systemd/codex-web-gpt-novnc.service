@@ -1,0 +1,14 @@
+[Unit]
+Description=Loopback-only noVNC bridge for Codex Web GPT authorization
+After=codex-web-gpt-vnc.service
+Requires=codex-web-gpt-vnc.service
+
+[Service]
+Type=simple
+User=longbiao
+ExecStart=/usr/bin/websockify --heartbeat=30 --web=/usr/share/novnc/ 127.0.0.1:6080 127.0.0.1:5901
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

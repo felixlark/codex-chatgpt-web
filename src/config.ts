@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, openSync, closeSync, renameSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { chmodSync, mkdirSync, openSync, closeSync, fsyncSync, renameSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep, win32 } from "node:path";
 import { tmpdir } from "node:os";
@@ -110,9 +110,6 @@ export interface AppConfig {
   browserHost: BrowserHostMode;
   browserInteractionMode: BrowserInteractionMode;
   browserHostDescriptorPath?: string;
-  browserHostPool?: string[];
-  browserHostAppNames?: Record<string, string>;
-  browserHostSlots?: Array<{ descriptor: string; appName: string }>;
   chromeExecutablePath: string;
   storageStatePath: string;
   brokerSocketPath: string;
@@ -201,7 +198,7 @@ function renameAtomicFile(source: string, destination: string): void {
 export function atomicWriteFile(
   path: string,
   data: string | Uint8Array,
-  { mode = 0o600, protectDirectory = true }: { mode?: number; protectDirectory?: boolean } = {},
+  { mode = 0o600, protectDirectory = true, durable = false }: { mode?: number; protectDirectory?: boolean; durable?: boolean } = {},
 ): void {
   const directory = dirname(path);
   mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -212,6 +209,7 @@ export function atomicWriteFile(
   const fd = openSync(temp, "wx", mode);
   try {
     writeFileSync(fd, data);
+    if (durable) fsyncSync(fd);
     closeSync(fd);
     renameAtomicFile(temp, path);
   } catch (error) {
@@ -473,32 +471,6 @@ function parseConfig(value: unknown, path: string): AppConfig {
     && !isAbsolute(expandUserPath(parsed.browserHostDescriptorPath!))) {
     throw new Error(`Launcher browserHostDescriptorPath must be absolute in ${path}`);
   }
-  if (parsed.browserHostPool !== undefined) {
-    if (parsed.browserHost !== "launcher"
-      || !Array.isArray(parsed.browserHostPool)
-      || parsed.browserHostPool.some(host => typeof host !== "string" || !isAbsolute(expandUserPath(host)))) {
-      throw new Error(`browserHostPool must list absolute launcher descriptor paths in ${path}`);
-    }
-  }
-  if (parsed.browserHostAppNames !== undefined) {
-    const names = parsed.browserHostAppNames;
-    if (!names || typeof names !== "object" || Array.isArray(names)
-      || Object.entries(names).some(([host, name]) => !isAbsolute(expandUserPath(host))
-        || typeof name !== "string" || !name.trim() || name.length > 80)) {
-      throw new Error(`browserHostAppNames must map launcher descriptor paths to connector names in ${path}`);
-    }
-  }
-  if (parsed.browserHostSlots !== undefined) {
-    const slots = parsed.browserHostSlots;
-    if (parsed.browserHost !== "launcher" || !Array.isArray(slots) || slots.length === 0
-      || slots.some(slot => !slot || typeof slot !== "object"
-        || typeof slot.descriptor !== "string" || !isAbsolute(expandUserPath(slot.descriptor))
-        || slot.descriptor.includes("#")
-        || typeof slot.appName !== "string" || !slot.appName.trim() || slot.appName.length > 80)
-      || new Set(slots.map(slot => `${slot.descriptor}#${slot.appName}`)).size !== slots.length) {
-      throw new Error(`browserHostSlots must list distinct { descriptor, appName } pairs with absolute launcher descriptor paths in ${path}`);
-    }
-  }
   const brokerEndpoint = expandUserPath(parsed.brokerSocketPath!);
   if (process.platform === "win32") {
     if (!isWindowsPipeEndpoint(brokerEndpoint)) {
@@ -656,9 +628,6 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       browserInteractionMode: config.browserInteractionMode,
       browserHost: config.browserHost,
       browserHostDescriptorPath: config.browserHostDescriptorPath,
-      ...(config.browserHostPool?.length ? { browserHostPool: config.browserHostPool } : {}),
-      ...(config.browserHostAppNames ? { browserHostAppNames: config.browserHostAppNames } : {}),
-      ...(config.browserHostSlots?.length ? { browserHostSlots: config.browserHostSlots } : {}),
       storageStatePath: config.storageStatePath,
       chromeExecutablePath: config.chromeExecutablePath,
       brokerSocketPath: config.brokerSocketPath,

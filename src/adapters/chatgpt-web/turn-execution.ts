@@ -556,6 +556,7 @@ export class ChatGptTurnSessions {
     nativeTurnId?: string,
     nativeThreadId?: string,
     instruction?: string,
+    admissionOwnsCapacity = false,
   ): ChatGptTurnSession {
     this.prune();
     const existing = this.entries.get(key);
@@ -565,7 +566,7 @@ export class ChatGptTurnSessions {
       return existing;
     }
     const active = [...this.entries.values()].filter(session => session.isActive()).length;
-    if (active >= MAX_CHATGPT_BROWSER_TABS) {
+    if (!admissionOwnsCapacity && active >= MAX_CHATGPT_BROWSER_TABS) {
       throw new Error(
         `ChatGPT Web supports at most ${MAX_CHATGPT_BROWSER_TABS} simultaneous browser turns; close or finish a browser tab before starting another`,
       );
@@ -587,6 +588,7 @@ export class ChatGptTurnSessions {
     nativeTurnId?: string,
     nativeThreadId?: string,
     instruction?: ChatGptInstructionLineage,
+    admissionOwnsCapacity = false,
   ): Promise<ChatGptTurnSession> {
     for (;;) {
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
@@ -625,7 +627,16 @@ export class ChatGptTurnSessions {
         continue;
       }
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
-      return this.getOrCreate(key, start, traceId, ownerKey, nativeTurnId, nativeThreadId, instruction?.current);
+      // Launcher admission is the only capacity queue: register queued sessions so
+      // reconnects and tool results find their exact owner without competing for a slot.
+      // Direct/manual paths retain the physical-capacity guard. A slot includes
+      // physical cleanup, and waking requests must re-check identity and ownership.
+      const occupied = [...this.entries.values()].filter(session => !session.isPhysicallySettled());
+      if (!admissionOwnsCapacity && occupied.length >= MAX_CHATGPT_BROWSER_TABS) {
+        await awaitWithAbort(Promise.race(occupied.map(session => session.physicalSettlement)), signal);
+        continue;
+      }
+      return this.getOrCreate(key, start, traceId, ownerKey, nativeTurnId, nativeThreadId, instruction?.current, admissionOwnsCapacity);
     }
   }
 

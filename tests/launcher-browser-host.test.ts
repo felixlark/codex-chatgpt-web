@@ -9,6 +9,7 @@ import {
   LauncherManualTurnTimedOutError,
   LauncherRetainedConversationUnavailableError,
   LauncherBrowserTurnCancelledError,
+  LauncherBrowserSurfaceTimeoutError,
   endLauncherManualTurn,
   inspectLauncherBrowserHost,
   inspectLauncherBrowserHostLiveness,
@@ -23,8 +24,53 @@ import {
 } from "../src/launcher-browser-host";
 import type { Browser, BrowserContext, Page } from "playwright-core";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
+import { retryTimedOutChatGptPageRebind } from "../src/adapters/chatgpt-web/browser-worker";
 
 const roots: string[] = [];
+
+test("launcher activity follows actual send callbacks and current-turn tool counts", async () => {
+  const messages: Array<{ phase: string; progress?: { stage: string; activeToolCalls: number } }> = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    const message = await request.json() as typeof messages[number];
+    messages.push(message);
+    return Response.json(message.phase === "start"
+      ? { surfaceId: "a".repeat(32), reused: false, connectorBound: false }
+      : { cancelledByUser: false });
+  } });
+  const waitForStage = async (stage: string) => {
+    const deadline = Date.now() + 1_000;
+    while (!messages.some(message => message.progress?.stage === stage) && Date.now() < deadline) await Bun.sleep(5);
+    expect(messages.some(message => message.progress?.stage === stage)).toBeTrue();
+  };
+  let activeToolCalls = 0;
+  let activated = 0;
+  let submitted = 0;
+  try {
+    const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+      config: { browserHost: "launcher", browserHostDescriptorPath: descriptorFile(`http://127.0.0.1:${server.port}`) },
+      runBrowserTurn: async (turn: { onSendActivated(): Promise<void>; onSubmitted(): Promise<void> }) => {
+        await waitForStage("preparing");
+        await turn.onSendActivated();
+        await waitForStage("sending");
+        activeToolCalls = 2;
+        await turn.onSubmitted();
+        await waitForStage("chatgpt");
+        return "done";
+      },
+    });
+    await expect(worker.runExclusive({
+      traceId: "activity-fixture", capabilities: { localToolsEnabled: true },
+      externalProgress: { snapshot: () => ({ activeToolCalls }) },
+      onSendActivated: () => { activated++; }, onSubmitted: () => { submitted++; },
+    })).resolves.toBe("done");
+    expect(messages.filter(message => message.progress).map(message => message.progress)).toEqual([
+      { stage: "preparing", activeToolCalls: 0 }, { stage: "sending", activeToolCalls: 0 },
+      { stage: "chatgpt", activeToolCalls: 2 },
+    ]);
+    expect(messages.at(-1)?.phase).toBe("end");
+    expect([activated, submitted]).toEqual([1, 1]);
+  } finally { server.stop(true); }
+});
 
 test("a blocked sign-in replaces an opaque navigation abort with a non-retryable session error", async () => {
   let needsSignIn: unknown = true;
@@ -463,6 +509,24 @@ test("launcher page selection is not blocked by an unrelated page whose CDP sess
   expect(Date.now() - startedAt).toBeLessThan(150);
   await new Promise(resolve => setTimeout(resolve, 250));
   expect(lateDetaches).toBe(1);
+});
+
+test("busy owned target inspection retries the same surface after the first deadline", async () => {
+  const descriptor = readLauncherBrowserHostDescriptor(descriptorFile());
+  const ownedPage = { url: () => LAUNCHER_BROWSER_IDLE_URL } as unknown as Page;
+  const context = nativeTargetContext([ownedPage], () => "native-owned-target");
+  let attempts = 0;
+  let cleaned = false;
+  let firstFailure: unknown;
+  const result = await retryTimedOutChatGptPageRebind(async () => {
+    attempts++;
+    if (attempts > 1) expect(cleaned).toBeTrue();
+    const browser = { contexts: () => attempts === 1 ? [] : [context] } as unknown as Browser;
+    return selectLauncherPage(browser, descriptor, 1);
+  }, { onRetry: error => { firstFailure = error; cleaned = true; } });
+  expect(firstFailure).toBeInstanceOf(LauncherBrowserSurfaceTimeoutError);
+  expect(attempts).toBe(2);
+  expect(result.page).toBe(ownedPage);
 });
 
 test("launcher page selection rejects duplicated native target ownership", async () => {

@@ -37,13 +37,19 @@ function constrainBrowserBounds(bounds, contentSize) {
   };
 }
 
+// ChatGPT can temporarily use the entire transported request as its page title.
+// Never send that unbounded text into the launcher renderer/native title surface.
+function boundedBrowserTitle(value) {
+  return typeof value === "string" && value.length <= 160 && value.trim() ? value.trim() : "ChatGPT";
+}
+
 function readBrowserNavigationState(contents, fallback, { readPageTitle = true } = {}) {
   if (!contents || contents.isDestroyed()) return { ...fallback };
   const history = contents.navigationHistory;
   return {
     ...fallback,
     url: contents.getURL() || fallback.url,
-    title: readPageTitle ? contents.getTitle() || fallback.title || "ChatGPT" : fallback.title || "ChatGPT",
+    title: readPageTitle ? boundedBrowserTitle(contents.getTitle() || fallback.title) : fallback.title || "ChatGPT",
     loading: contents.isLoading(),
     canGoBack: history.canGoBack(),
     canGoForward: history.canGoForward(),
@@ -64,6 +70,7 @@ function navigateBrowser(contents, action) {
 }
 
 module.exports = {
+  boundedBrowserTitle,
   browserViewVisible,
   constrainBrowserBounds,
   navigateBrowser,

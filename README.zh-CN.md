@@ -2,10 +2,10 @@
 >
 > 上游：**[miuuyy/codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web)** —— 想用原版请去那边，安装包、各平台发布和支持都在上游。
 >
-> 这个 fork 只为一种上游明确不支持的部署而存在：**桥跑在与 Codex 不同的机器上**，并且同时驱动多个启动器浏览器。这里的改动都是为这个形态做的，其中几个补丁正是因此被上游拒绝。
+> 这个 fork 只为一种上游明确不支持的部署而存在：**桥跑在与 Codex 不同的机器上**，使用一个启动器浏览器承载五个并发任务标签页。这里的改动都是为这个形态做的，其中几个补丁正是因此被上游拒绝。
 >
 > - **差异说明：**[这个 fork 改了什么](#what-this-fork-changes)
-> - **发布：** 标签形如 `mars-vX.Y.Z`（上游是 `vX.Y.Z`）。最新：**[mars-v1.0.0](https://github.com/longbiaochen/codex-chatgpt-web/releases/tag/mars-v1.0.0)**，基于上游 v5.0.8。
+> - **发布：** 标签形如 `mars-vX.Y.Z`（上游是 `vX.Y.Z`）。历史发布：**[mars-v1.0.0](https://github.com/longbiaochen/codex-chatgpt-web/releases/tag/mars-v1.0.0)**，基于上游 v5.0.8。
 > - **这里没有安装包。** 发布里只有两个运行时产物（`cli.js`、`browser-helper.cjs`）：先从上游装好应用，再把这两个文件换进去。
 > - 与该部署无关的通用修复会提给上游，其余留在 `mars-5.0.8` 分支。
 
@@ -14,13 +14,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.3/codex-web-gpt-6.1.3-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.3/codex-web-gpt-6.1.3-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.3/codex-web-gpt-6.1.3-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.6/codex-web-gpt-6.1.6-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.6/codex-web-gpt-6.1.6-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.6/codex-web-gpt-6.1.6-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.3/codex-web-gpt-6.1.3-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">所有版本</a>
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.6/codex-web-gpt-6.1.6-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">所有版本</a>
 </p>
 
 <p align="center">
@@ -45,16 +45,15 @@
 
 ## 这个 fork 改了什么
 
-基于上游 **v5.0.8**。一个桥进程服务多个启动器浏览器，每个浏览器有自己的 ChatGPT 连接器和隧道。
+基于上游 **v6.1.4**。一个桥进程服务一个启动器浏览器，只使用一个 ChatGPT 连接器和隧道。标签页容量与全局并发均为 **5**，超额请求在桥内排队，限流冷却和请求预算继续生效。满位时，新自动任务可回收最久未使用的已完成自动会话标签；运行中、手动保留和待认证会话不受影响。
 
 ### 架构
 
 | 改动 | 为什么 |
 | --- | --- |
-| **浏览器宿主池** —— 一个桥、多个启动器浏览器；回合分给进行中最少的宿主，保留对话固定在拥有其标签页的那个启动器 | 同一个 Chromium 里，一个渲染进程在吞大提示词时会拖住其他回合的 CDP 连接与重绑 |
-| **每宿主独立的连接器名** —— 每个池成员 @ 自己的连接器，各走各的隧道 | OpenAI 在同一条隧道上一次只下发一个工具调用；没有这一步，并发回合会互相排队 |
-| **宿主故障回落** —— 主启动器与池成员一视同仁地校验，浏览器 helper 从任一存活启动器启动 | 以前主启动器一停，所有回合都失败，哪怕池里还有活着的成员 |
-| **`CODEX_WEB_GPT_BROWSER_HOST_ONLY=1`** —— 启动器只承载浏览器，隐藏安装步骤、Codex 重启提示和 MCP 入口 | 池成员没有自己的配置，它显示的安装向导只可能失败 |
+| **单浏览器宿主** —— 一个 descriptor、一个 connector、一条 tunnel，最多五个并发任务标签页 | 移除宿主选择、connector 槽位路由和多套登录状态 |
+| **账号级准入** —— 第六个任务排队，并保留请求预算与冷却 | 限制同时进展的任务数，避免发送后重放提示词 |
+| **`CODEX_WEB_GPT_BROWSER_HOST_ONLY=1`** —— 浏览器启动器与独立桥进程配合 | 将浏览器所有权与远程桥的配置分离 |
 
 ### 修复
 
@@ -69,9 +68,9 @@
 
 ### 状态
 
-在一台主机上长期运行：3 轮 × 3 并发回合，9/9 通过，零重绑、零限流。`bun test`：1050 通过，另有 2 个启动器本地化测试在干净的上游检出上同样失败。
+部署使用单一浏览器宿主，已移除多宿主池和槽位调度。并发容量为 5；这不会改变 ChatGPT 账号的使用额度，长期吞吐取决于账号限制和任务负载。
 
-没有打包、没有支持，也没在 Windows 和 macOS 上测过——它就是一套恰好值得公开的 Linux 部署。关于宿主池的 issue 和 PR 欢迎提；关于应用本身的请去上游。
+本 fork 面向 Linux 远程部署，通用安装包与应用支持请使用上游。
 
 ## 开始使用
 

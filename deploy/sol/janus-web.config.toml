@@ -1,0 +1,12 @@
+# codex-ops: intentional-profile
+# Sol Codex -> Janus over trusted office LAN -> Janus Codex Web GPT loopback proxy.
+model = "chatgpt-web/high"
+model_provider = "janus_web"
+model_reasoning_effort = "high"
+
+[model_providers.janus_web]
+name = "Janus Codex Web GPT"
+base_url = "http://192.168.110.130:17841/v1"
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = false

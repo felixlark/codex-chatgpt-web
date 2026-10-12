@@ -1,0 +1,14 @@
+[Unit]
+Description=Loopback-only VNC for Codex Web GPT instance %i
+After=cwg-xvfb@%i.service
+Requires=cwg-xvfb@%i.service
+
+[Service]
+User=longbiao
+EnvironmentFile=/etc/codex-web-gpt/%i.env
+ExecStart=/usr/bin/x11vnc -display :${CWG_DISPLAY} -localhost -forever -shared -nopw -rfbport ${CWG_VNC_PORT}
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

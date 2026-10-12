@@ -1,4 +1,3 @@
-import { clearLauncherHostAffinity, launcherSlot, selectLauncherHost } from "../src/adapters/chatgpt-web/launcher-host-pool";
 import { selectedSkillFile } from "../src/adapters/chatgpt-web/skill-attachments";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -7,6 +6,7 @@ import { join } from "node:path";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { LauncherBrowserHelperClient, setSharedAdmissionForTests } from "../src/adapters/chatgpt-web/launcher-helper-client";
 import { ChatGptAdmission, COOLDOWN_MS } from "../src/adapters/chatgpt-web/admission";
+import { chatGptRetainedConversationUsable, resetChatGptRetainedConversationHealthForTests } from "../src/adapters/chatgpt-web/retained-conversation-health";
 import type { BrowserTurn, ResolvedBrowserConfig } from "../src/adapters/chatgpt-web/browser-worker";
 import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
 
@@ -308,13 +308,12 @@ test("launcher helper protocol preserves multipart context and the compaction fl
   });
 });
 
-test("a slot sends its own connector and its browser's descriptor", async () => {
+test("the single launcher sends its configured connector and descriptor", async () => {
   const sent: Record<string, unknown>[] = [];
   const client = new LauncherBrowserHelperClient({
     appName: "Codex Mars Alpha",
     browserHost: "launcher",
     browserHostDescriptorPath: "/durable/alpha.json",
-    browserHostSlots: [launcherSlot("/durable/alpha.json", "Codex Mars Beta")],
     storageStatePath: "/durable/unused-state.json",
     chromeExecutablePath: "/durable/unused-chrome",
     turnTimeoutMs: 60_000,
@@ -349,8 +348,48 @@ test("a slot sends its own connector and its browser's descriptor", async () => 
   })).resolves.toBe("done");
   expect(sent[0]).toMatchObject({
     type: "run",
-    config: { appName: "Codex Mars Beta", browserHostDescriptorPath: "/durable/alpha.json" },
+    config: { appName: "Codex Mars Alpha", browserHostDescriptorPath: "/durable/alpha.json" },
   });
+});
+
+test("one launcher admits five turns across clients and queues the sixth until capacity is released", async () => {
+  setSharedAdmissionForTests(undefined);
+  const sent: Array<{ id: string; client: any; child: object }> = [];
+  const clients = Array.from({ length: 6 }, () => {
+    const client = new LauncherBrowserHelperClient({
+      appName: "Codex Mars Alpha", browserHost: "launcher", browserHostDescriptorPath: "/durable/alpha.json",
+      storageStatePath: "/unused", chromeExecutablePath: "/unused", headed: true,
+      autoApproveToolCalls: false, useSavedChats: false,
+    });
+    const internal = client as any;
+    const child = {};
+    internal.child = child;
+    internal.ensureChild = async () => {};
+    internal.send = async (message: any) => {
+      if (message.type === "run") sent.push({ id: message.id, client: internal, child });
+    };
+    return client;
+  });
+  const runs = clients.map((client, index) => client.run({
+    traceId: `single-host-${index}`, modelId: "chatgpt-web/high",
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+    prepare: async () => ({ text: "test", images: [], release() {} }), onTextDelta() {},
+  }));
+  const finish = (entry: typeof sent[number]) => entry.client.handleLine(entry.child,
+    JSON.stringify({ type: "result", id: entry.id, text: "done" }));
+  try {
+    await Bun.sleep(20);
+    expect(sent).toHaveLength(5);
+    finish(sent[0]!);
+    await runs[0];
+    await Bun.sleep(20);
+    expect(sent).toHaveLength(6);
+    for (const entry of sent.slice(1)) finish(entry);
+    expect(await Promise.all(runs)).toEqual(Array(6).fill("done"));
+  } finally {
+    for (const entry of sent) finish(entry);
+    setSharedAdmissionForTests(undefined);
+  }
 });
 
 test("an abort dispatched during run submission cannot overtake the run frame", async () => {
@@ -518,7 +557,7 @@ describe("admission requeue on a throttle", () => {
     }, undefined, undefined, 0);
     const internal = client as unknown as {
       ensureChild(): Promise<void>;
-      runAdmitted(turn: { onSubmitted?: () => void }, onHost?: (host: string) => void): Promise<string>;
+      runAdmitted(turn: { onSubmitted?: () => void; onSendActivated?: () => void | Promise<void> }, onHost?: (host: string) => void): Promise<string>;
     };
     internal.ensureChild = async () => {};
     return {
@@ -552,6 +591,25 @@ describe("admission requeue on a throttle", () => {
     expect(attempts).toBe(2);
   });
 
+  test("a lost retained compaction connector returns directly to canonical-history fallback", async () => {
+    const { client, internal, admission } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async () => {
+      attempts += 1;
+      throw new Error("ChatGPT retained conversation lost its connector");
+    };
+    try {
+      await expect(client.run({ ...turn(), threadId: "lost-compaction-connector", requireRetainedConversation: true } as never))
+        .rejects.toMatchObject({ code: "compaction_source_unavailable", retryable: false });
+      expect(attempts).toBe(1);
+      expect(chatGptRetainedConversationUsable("lost-compaction-connector")).toBeFalse();
+      expect(chatGptRetainedConversationUsable("unrelated-thread")).toBeTrue();
+      expect(admission.snapshot().cooldownUntil).toBe(0);
+    } finally {
+      resetChatGptRetainedConversationHealthForTests();
+    }
+  });
+
   test("page failures before submission are retried (twelve times at most), without a cooldown", async () => {
     const { client, internal, admission } = gatedClient();
     let attempts = 0;
@@ -573,6 +631,43 @@ describe("admission requeue on a throttle", () => {
     };
     await expect(fresh.client.run(turn() as never)).rejects.toThrow("login is expired");
     expect(always).toBe(13);                             // first try + 12 retries
+  });
+
+  test("missing composer before Send retries with its admission refunded", async () => {
+    const { client, internal, admission } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async () => {
+      if (++attempts === 1) throw new Error("ChatGPT composer is unavailable. Reload ChatGPT and retry the task.");
+      return "done";
+    };
+    expect(await client.run(turn() as never)).toBe("done");
+    expect(attempts).toBe(2);
+    expect(admission.snapshot().recent60).toBe(1);
+    expect(admission.snapshot().cooldownUntil).toBe(0);
+  });
+
+  test("missing composer after Send is not replayed", async () => {
+    const { client, internal } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async (observed) => {
+      attempts++;
+      await observed.onSendActivated?.();
+      throw new Error("ChatGPT composer is unavailable. Reload ChatGPT and retry the task.");
+    };
+    await expect(client.run(turn() as never)).rejects.toThrow("composer is unavailable");
+    expect(attempts).toBe(1);
+  });
+
+  test("verified guest landing authentication failure is returned once, not replayed as a broken composer", async () => {
+    const { client, internal } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async () => {
+      attempts++;
+      throw new ChatGptWebAdapterError("ChatGPT requested sign-in. Open sign in in the launcher, then retry.",
+        { status: 401, errorType: "authentication_error", code: "chatgpt_sign_in_required", retryable: false });
+    };
+    await expect(client.run(turn() as never)).rejects.toMatchObject({code:'chatgpt_sign_in_required',retryable:false});
+    expect(attempts).toBe(1);
   });
 
   test("the 6.1 wording of the expired-login failure is still retried before submission", async () => {
@@ -610,43 +705,6 @@ describe("admission requeue on a throttle", () => {
     expect(always).toBe(37);                             // first try + 36 waits (three hours on Mars)
   });
 
-  test("a signed-out browser takes every slot it hosts out of new turns, not just the one that failed", async () => {
-    // Mars, 2026-09-26: three slots share alpha's login, and each round of retries tried all three.
-    clearLauncherHostAffinity();
-    const alphaA = launcherSlot("/durable/alpha.json", "Codex Mars Alpha");
-    const alphaB = launcherSlot("/durable/alpha.json", "Codex Mars Beta");
-    const other = launcherSlot("/durable/other.json", "Codex Mars Gamma");
-    setSharedAdmissionForTests(new ChatGptAdmission({ maxConcurrent: 3, log: () => {} }));
-    const client = new LauncherBrowserHelperClient({
-      appName: "Codex Mars Alpha", browserHost: "launcher", browserHostDescriptorPath: "/durable/alpha.json",
-      browserHostSlots: [alphaA, alphaB, other],
-      storageStatePath: "/durable/unused.json", chromeExecutablePath: "/durable/chrome", headed: true, autoApproveToolCalls: false,
-      useSavedChats: false,
-    } as ResolvedBrowserConfig, undefined, undefined, 0);
-    const internal = client as unknown as {
-      ensureChild(): Promise<void>;
-      runAdmitted(turn: unknown, onHost?: (host: string) => void): Promise<string>;
-    };
-    internal.ensureChild = async () => {};
-    let attempts = 0;
-    internal.runAdmitted = async (_turn, onHost) => {
-      attempts += 1;
-      onHost?.(alphaA);
-      if (attempts === 1) throw new Error("ChatGPT web is signed out: the browser was sent to the ChatGPT login page.");
-      return "done";
-    };
-    const warn = spyOn(console, "warn").mockImplementation(() => {});
-    try {
-      expect(await client.run(turn() as never)).toBe("done");
-    } finally {
-      warn.mockRestore();
-    }
-    expect(selectLauncherHost({
-      primary: alphaA, pool: [alphaB, other], activeTurns: () => 0, read: () => ({}),
-    })).toBe(other);
-    clearLauncherHostAffinity();
-  });
-
   test("a host still refreshing its session after a bridge restart is retried with the slot refunded", async () => {
     // Seen on Mars right after a restart: four turns failed with this before any prompt was sent,
     // were not retried, and each kept its admission slot, filling the 60-minute window.
@@ -662,6 +720,30 @@ describe("admission requeue on a throttle", () => {
     expect(await client.run(turn() as never)).toBe("done");
     expect(attempts).toBe(2);
     expect(admission.snapshot().recent60).toBe(1);
+  });
+
+  test("session inspection contention refunds an unsent turn and retries after release", async () => {
+    const { client, internal, admission } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async () => {
+      if (++attempts === 1) throw new Error("Launcher browser control channel failed: HTTP 400: ChatGPT browser is busy with session inspection");
+      return "done";
+    };
+    expect(await client.run(turn() as never)).toBe("done");
+    expect(attempts).toBe(2);
+    expect(admission.snapshot().recent60).toBe(1);
+  });
+
+  test("session inspection contention after send must never replay the turn", async () => {
+    const { client, internal } = gatedClient();
+    let attempts = 0;
+    internal.runAdmitted = async (observed) => {
+      attempts++;
+      await observed.onSendActivated?.();
+      throw new Error("Launcher browser control channel failed: HTTP 400: ChatGPT browser is busy with session inspection");
+    };
+    await expect(client.run(turn() as never)).rejects.toThrow("busy with session inspection");
+    expect(attempts).toBe(1);
   });
 
   test("a page that does not load before submission is retried instead of blocking the goal", async () => {
@@ -747,12 +829,14 @@ describe("unresponsive helper watchdog", () => {
     }, 5 * 60_000, () => now.value);
     const internal = created as unknown as {
       pending: Map<string, unknown>;
+      releaseUnresponsiveTurn(id: string): Promise<void>;
       send(message: Record<string, unknown>): Promise<void>;
       handleLine(child: unknown, line: string): void;
       child: unknown;
     };
     const sent: Record<string, unknown>[] = [];
     internal.send = async message => { sent.push(message); };
+    internal.releaseUnresponsiveTurn = async id => { sent.push({ type: "release", id }); };
     return { created, internal, sent };
   }
   const pendingTurn = (resolve: (v: string) => void, reject: (e: Error) => void, lastHelperEventAt: number) => ({
@@ -779,6 +863,28 @@ describe("unresponsive helper watchdog", () => {
     expect(error).toMatchObject({ code: "chatgpt_page_unresponsive", retryable: true });
     // The cause travels with the abort so the turn's error names it rather than reading generic.
     expect(sent).toContainEqual({ type: "abort", id: "stuck-1", cause: "the ChatGPT page stopped responding" });
+    expect(sent).toContainEqual({ type: "release", id: "stuck-1" });
+  });
+
+  test("watchdog retains occupancy until exact surface release completes", async () => {
+    const now = { value: 1_000_000 };
+    const { created, internal } = client(now);
+    let released!: () => void;
+    let calls = 0;
+    internal.releaseUnresponsiveTurn = async () => {
+      calls += 1;
+      await new Promise<void>(resolve => { released = resolve; });
+    };
+    const result = new Promise<string>((resolve, reject) => internal.pending.set("stuck-1", pendingTurn(resolve, reject, now.value)))
+      .catch(error => error);
+    now.value += 301_000;
+    created.checkUnresponsiveTurns();
+    created.checkUnresponsiveTurns();
+    expect(calls).toBe(1);
+    expect(internal.pending.has("stuck-1")).toBe(true);
+    released();
+    expect(await result).toBeInstanceOf(ChatGptWebAdapterError);
+    expect(internal.pending.has("stuck-1")).toBe(false);
   });
 
   test("helper heartbeats keep a long turn alive", () => {

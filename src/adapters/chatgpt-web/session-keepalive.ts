@@ -1,16 +1,7 @@
 import { inspectLauncherBrowserHost } from "../../launcher-browser-host";
-import { markLauncherHostBusy } from "./launcher-host-pool";
+import { markLauncherHostBusy } from "./launcher-host-activity";
 
-/**
- * Browser hosts lose their ChatGPT session between turns, and nothing notices until a turn fails:
- * on Mars two of three hosts were signed out for hours while goals kept being blocked. A host that
- * is only touched when a turn needs it also lets its Cloudflare clearance go stale, so the next
- * turn walks into a challenge no one is there to answer.
- *
- * So touch every idle host on a slow timer. The launcher's own inspection reloads the ChatGPT home
- * document and reports whether the session is still signed in, which both keeps the session warm
- * and turns "signed out" into something the console can show before a goal pays for it.
- */
+/** Refresh the idle launcher's session and report sign-out before a task needs the browser. */
 export const KEEPALIVE_INTERVAL_MS = 20 * 60_000;
 /** Long enough for a reload and the picker, short enough that a host is never held for minutes. */
 export const KEEPALIVE_PROBE_TIMEOUT_MS = 60_000;
@@ -24,7 +15,7 @@ export interface ChatGptKeepAliveRecord {
 }
 
 export interface ChatGptKeepAliveOptions {
-  /** Descriptor paths of the hosts to keep warm; re-read each round so a pool change is picked up. */
+  /** Descriptor paths of the hosts to keep warm; resolved from the configured single launcher. */
   hosts: () => readonly string[];
   /** A host running a turn is warm already, and must not be disturbed. */
   busy: (host: string) => boolean;
@@ -64,7 +55,7 @@ export class ChatGptSessionKeepAlive {
       // The inspection holds the launcher's operation lock while it reloads the home document, so
       // a turn admitted onto the same host mid-check cannot reach its page (seen on Mars: two CDP
       // rebinds timed out and a goal was blocked). Count as a turn for the duration, which both
-      // keeps selection away from this host and ends the check with a bounded timeout.
+      // lets the keep-alive see activity and ends the check with a bounded timeout.
       const release = markLauncherHostBusy(host);
       try {
         await inspectLauncherBrowserHost(host, { detectCapabilities: true, timeoutMs: KEEPALIVE_PROBE_TIMEOUT_MS });

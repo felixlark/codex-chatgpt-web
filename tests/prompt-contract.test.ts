@@ -64,7 +64,7 @@ test("Full-mode Pro prompts pass one stable turn token directly to native action
   expect(envelopeEnd).toBeGreaterThan(0);
   expect(resume).toBeGreaterThan(envelopeEnd);
   expect(tokenMatches).toHaveLength(1);
-  expect(compiled.text).toContain("[retired turn handle]");
+  expect(JSON.stringify(JSON.parse(compiled.text.split("<codex_context_json>\n")[1]!.split("\n</codex_context_json>")[0]!))).toContain("[retired turn handle]");
   expect(transportOnly).toContain("For local work required by the task, use the attached Codex Native tools directly according to their declared descriptions and schemas.");
   expect(transportOnly).toContain("Call a Codex Native tool only when the latest active request requires a local effect or fresh local evidence that is not already present in the supplied context; otherwise answer the request directly without a tool call.");
   expect(transportOnly).toContain("Use actual Codex Native results as evidence for local observations and effects.");
@@ -355,7 +355,7 @@ test("Bigger Context compaction preserves history above the retired inline byte 
   }
 }, 30_000);
 
-test("Bigger Context minimizes the largest ordered stage instead of overfilling a middle part", () => {
+test("Bigger Context keeps preliminary parts small and preserves all records in order", () => {
   const compact = request("high");
   compact._compactionRequest = true;
   compact.context.systemPrompt = ["system".repeat(1_000)];
@@ -378,7 +378,9 @@ test("Bigger Context minimizes the largest ordered stage instead of overfilling 
 
   expect(parts).toHaveLength(6);
   expect(parts.flatMap(part => part.records)).toHaveLength(8);
-  expect(Math.max(...multipart.multipart!.parts.map(part => part.length))).toBeLessThan(120_000);
+  expect(Math.max(...multipart.multipart!.parts.slice(0, -1).map(part => part.length))).toBeLessThan(120_000);
+  // The selected High mode can carry a larger final part than an Instant upload.
+  expect(multipart.multipart!.parts.at(-1)!.length).toBeLessThan(1_048_572);
 });
 
 test("Web compaction rebuilds attachments after trimming an oversized oldest image message", () => {
@@ -592,8 +594,8 @@ test("the replayed context never carries a finished turn's broker handles", () =
 
   expect(compiled.text).not.toContain(staleToken);
   expect(compiled.text).not.toContain(staleBinding);
-  expect(compiled.text).toContain("[retired turn handle]");
-  expect(compiled.text).toContain("[retired binding handle]");
+  expect(JSON.stringify(JSON.parse(compiled.text.split("<codex_context_json>\n")[1]!.split("\n</codex_context_json>")[0]!))).toContain("[retired turn handle]");
+  expect(JSON.stringify(JSON.parse(compiled.text.split("<codex_context_json>\n")[1]!.split("\n</codex_context_json>")[0]!))).toContain("[retired binding handle]");
   expect(compiled.text).toContain(token);
   expect(compiled.text).toContain("keep working");
   const envelope = compiled.text.split("<codex_context_json>")[1]!.split("</codex_context_json>")[0]!.trim();

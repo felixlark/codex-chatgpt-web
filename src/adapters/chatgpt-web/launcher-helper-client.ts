@@ -1,11 +1,13 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { noteChatGptRetainedConnectorLost } from "./retained-conversation-health";
-import { launcherSlotAppName, launcherSlotDescriptor, markLauncherHostBusy, quarantineLauncherHost, readAnyLauncherBrowserHostDescriptor, rememberLauncherHostAffinity, selectLauncherHost, usableLauncherHostCount } from "./launcher-host-pool";
+import { markLauncherHostBusy } from "./launcher-host-activity";
+import { readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
+import { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
 import { existsSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { notifyLauncherTurn } from "../../launcher-browser-host";
-import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
+import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError, chatGptRetainedConversationUnavailableError } from "./adapter-error";
 import { ChatGptAdmission, isChatGptRateLimitError } from "./admission";
 import { getConfigDir } from "../../config";
 import type { CompiledChatGptWebPrompt } from "./prompt";
@@ -191,6 +193,11 @@ function parseHelperMessage(line: string): HelperMessage {
 
 let admissionSingleton: ChatGptAdmission | undefined;
 
+/** Read-only account metrics; health checks never instantiate or reset admission. */
+export function chatGptAdmissionSnapshot() {
+  return admissionSingleton?.snapshot();
+}
+
 /** Tests only: swap in a gate with a controllable clock (undefined restores the default). */
 export function setSharedAdmissionForTests(admission: ChatGptAdmission | undefined): void {
   admissionSingleton = admission;
@@ -227,7 +234,10 @@ function isChatGptSignedOutError(error: unknown): boolean {
 
 function isChatGptSurfaceUnavailableError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /login is expired or the (?:Temporary Chat|new chat) surface is unavailable|could not load the account subscription|personalization preflight exceeded its readiness deadline|retained conversation lost its connector|page\.goto: net::ERR_ABORTED|page\.goto: Timeout \d+ms exceeded|browser stage timed out: (?:browser_page|temporary_chat_preparation)\b|model controls are unavailable|connector menu (?:did not open|opened but exposed no row)|dropped the connector before the prompt was sent|locator\.waitFor: Timeout|browser is busy with session refresh/i
+  // Hydration may leave the new-chat page without its editor. Only the caller's
+  // unsent fence may retry this; after Send the outcome must never be replayed.
+  if (/ChatGPT composer is unavailable\./i.test(message)) return true;
+  return /login is expired or the (?:Temporary Chat|new chat) surface is unavailable|could not load the account subscription|personalization preflight exceeded its readiness deadline|retained conversation lost its connector|page\.goto: net::ERR_ABORTED|page\.goto: Timeout \d+ms exceeded|browser stage timed out: (?:browser_page|temporary_chat_preparation)\b|model controls are unavailable|connector menu (?:did not open|opened but exposed no row)|dropped the connector before the prompt was sent|locator\.waitFor: Timeout|browser is busy with session (?:refresh|inspection)/i
     .test(message);
 }
 
@@ -245,30 +255,14 @@ function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 /**
- * Where turns can go: the configured slots, or else the legacy primary descriptor plus pool hosts.
- * Every entry is a slot key (see launcher-host-pool); a bare descriptor is a legacy whole host.
- */
-function launcherHostCandidates(config: ResolvedBrowserConfig): { primary: string; pool: string[] } | undefined {
-  if (config.browserHostSlots?.length) {
-    return { primary: config.browserHostSlots[0]!, pool: config.browserHostSlots.slice(1) };
-  }
-  return config.browserHostDescriptorPath
-    ? { primary: config.browserHostDescriptorPath, pool: config.browserHostPool ?? [] }
-    : undefined;
-}
-
-/**
  * One admission gate per bridge process: the account, not a client instance, is what throttles.
  * CODEX_CHATGPT_WEB_ADMISSION=off bypasses it without a rollback; tests never persist its state.
  */
-function sharedAdmission(config: ResolvedBrowserConfig): ChatGptAdmission | undefined {
+function sharedAdmission(): ChatGptAdmission | undefined {
   if (process.env.CODEX_CHATGPT_WEB_ADMISSION === "off") return undefined;
   admissionSingleton ??= new ChatGptAdmission({
     ...(process.env.NODE_ENV === "test" ? {} : { statePath: join(getConfigDir(), "runtime", "chatgpt-admission.json") }),
-    maxConcurrent: () => {
-      const hosts = launcherHostCandidates(config);
-      return hosts ? usableLauncherHostCount(hosts.primary, hosts.pool) : 1 + (config.browserHostPool?.length ?? 0);
-    },
+    maxConcurrent: MAX_CHATGPT_BROWSER_TABS,
   });
   return admissionSingleton;
 }
@@ -299,16 +293,35 @@ export class LauncherBrowserHelperClient {
   checkUnresponsiveTurns(): void {
     const now = this.now();
     for (const [id, pending] of this.pending) {
-      if (!pending.sent || pending.lastHelperEventAt === undefined) continue;
+      if (!pending.sent || pending.lastHelperEventAt === undefined || this.releasingUnresponsive.has(id)) continue;
       if (now - pending.lastHelperEventAt < this.unresponsiveAfterMs) continue;
       console.warn(`[chatgpt-web] browser turn ${id} unresponsive for `
         + `${Math.round((now - pending.lastHelperEventAt) / 1000)}s on ${pending.host ?? "the browser host"}: aborting`);
       void this.send({ type: "abort", id, cause: "the ChatGPT page stopped responding" }).catch(() => {});
-      this.finishWithError(id, new ChatGptWebAdapterError(
+      const failure = new ChatGptWebAdapterError(
         "The ChatGPT page stopped responding during the turn. It was stopped so it can run again.",
         { status: 504, errorType: "server_error", code: "chatgpt_page_unresponsive", retryable: true },
-      ));
+      );
+      // A wedged renderer cannot reach the worker's finally block. Release its
+      // exact launcher-owned surface before returning capacity to admission.
+      this.releasingUnresponsive.add(id);
+      void this.releaseUnresponsiveTurn(id).then(() => {
+        if (this.pending.get(id) === pending) this.finishWithError(id, failure);
+      }).catch(error => {
+        console.warn(`[chatgpt-web] failed to release unresponsive turn ${id}: ${String(error).slice(0, 180)}`);
+      }).finally(() => this.releasingUnresponsive.delete(id));
     }
+  }
+
+  private readonly releasingUnresponsive = new Set<string>();
+
+  private async releaseUnresponsiveTurn(id: string): Promise<void> {
+    const helperPid = this.child?.pid;
+    if (!helperPid) throw new Error("Cannot release surface without its owning helper PID");
+    await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
+      phase: "end", traceId: id, helperPid, status: "failed", retain: false,
+      message: "The ChatGPT page stopped responding during the turn",
+    });
   }
 
   private watchUnresponsiveTurns(): void {
@@ -355,8 +368,8 @@ export class LauncherBrowserHelperClient {
         "Launcher browser helper does not support the MCP completion fence; update or restart the launcher",
       );
     }
-    // Every pool host drives the same ChatGPT account; pace the account before picking a host.
-    const admission = sharedAdmission(this.config);
+    // All task tabs share the account; pace requests before dispatching a turn.
+    const admission = sharedAdmission();
     if (!admission) return await this.runAdmitted(turn);
     let submitted = false;
     let sendActivated = false;
@@ -378,9 +391,8 @@ export class LauncherBrowserHelperClient {
     // blocked for the rest of the throttle.
     let surfaceRetries = 0;
     let signedOutRetries = 0;
-    let lastHost: string | undefined;
     for (let requeues = 0; ; requeues += 1) {
-      const release = await admission.acquire(turn.conversationKey ?? turn.traceId, turn.traceId, turn.abortSignal, {
+      const release = await admission.acquire(turn.threadId ?? turn.conversationKey ?? turn.traceId, turn.traceId, turn.abortSignal, {
         ...(turn.threadId ? { threadId: turn.threadId } : {}),
         model: turn.modelId,
       });
@@ -389,7 +401,6 @@ export class LauncherBrowserHelperClient {
       let refund = false;
       try {
         return await this.runAdmitted(observed, host => {
-          lastHost = host;
           admission.noteHost(turn.traceId, host);
         });
       } catch (error) {
@@ -404,33 +415,22 @@ export class LauncherBrowserHelperClient {
         } else if (isChatGptSignedOutError(error)) {
           signedOutRetries += 1;
           requeue = unsent && signedOutRetries <= MAX_SIGNED_OUT_RETRIES;
-          // Every slot of that browser shares its one login, so they are all out until it is back.
-          const candidates = launcherHostCandidates(this.config);
-          if (lastHost && candidates && candidates.pool.length > 0) {
-            const descriptor = launcherSlotDescriptor(lastHost);
-            const slots = [candidates.primary, ...candidates.pool].filter(slot => launcherSlotDescriptor(slot) === descriptor);
-            for (const slot of slots) quarantineLauncherHost(slot);
-            console.warn(`[chatgpt-web] launcher browser ${descriptor} is signed out; its ${slots.length} slot(s) `
-              + "left out of new turns for 10 minutes. Sign it in to ChatGPT again");
-          }
           refund = unsent;
         } else if (isChatGptSurfaceUnavailableError(error)) {
           if (/retained conversation lost its connector/i.test(
             error instanceof Error ? error.message : String(error),
-          )) noteChatGptRetainedConnectorLost(turn.threadId);
+          )) {
+            noteChatGptRetainedConnectorLost(turn.threadId);
+            if (unsent && turn.requireRetainedConversation) {
+              // This exact retained source cannot acquire tools. Let its compaction owner
+              // rebuild once from canonical history instead of re-leasing a doomed source.
+              refund = true;
+              throw chatGptRetainedConversationUnavailableError();
+            }
+          }
           // The turn never reached ChatGPT, so run it again (no account cooldown).
           surfaceRetries += 1;
           requeue = unsent && surfaceRetries <= MAX_SURFACE_RETRIES;
-          // A retained chat losing its connector is ChatGPT's per-message binding, not a host fault.
-          // A host refreshing its session after a restart is busy for seconds, not broken.
-          const hostFault = !/retained conversation lost its connector|browser is busy with session refresh/i.test(
-            error instanceof Error ? error.message : String(error),
-          );
-          if (hostFault && lastHost && (launcherHostCandidates(this.config)?.pool.length ?? 0) > 0) {
-            quarantineLauncherHost(lastHost);
-            console.warn(`[chatgpt-web] launcher host ${lastHost} failed before submission; `
-              + "left out of new turns for 10 minutes");
-          }
           refund = unsent;                  // nothing reached ChatGPT: give the slot back
         }
         if (!requeue && isChatGptRateLimitError(error) && !unsent) {
@@ -463,21 +463,11 @@ export class LauncherBrowserHelperClient {
           rejectResult(new Error(`Duplicate launcher browser turn: ${turn.traceId}`));
           return;
         }
-        const candidates = launcherHostCandidates(this.config)!;
-        const host = selectLauncherHost({
-          primary: candidates.primary,
-          pool: candidates.pool,
-          conversationKey: turn.conversationKey,
-          activeTurns: candidate => [...this.pending.values()].filter(item => item.host === candidate).length,
-        });
+        const host = this.config.browserHostDescriptorPath!;
         onHost?.(host);
         const pending: PendingTurn = { turn, resolve: resolveResult, reject: rejectResult, host };
         pending.releaseHost = markLauncherHostBusy(host);
         this.pending.set(turn.traceId, pending);
-        if (turn.retainConversation && turn.conversationKey) rememberLauncherHostAffinity(turn.conversationKey, host);
-        if (candidates.pool.length) {
-          console.info(`[chatgpt-web] browser turn ${turn.traceId} assigned to launcher host ${host}`);
-        }
         if (turn.abortSignal) {
           const abortListener = () => {
             if (!pending.sent) {
@@ -523,11 +513,8 @@ export class LauncherBrowserHelperClient {
           type: "run",
           id: turn.traceId,
           config: {
-            // Each launcher host can have its own connector (and therefore its own tunnel), so a
-            // long tool call in one browser does not queue the tool calls of turns in another.
-            appName: (pending.host && (launcherSlotAppName(pending.host) ?? this.config.browserHostAppNames?.[pending.host]))
-              || this.config.appName,
-            browserHostDescriptorPath: pending.host ? launcherSlotDescriptor(pending.host) : this.config.browserHostDescriptorPath!,
+            appName: this.config.appName,
+            browserHostDescriptorPath: this.config.browserHostDescriptorPath!,
             browserDiagnosticsPath: this.config.browserDiagnosticsPath,
             turnTimeoutMs: this.config.turnTimeoutMs,
             autoApproveToolCalls: this.config.autoApproveToolCalls,
@@ -580,8 +567,7 @@ export class LauncherBrowserHelperClient {
       && this.ready) {
       return this.ready;
     }
-    const candidates = launcherHostCandidates(this.config)!;
-    const descriptor = readAnyLauncherBrowserHostDescriptor(candidates.primary, candidates.pool);
+    const descriptor = readLauncherBrowserHostDescriptor(this.config.browserHostDescriptorPath!);
     const child = spawn(
       descriptor.helper.executable,
       [this.config.browserHelperScriptPath ?? this.bundledHelperScript() ?? descriptor.helper.script],
@@ -918,7 +904,7 @@ export class LauncherBrowserHelperClient {
     for (const id of [...this.pending.keys()]) {
       const pending = this.pending.get(id);
       if (!pending) continue;
-      void notifyLauncherTurn(pending.host ? launcherSlotDescriptor(pending.host) : this.config.browserHostDescriptorPath!, {
+      void notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
         phase: "end",
         traceId: id,
         helperPid: child.pid!,

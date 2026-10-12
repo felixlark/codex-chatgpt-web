@@ -4,7 +4,7 @@ import type {
   CodexParsedRequest,
   CodexToolResultMessage,
 } from "../../types";
-import { extractChatGptCompactionSourceRevision } from "./environment";
+import { extractChatGptCompactionSourceRevision, extractChatGptTurnIdentity } from "./environment";
 import type { ChatGptBrowserWorker } from "./browser-worker";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
 import type { CompactionTransactionHandle } from "./compaction-transaction";
@@ -129,9 +129,13 @@ function currentToolResults(
 }
 
 export const MAX_COMPACTION_HANDOFF_TIMEOUT_MS = 5 * 60_000;
+export const MAX_PRO_COMPACTION_HANDOFF_TIMEOUT_MS = 30 * 60_000;
 
-function boundedCompactionTimeout(timeoutMs: number): number {
-  return Math.min(timeoutMs, MAX_COMPACTION_HANDOFF_TIMEOUT_MS);
+/** Pro can still be reasoning without answer text after five minutes. Keep a hard
+ * bound, but do not cancel that generation using the non-Pro handoff budget. */
+export function compactionHandoffTimeoutMs(timeoutMs: number | undefined, effort?: string): number {
+  const limit = effort === "max" ? MAX_PRO_COMPACTION_HANDOFF_TIMEOUT_MS : MAX_COMPACTION_HANDOFF_TIMEOUT_MS;
+  return Math.min(timeoutMs ?? limit, limit);
 }
 
 function abortReason(signal: AbortSignal): Error {
@@ -142,7 +146,10 @@ function abortReason(signal: AbortSignal): Error {
 
 function withCompactionAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
-  if (signal.aborted) return Promise.reject(abortReason(signal));
+  if (signal.aborted) {
+    void promise.catch(() => {});
+    return Promise.reject(abortReason(signal));
+  }
   return new Promise<T>((resolve, reject) => {
     const onAbort = () => reject(abortReason(signal));
     signal.addEventListener("abort", onAbort, { once: true });
@@ -282,11 +289,11 @@ export async function requestRetainedCompactionHandoff(
   capabilities: ChatGptWebCapabilities,
   traceId: string,
   signal?: AbortSignal,
-  timeoutMs = MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
+  timeoutMs?: number,
 ): Promise<string> {
   const conversationKey = source.conversationKey();
   if (!conversationKey) throw new Error("The completed ChatGPT source has no retained conversation identity");
-  const operationTimeoutMs = boundedCompactionTimeout(timeoutMs);
+  const operationTimeoutMs = compactionHandoffTimeoutMs(timeoutMs, parsed.options.reasoning);
   const deadline = new AbortController();
   const deadlineTimer = setTimeout(
     () => deadline.abort(new Error(`ChatGPT compaction handoff timed out after ${operationTimeoutMs}ms`)),
@@ -312,10 +319,14 @@ export async function requestRetainedCompactionHandoff(
     transaction = await withCompactionAbort(transactionPromise, operationSignal);
     const instruction = structuredCompactionHandoffInstruction(transaction);
     const prepare = async () => ({ text: instruction, images: [], release: () => {} });
+    const identity = extractChatGptTurnIdentity(parsed);
     browser = worker.run({
       traceId,
+      ...(identity.threadId ? { threadId: identity.threadId } : {}),
       modelId: parsed.modelId,
+      ...(parsed._chatgptModelFamily ? { modelFamily: parsed._chatgptModelFamily } : {}),
       reasoning: parsed.options.reasoning,
+      ...(parsed._chatgptModelFamily ? { modelFamily: parsed._chatgptModelFamily } : {}),
       // The retained connector exposes only the one-shot control token embedded above. It does
       // not receive an ordinary Codex tool environment for this checkpoint message.
       capabilities: { ...capabilities, localToolsEnabled: false },
@@ -324,6 +335,7 @@ export async function requestRetainedCompactionHandoff(
       prepareResume: prepare,
       conversationKey,
       requireRetainedConversation: true,
+      compaction: true,
       abortSignal: browserAbort.signal,
       onTextDelta: () => {},
     });
@@ -465,17 +477,35 @@ export function runStructuredCompactionOnce(
   const promise = Promise.resolve().then(async () => {
     if (previousOwner) await withCompactionAbort(previousOwner, abort.signal);
     if (abort.signal.aborted) throw abortReason(abort.signal);
-    return start(abort.signal, settlement => { physicalSettlements.push(settlement); });
+    try {
+      return await start(abort.signal, settlement => { physicalSettlements.push(settlement); });
+    } catch (error) {
+      // The helper boundary transports ordinary errors as messages. This exact
+      // worker-owned failure has an unknown edit outcome, not a safe retry.
+      if (error instanceof Error && (
+        error.message === "ChatGPT composer edit did not settle; its surface must be retired"
+        || /^ChatGPT composer did not preserve the complete prompt \(expectedChars=\d+, actualChars=\d+, commonPrefixChars=\d+\)$/.test(error.message)
+      )) {
+        throw new ChatGptWebAdapterError(error.message, {
+          status: 409, errorType: "invalid_request_error",
+          code: error.message.startsWith("ChatGPT composer did not preserve")
+            ? "compaction_composer_integrity" : "compaction_composer_edit_unsettled", retryable: false,
+        });
+      }
+      throw error;
+    }
   });
   // Return a deadline failure promptly, while its physical browser owner still blocks retries
   // and cancel-all completion. A cancelled queued run must also retain its predecessor's gate.
-  const ownerSettlement = promise.then(() => false, () => true).then(async failed => {
+  const ownerSettlement = promise.then(() => false, error => !(
+    error instanceof ChatGptWebAdapterError && ["compaction_composer_edit_unsettled", "compaction_composer_integrity"].includes(error.code)
+  )).then(async evict => {
     await Promise.allSettled(physicalSettlements);
     run.active = false;
     if (structuredCompactionOwners.get(owner.ownerKey) === ownerSettlement) {
       structuredCompactionOwners.delete(owner.ownerKey);
     }
-    if (failed && structuredCompactionRuns.get(key) === run) structuredCompactionRuns.delete(key);
+    if (evict && structuredCompactionRuns.get(key) === run) structuredCompactionRuns.delete(key);
   });
   const run: CachedCompactionRun = {
     createdAt: Date.now(),

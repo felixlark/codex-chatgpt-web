@@ -1,0 +1,15 @@
+# codex-ops: intentional-profile
+# Sol Codex -> https://mars.tailbbe133.ts.net:17841 (tailscale serve --tls-terminated-tcp, tailnet-only, direct P2P)
+# -> TCP straight to Mars Codex Web GPT 127.0.0.1:17841 (no HTTP proxy, no injected headers, no nginx).
+# No Cloudflare Access: tailnet membership is the gate. Use `codex --profile mars-ts`.
+model = "chatgpt-web/high"
+model_provider = "mars_ts"
+model_reasoning_effort = "high"
+
+[model_providers.mars_ts]
+name = "Mars Codex Web GPT (Tailscale)"
+base_url = "https://mars.tailbbe133.ts.net:17841/v1"
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = false
+

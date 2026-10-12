@@ -18,6 +18,7 @@ const {
   sweepGapIndicatesSuspension,
 } = require("./turn-suspension.cjs");
 const {
+  boundedBrowserTitle,
   browserViewVisible,
   constrainBrowserBounds,
   navigateBrowser,
@@ -32,7 +33,7 @@ const IDLE_BROWSER_URL = "data:text/html;charset=utf-8,%3C!doctype%20html%3E%3Ch
 const PRIMARY_VIEW_BOOTSTRAP_TIMEOUT_MS = 10_000;
 const MAX_BROWSER_VIEW_DIMENSION = 16_384;
 // Task tabs only; the signed-in home view is separate and never owns a Codex turn.
-const MAX_BROWSER_TABS = 2;
+const MAX_BROWSER_TABS = 5;
 const MAX_CANCELLED_TURN_TRACES = 256;
 const MANUAL_SUBMIT_TIMEOUT_MS = 60_000;
 const MANUAL_COMPACTION_SUBMIT_TIMEOUT_MS = 120_000;
@@ -47,6 +48,18 @@ const TURN_HEARTBEAT_SWEEP_MS = 5_000;
 const TURN_HEARTBEAT_TIMEOUT_MS = 60_000;
 const TURN_TAB_BOOTSTRAP_TIMEOUT_MS = 120_000;
 const RETAINED_TURN_TAB_TTL_MS = 30 * 60 * 1000;
+
+function recordTurnActivity(tab, now = Date.now()) {
+  const state = tab.approvalPending ? "approval"
+    : tab.turnProgress?.activeToolCalls > 0 ? "tools" : tab.turnProgress?.stage ?? "unknown";
+  tab.activity = {
+    state,
+    since: tab.activity?.state === state ? tab.activity.since : now,
+    updatedAt: now,
+    activeToolCalls: tab.turnProgress?.activeToolCalls ?? 0,
+  };
+}
+
 const BROWSER_NAVIGATION_TIMEOUT_MS = 60_000;
 const CHATGPT_AUTH_SESSION_TIMEOUT_MS = 5_000;
 const WINDOW_VISIBILITY_EVENTS = ["show", "hide", "minimize", "restore"];
@@ -393,6 +406,7 @@ class BrowserHost {
     this.shellZoomShortcutBindings = new Map();
     this.authView = null;
     this.authNavigationError = null;
+    this.primaryNavigationError = null;
     this.homeNavigationTimeout = null;
     this.lastTurnSweepAt = Date.now();
     this.powerSaveBlockerId = null;
@@ -458,12 +472,44 @@ class BrowserHost {
     this.view.setVisible(true);
     try {
       await loadCommittedBrowserSurface(this.view.webContents, IDLE_BROWSER_URL);
-      if (browserInteractionModeFor(this) === "automatic") await this.markOwnedSurface();
+      if (browserInteractionModeFor(this) === "automatic") {
+        await this.markOwnedSurface();
+        await this.pruneUnownedTemporaryConversationCookies();
+      }
     } finally {
       this.syncViewVisibility();
     }
     this.writeDescriptor();
     this.logger.info("browser.initialized", { url: this.view.webContents.getURL() });
+  }
+
+  async pruneUnownedTemporaryConversationCookies() {
+    const contents = this.view?.webContents;
+    // Cold-start maintenance only: never invalidate a running/retained/manual conversation or
+    // a home document. Codex owns durable history; no browser conversation survives this idle state.
+    const idle = () => browserInteractionModeFor(this) === "automatic"
+      && this.turnTabs?.size === 0 && !this.authView
+      && contents && !contents.isDestroyed() && contents.getURL() === IDLE_BROWSER_URL;
+    if (!idle() || !contents.session?.cookies) return 0;
+    const cookies = await contents.session.cookies.get({ url: CHATGPT_ORIGIN });
+    if (!idle()) return 0;
+    const temporary = cookies.filter(cookie => cookie.domain.replace(/^\./, "") === "chatgpt.com"
+      && /^conv_key_[A-Za-z0-9_-]+$/.test(cookie.name));
+    const headerBytes = cookies.reduce((size, cookie) => size + Buffer.byteLength(`${cookie.name}=${cookie.value}; `), 0);
+    this.logger.info("browser.temporary_cookie_inventory", { count: temporary.length, headerBytes });
+    // Leave small caches alone. Temporary-chat keys can otherwise accumulate for a month and
+    // exceed the server's header budget (observed 17 KB: HTTP/2 stalls, HTTP/1.1 empty response).
+    if (headerBytes < 12 * 1024) return 0;
+    let removed = 0;
+    for (const cookie of temporary) {
+      if (!idle()) break;
+      const path = typeof cookie.path === "string" && cookie.path.startsWith("/") ? cookie.path : "/";
+      await contents.session.cookies.remove(`${CHATGPT_ORIGIN}${path}`, cookie.name);
+      removed += 1;
+    }
+    if (removed) await contents.session.cookies.flushStore();
+    this.logger.info("browser.unowned_temporary_cookies_pruned", { removed, headerBytes });
+    return removed;
   }
 
   currentOperation() {
@@ -543,6 +589,11 @@ class BrowserHost {
       loading: tab.loading === true,
       active: this.selectedTabId === tab.id,
       closable: true,
+      ...(tab.status === "running" && tab.authenticationRequired ? { authenticationRequired: true } : {}),
+      ...(tab.status === "running" && !tab.authenticationRequired && tab.activity
+        ? { activity: { ...tab.activity } } : {}),
+      ...(tab.status === "running" && !tab.authenticationRequired && tab.approvalPending === true
+        ? { approvalPending: true } : {}),
     };
     if (tab.interactionMode === "manual") {
       Object.assign(snapshot, {
@@ -582,7 +633,8 @@ class BrowserHost {
   async createTurnTab(traceId, helperPid, conversationKey, connectorIdentity, signal) {
     signal?.throwIfAborted();
     if (this.turnTabs.size >= MAX_BROWSER_TABS
-      && !BrowserHost.prototype.evictTerminalManualTurnTab.call(this)) {
+      && !BrowserHost.prototype.evictTerminalManualTurnTab.call(this)
+      && !BrowserHost.prototype.evictRetainedAutomaticTurnTab.call(this)) {
       throw new Error(
         `ChatGPT Web already has ${MAX_BROWSER_TABS} browser tabs; close one before starting another turn to avoid excessive parallel traffic on the ChatGPT account`,
       );
@@ -771,6 +823,22 @@ class BrowserHost {
     }
   }
 
+  evictRetainedAutomaticTurnTab() {
+    // Completed automatic documents are a cache, not the durable Codex history. A later
+    // resume already handles retained_conversation_unavailable by replaying that history.
+    // Never reclaim a running lease or a manually controlled conversation.
+    const idle = [...this.turnTabs.values()]
+      .filter(tab => tab.interactionMode === "automatic" && tab.status === "ready"
+        && tab.conversationKey && tab.authenticationRequired !== true)
+      .sort((left, right) => (left.lastHeartbeatAt ?? 0) - (right.lastHeartbeatAt ?? 0))[0];
+    if (!idle) return false;
+    this.removeTurnTab(idle, false);
+    this.logger.info("browser.retained_tab_evicted", {
+      tabId: idle.id, traceId: idle.traceId, reason: "capacity",
+    });
+    return true;
+  }
+
   evictTerminalManualTurnTab() {
     const terminalManual = [...this.turnTabs.values()]
       .filter(tab => tab.interactionMode === "manual"
@@ -881,7 +949,8 @@ class BrowserHost {
     });
     contents.on("page-title-updated", (_event, title) => {
       if (browserInteractionModeFor(this) !== "automatic") return;
-      if (typeof title === "string" && title.trim()) tab.pageTitle = title.trim();
+      _event.preventDefault?.();
+      tab.pageTitle = boundedBrowserTitle(title);
       this.publishState?.(this.snapshot());
     });
     contents.on("did-navigate-in-page", (_event, url, mainFrame) => {
@@ -1077,6 +1146,7 @@ class BrowserHost {
         this.setState({ url });
         return;
       }
+      this.primaryNavigationError = null;
       this.primaryRendererReady = false;
       this.primaryDeviceEmulationDirty = true;
       this.armHomeNavigationTimeout(contents, url);
@@ -1092,6 +1162,7 @@ class BrowserHost {
     });
     contents.on("did-finish-load", () => {
       this.clearHomeNavigationTimeout();
+      if (this.primaryNavigationError) return;
       this.primaryRendererReady = true;
       this.syncViewVisibility();
       if (this.manualOperation === "ChatGPT login") {
@@ -1135,7 +1206,8 @@ class BrowserHost {
     });
     contents.on("page-title-updated", (_event, title) => {
       if (browserInteractionModeFor(this) === "manual") return;
-      this.setState({ title: typeof title === "string" && title.trim() ? title.trim() : "ChatGPT" });
+      _event.preventDefault?.();
+      this.setState({ title: boundedBrowserTitle(title) });
     });
     contents.on("did-navigate-in-page", (_event, url, mainFrame) => {
       if (mainFrame) {
@@ -1146,6 +1218,8 @@ class BrowserHost {
     contents.on("did-fail-load", (_event, errorCode, errorDescription, url, mainFrame) => {
       if (!mainFrame || errorCode === -3) return;
       this.clearHomeNavigationTimeout();
+      this.primaryNavigationError = new Error(`ChatGPT page failed to load: ${errorDescription}`);
+      this.primaryRendererReady = false;
       this.logger.error(
         this.manualOperation === "ChatGPT login"
           ? "browser.auth_navigation_failed"
@@ -1161,6 +1235,8 @@ class BrowserHost {
     });
     contents.on("render-process-gone", (_event, details) => {
       this.clearHomeNavigationTimeout();
+      this.primaryNavigationError = new Error(`ChatGPT renderer stopped: ${details.reason}`);
+      this.primaryRendererReady = false;
       this.logger.error("browser.renderer_gone", { reason: details.reason, exitCode: details.exitCode });
       this.setState({ status: "error", message: `Browser renderer stopped: ${details.reason}`, loading: false });
     });
@@ -1173,6 +1249,8 @@ class BrowserHost {
       if (contents.isDestroyed() || !contents.isLoadingMainFrame()) return;
       contents.stop();
       const message = "ChatGPT did not finish loading within 60 seconds. Check your connection and retry.";
+      this.primaryNavigationError = new Error(message);
+      this.primaryRendererReady = false;
       this.logger.error("browser.navigation_timeout", { origin: navigationOriginForLog(url) });
       this.setState({ status: "error", message, url, loading: false });
     }, BROWSER_NAVIGATION_TIMEOUT_MS);
@@ -1451,7 +1529,7 @@ class BrowserHost {
     this.publishState?.(this.snapshot());
   }
 
-  heartbeatTurn(traceId, helperPid, refreshViewport = false) {
+  heartbeatTurn(traceId, helperPid, refreshViewport = false, progress) {
     if (typeof refreshViewport !== "boolean") throw new Error("refreshViewport is invalid");
     const tab = [...this.turnTabs.values()].find(candidate => candidate.traceId === traceId);
     if (!tab) {
@@ -1463,6 +1541,17 @@ class BrowserHost {
       throw new Error(`Browser helper ownership mismatch: expected ${tab.helperPid}, received ${helperPid}`);
     }
     if (tab.status !== "running") throw new Error(`Browser turn ${traceId} is no longer running`);
+    if (progress !== undefined) {
+      if (tab.interactionMode !== "automatic" || !progress || typeof progress !== "object"
+        || Object.keys(progress).length !== 2
+        || !["preparing", "sending", "chatgpt"].includes(progress.stage)
+        || !Number.isSafeInteger(progress.activeToolCalls) || progress.activeToolCalls < 0) {
+        throw new Error("Browser turn progress is invalid");
+      }
+      tab.turnProgress = { stage: progress.stage, activeToolCalls: progress.activeToolCalls };
+      recordTurnActivity(tab);
+      this.publishState?.(this.snapshot());
+    }
     tab.lastHeartbeatAt = Date.now();
     if (refreshViewport) {
       // Closing an external Playwright CDP session can clear Chromium's effective emulation while
@@ -1472,6 +1561,16 @@ class BrowserHost {
       this.syncViewVisibility();
     }
     return this.snapshot();
+  }
+
+  setTurnApprovalPending(traceId, helperPid, pending) {
+    if (typeof pending !== "boolean") throw new Error("Tool approval pending state must be a boolean");
+    this.heartbeatTurn(traceId, helperPid);
+    const tab = [...this.turnTabs.values()].find(candidate => candidate.traceId === traceId);
+    if (tab.interactionMode !== "automatic") throw new Error("Tool approval requires an automatic browser turn");
+    tab.approvalPending = pending;
+    recordTurnActivity(tab);
+    this.publishState?.(this.snapshot());
   }
 
   refreshTurnLeases(reason, now = Date.now()) {
@@ -1607,8 +1706,13 @@ class BrowserHost {
 
   hiddenTurnBounds() {
     const [contentWidth, contentHeight] = this.window.getContentSize();
-    const width = Math.max(HIDDEN_TURN_VIEWPORT.width, Math.round(contentWidth || 0));
-    const height = Math.max(HIDDEN_TURN_VIEWPORT.height, Math.round(contentHeight || 0));
+    // Once measured, every tab uses the browser pane's dimensions, including offscreen tabs.
+    // Using the whole window here resized a running page when another task finished and its
+    // tab became selected. ChatGPT closes its model picker on that resize, aborting selection.
+    const width = this.boundsReady ? this.bounds.width
+      : Math.max(HIDDEN_TURN_VIEWPORT.width, Math.round(contentWidth || 0));
+    const height = this.boundsReady ? this.bounds.height
+      : Math.max(HIDDEN_TURN_VIEWPORT.height, Math.round(contentHeight || 0));
     return {
       // Electron collapses a hidden WebContentsView's renderer viewport to 0x0. Keep running
       // turn views visible to Chromium and move them wholly outside the launcher content area so
@@ -1620,7 +1724,7 @@ class BrowserHost {
     };
   }
 
-  enableHiddenTurnViewport(contents, { width, height }) {
+  enableBrowserViewport(contents, { width, height }) {
     contents.enableDeviceEmulation({
       screenPosition: "desktop",
       screenSize: { width, height },
@@ -1637,29 +1741,19 @@ class BrowserHost {
       tab.view.setVisible(visible || tab.status === "running");
       return;
     }
-    if (visible) {
-      // Establish native on-screen bounds before removing the background viewport contract.
-      tab.view.setBounds(this.bounds);
-      if (tab.rendererReady && tab.deviceEmulationViewport) {
-        tab.view.webContents.disableDeviceEmulation();
-        tab.deviceEmulationViewport = null;
-      }
-      if (tab.rendererReady) tab.deviceEmulationDirty = false;
-    } else {
-      // A WebContentsView born outside a hidden BrowserWindow has a 0x0 renderer even when its
-      // native bounds and View visibility are non-zero. Device emulation gives background turns
-      // an explicit renderer viewport before moving the view outside the launcher surface.
-      const bounds = this.hiddenTurnBounds();
-      if (tab.rendererReady
-        && (tab.deviceEmulationDirty
-          || tab.deviceEmulationViewport?.width !== bounds.width
-          || tab.deviceEmulationViewport?.height !== bounds.height)) {
-        this.enableHiddenTurnViewport(tab.view.webContents, bounds);
-        tab.deviceEmulationViewport = { width: bounds.width, height: bounds.height };
-        tab.deviceEmulationDirty = false;
-      }
-      tab.view.setBounds(bounds);
+    // Hidden BrowserWindows need an explicit renderer viewport. Keep that same contract when
+    // a task becomes visible: disabling emulation emits resize even when the dimensions match,
+    // which closes ChatGPT menus midway through another helper's model selection.
+    const bounds = visible ? this.bounds : this.hiddenTurnBounds();
+    if (tab.rendererReady
+      && (tab.deviceEmulationDirty
+        || tab.deviceEmulationViewport?.width !== bounds.width
+        || tab.deviceEmulationViewport?.height !== bounds.height)) {
+      this.enableBrowserViewport(tab.view.webContents, bounds);
+      tab.deviceEmulationViewport = { width: bounds.width, height: bounds.height };
+      tab.deviceEmulationDirty = false;
     }
+    tab.view.setBounds(bounds);
     tab.view.setVisible(visible || tab.status === "running");
   }
 
@@ -1682,7 +1776,7 @@ class BrowserHost {
         && (this.primaryDeviceEmulationDirty
           || this.primaryDeviceEmulationViewport?.width !== bounds.width
           || this.primaryDeviceEmulationViewport?.height !== bounds.height)) {
-        this.enableHiddenTurnViewport(this.view.webContents, bounds);
+        this.enableBrowserViewport(this.view.webContents, bounds);
         this.primaryDeviceEmulationViewport = { width: bounds.width, height: bounds.height };
         this.primaryDeviceEmulationDirty = false;
       }
@@ -1877,7 +1971,8 @@ class BrowserHost {
     });
     contents.on("page-title-updated", (_event, title) => {
       if (browserInteractionModeFor(this) === "manual") return;
-      this.setState({ title: typeof title === "string" && title.trim() ? title.trim() : "ChatGPT" });
+      _event.preventDefault?.();
+      this.setState({ title: boundedBrowserTitle(title) });
     });
     contents.on("close", () => this.closeAuthView(authView, true));
     contents.on("destroyed", () => this.closeAuthView(authView, false));
@@ -2487,6 +2582,9 @@ class BrowserHost {
       existing.helperPid = helperPid;
       existing.traceId = traceId;
       existing.status = "running";
+      existing.approvalPending = false;
+      existing.turnProgress = undefined;
+      existing.activity = undefined;
       existing.loading = true;
       existing.message = "ChatGPT is working";
       if (!reused) {
@@ -2553,6 +2651,9 @@ class BrowserHost {
     const authenticationRequired = tab.authenticationRequired === true;
     if (authenticationRequired && status === "completed") status = "failed";
     tab.status = status === "completed" ? "ready" : status === "aborted" ? "aborted" : "error";
+    tab.approvalPending = false;
+    tab.turnProgress = undefined;
+    tab.activity = undefined;
     this.syncPowerSaveBlocker();
     tab.message = status === "completed" ? "Task completed" : message || `ChatGPT turn ${status}`;
     tab.loading = false;
@@ -2594,7 +2695,7 @@ class BrowserHost {
 
   openLogin() {
     requireAutomaticBrowserInspection(this, "Automated ChatGPT sign-in verification");
-    if (this.state.authenticated) {
+    if (this.state.authenticated && !this.primaryNavigationError) {
       this.activateHomeSurface();
       this.show();
       return Promise.resolve(this.snapshot());
@@ -2618,7 +2719,7 @@ class BrowserHost {
         this.show();
         this.logger.info("browser.login_opened");
         const current = this.view.webContents.getURL();
-        if (this.reauthenticationRequired || !current.startsWith(CHATGPT_ORIGIN)) {
+        if (this.primaryNavigationError || this.reauthenticationRequired || !current.startsWith(CHATGPT_ORIGIN)) {
           await this.view.webContents.loadURL(TEMPORARY_CHAT_URL);
         }
         await this.probeAuthentication();
@@ -2796,7 +2897,13 @@ class BrowserHost {
     const operation = this.withManualOperation("session refresh", async () => {
       this.setState({ status: "loading", message: "Checking saved ChatGPT session" });
       if (!isTemporaryChatUrl(this.view.webContents.getURL())) {
-        await this.view.webContents.loadURL(TEMPORARY_CHAT_URL);
+        try {
+          await this.view.webContents.loadURL(TEMPORARY_CHAT_URL);
+        } catch (error) {
+          // ChatGPT may replace the home navigation with its sign-in page. The
+          // observed auth URL is a signed-out state, not a broken installation.
+          if (!isAbortedNavigationError(error) || !allowedAuthUrl(this.view.webContents.getURL())) throw error;
+        }
       }
       const state = await this.probeAuthentication();
       if (state.authenticated) {
@@ -2805,7 +2912,14 @@ class BrowserHost {
       return this.snapshot();
     });
     let tracked;
-    tracked = operation.finally(() => {
+    tracked = operation.catch((error) => {
+      this.setState({
+        status: "error",
+        message: "Could not check ChatGPT sign-in. Open sign in to try again.",
+        loading: false,
+      });
+      throw error;
+    }).finally(() => {
       if (this.sessionRefreshOperation === tracked) this.sessionRefreshOperation = null;
     });
     this.sessionRefreshOperation = tracked;
@@ -2831,7 +2945,8 @@ class BrowserHost {
         });
         return this.snapshot();
       }
-      if (!url.startsWith(CHATGPT_ORIGIN)) {
+      const awaitingLogin = allowedAuthUrl(url) && this.manualOperation !== "ChatGPT login" && !this.authView;
+      if (awaitingLogin || !url.startsWith(`${CHATGPT_ORIGIN}/`)) {
         this.setState({ status: "signed-out", message: "Sign in to ChatGPT", authenticated: false, url });
         return this.snapshot();
       }
@@ -2922,6 +3037,7 @@ class BrowserHost {
   async waitForAuthenticated(timeoutMs = 180_000, { failWhenSignedOut = false } = {}) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
+      if (this.primaryNavigationError) throw this.primaryNavigationError;
       if (this.authNavigationError) {
         const error = this.authNavigationError;
         this.authNavigationError = null;

@@ -1,0 +1,14 @@
+[Unit]
+Description=Openbox for Codex Web GPT instance %i
+After=cwg-xvfb@%i.service
+Requires=cwg-xvfb@%i.service
+
+[Service]
+User=longbiao
+EnvironmentFile=/etc/codex-web-gpt/%i.env
+ExecStart=/usr/bin/env DISPLAY=:${CWG_DISPLAY} /usr/bin/openbox
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

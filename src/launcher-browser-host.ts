@@ -210,6 +210,13 @@ export async function inspectLauncherBrowserHostLiveness(
 /** Per-page bound for reading native target ownership during page selection. */
 export const LAUNCHER_PAGE_INSPECTION_TIMEOUT_MS = 2_000;
 
+export class LauncherBrowserSurfaceTimeoutError extends Error {
+  constructor(readonly timeoutMs: number) {
+    super("Launcher browser host did not expose its owned browser surface");
+    this.name = "LauncherBrowserSurfaceTimeoutError";
+  }
+}
+
 async function inspectLauncherCandidateTarget(
   context: BrowserContext,
   page: Page,
@@ -281,7 +288,7 @@ export async function selectLauncherPage(
     }
     await new Promise(resolve => setTimeout(resolve, 100));
   } while (Date.now() < deadline);
-  throw new Error("Launcher browser host did not expose its owned browser surface");
+  throw new LauncherBrowserSurfaceTimeoutError(timeoutMs);
 }
 
 /**
@@ -330,7 +337,7 @@ export async function connectLauncherBrowserHost(
   const readyAt = performance.now();
   let browser: Browser;
   try {
-    browser = await chromium.connectOverCDP(descriptor.endpoint, { timeout: timeoutMs });
+    browser = await chromium.connectOverCDP(descriptor.endpoint, { timeout: timeoutMs, noDefaults: true });
   } catch (error) {
     console.info(`[chatgpt-web] launcher connect timing surface=${surfaceId ?? "-"} readyMs=${Math.round(readyAt - startedAt)}`
       + ` cdpMs=${Math.round(performance.now() - readyAt)} result=cdp-failed`);
@@ -353,6 +360,11 @@ export async function connectLauncherBrowserHost(
     console.info(`[chatgpt-web] launcher connect timing surface=${surfaceId ?? "-"} readyMs=${Math.round(readyAt - startedAt)}`
       + ` cdpMs=${Math.round(connectedAt - readyAt)} selectMs=${Math.round(performance.now() - connectedAt)}`
       + ` pages=${browser.contexts().reduce((count, item) => count + item.pages().length, 0)} result=ok`);
+    // Preserve the host's theme and other pages. Only our owned page needs
+    // focus emulation for input while its Electron view is in the background.
+    const inputSession = await context.newCDPSession(page);
+    await inputSession.send("Emulation.setFocusEmulationEnabled", { enabled: true });
+    // The browser connection owns this session; disconnect releases the override.
     return { descriptor, browser, context, page };
   } catch (error) {
     await browser.close().catch(() => {});
@@ -430,6 +442,12 @@ export const LAUNCHER_CAPABILITY_INSPECTION_TIMEOUT_MS = 120_000;
 
 export type LauncherTurnActivity =
   | {
+      phase: "approval";
+      traceId: string;
+      helperPid: number;
+      pending: boolean;
+    }
+  | {
       phase: "usage";
       traceId: string;
       helperPid: number;
@@ -455,6 +473,10 @@ export type LauncherTurnActivity =
       helperPid: number;
       /** Re-establish the launcher's hidden viewport after the caller closes its CDP session. */
       refreshViewport?: boolean;
+      progress?: {
+        stage: "preparing" | "sending" | "chatgpt";
+        activeToolCalls: number;
+      };
     }
   | {
       phase: "end";
@@ -699,7 +721,7 @@ export async function notifyLauncherTurn(
   activity: LauncherTurnActivity,
   timeoutMs = activity.phase === "end"
     ? LAUNCHER_TURN_END_TIMEOUT_MS
-    : activity.phase === "heartbeat"
+    : activity.phase === "heartbeat" || activity.phase === "approval"
       ? LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS
       : LAUNCHER_TURN_START_TIMEOUT_MS,
   signal?: AbortSignal,

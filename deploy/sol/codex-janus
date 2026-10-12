@@ -1,0 +1,5 @@
+#!/bin/sh
+# Select Janus without changing the default route used by existing Codex tasks.
+set -eu
+exec codex --profile janus-web "$@"
+

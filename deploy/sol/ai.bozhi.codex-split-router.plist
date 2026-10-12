@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>CODEX_SPLIT_WEB_BASE_URL</key>
+		<string>https://mars.tailbbe133.ts.net:17841</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>ai.bozhi.codex-split-router</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/longbiao/.cache/ccw-pr/bun14/node_modules/bun/bin/bun.exe</string>
+		<string>/Users/longbiao/Library/Application Support/codex-model-router/router.js</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/longbiao/Library/Logs/codex-model-router/stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/longbiao/Library/Logs/codex-model-router/stdout.log</string>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/longbiao/Library/Application Support/codex-model-router</string>
+</dict>
+</plist>

@@ -1,0 +1,14 @@
+[Unit]
+Description=Loopback-only VNC for Codex Web GPT authorization
+After=codex-web-gpt-xvfb.service
+Requires=codex-web-gpt-xvfb.service
+
+[Service]
+User=longbiao
+Environment=DISPLAY=:99
+ExecStart=/usr/bin/x11vnc -display :99 -localhost -forever -shared -nopw -rfbport 5901
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -58,9 +58,9 @@ test("failures are classified the way the console shows them", () => {
 });
 
 test("the real probe holds the host so no turn is admitted onto it mid-check", async () => {
-  const { launcherHostHasTurn, clearLauncherHostAffinity } = await import("../src/adapters/chatgpt-web/launcher-host-pool");
-  const { markLauncherHostBusy } = await import("../src/adapters/chatgpt-web/launcher-host-pool");
-  clearLauncherHostAffinity();
+  const { launcherHostHasTurn, clearLauncherHostActivity } = await import("../src/adapters/chatgpt-web/launcher-host-activity");
+  const { markLauncherHostBusy } = await import("../src/adapters/chatgpt-web/launcher-host-activity");
+  clearLauncherHostActivity();
   const host = hosts[0]!;
   expect(launcherHostHasTurn(host)).toBe(false);
   const release = markLauncherHostBusy(host);          // what the default probe does around itself

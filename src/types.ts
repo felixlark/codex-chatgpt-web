@@ -272,16 +272,6 @@ export interface CodexProviderConfig {
     browserHost?: "managed-chrome" | "launcher";
     /** Owner-only descriptor containing the launcher's loopback CDP and control endpoints. */
     browserHostDescriptorPath?: string;
-    /** Extra launcher browser hosts (descriptor paths) that share this bridge's broker and connector. */
-    browserHostPool?: string[];
-    /** Connector (appName) per pool host, so each browser's tool calls use its own tunnel. */
-    browserHostAppNames?: Record<string, string>;
-    /**
-     * Pool as slots: one connector in one launcher browser each. A descriptor may repeat with
-     * different connectors, so one browser (one ChatGPT login) serves several tunnels. When set it
-     * replaces browserHostDescriptorPath/browserHostPool/browserHostAppNames for turn placement.
-     */
-    browserHostSlots?: Array<{ descriptor: string; appName: string }>;
     /** Explicit browser-helper bundle. DEV builds current source; the launcher still supplies Electron-as-Node. */
     browserHelperScriptPath?: string;
     /** Explicit private diagnostic root for isolated harnesses. */

@@ -1,0 +1,13 @@
+[Unit]
+Description=Virtual X display for Codex Web GPT instance %i
+After=network.target
+
+[Service]
+User=longbiao
+EnvironmentFile=/etc/codex-web-gpt/%i.env
+ExecStart=/usr/bin/Xvfb :${CWG_DISPLAY} -screen 0 1440x900x24 -nolisten tcp
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

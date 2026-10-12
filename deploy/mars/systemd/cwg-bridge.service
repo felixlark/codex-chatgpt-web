@@ -1,0 +1,31 @@
+[Unit]
+Description=Codex Web GPT bridge (Responses proxy + turn broker), with a single Alpha browser host
+After=network-online.target cwg-app@alpha.service
+Wants=network-online.target cwg-app@alpha.service
+
+[Service]
+Type=simple
+User=longbiao
+# The bridge owns the control plane only: config, sessions, thread environments, broker socket,
+# and the broker socket. The browser lives in cwg-app@alpha and follows bridge restarts.
+Environment=CODEX_CHATGPT_WEB_HOME=/home/longbiao/.codex-chatgpt-web
+Environment=CODEX_HOME=/home/longbiao/.codex-web-gpt-home
+Environment=CODEX_CHATGPT_WEB_BROWSER_HOST_DESCRIPTOR=/home/longbiao/.local/share/cwg-alpha/core/runtime/launcher-browser.json
+# The browser helper is the launcher binary run as node, so it needs the unpacked AppImage's env.
+Environment=DISPLAY=:99
+Environment=LD_LIBRARY_PATH=/home/longbiao/.local/lib/codex-web-gpt/5.0.8/unpacked/usr/lib
+Environment=PATH=/home/longbiao/.local/lib/codex-web-gpt/5.0.8/unpacked:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=GSETTINGS_SCHEMA_DIR=/home/longbiao/.local/lib/codex-web-gpt/5.0.8/unpacked/usr/share/glib-2.0/schemas
+Environment=XDG_DATA_DIRS=/home/longbiao/.local/lib/codex-web-gpt/5.0.8/unpacked/usr/share/:/usr/share/gnome:/usr/local/share/:/usr/share/
+Environment=GDK_BACKEND=x11
+Environment=NO_AT_BRIDGE=1
+Environment=DBUS_SESSION_BUS_ADDRESS=disabled:
+Environment=XDG_RUNTIME_DIR=/run/cwg-bridge
+RuntimeDirectory=cwg-bridge
+RuntimeDirectoryMode=0700
+ExecStart=/home/longbiao/.codex-chatgpt-web/versions/5.0.8-linux-x64/runtime/bun /home/longbiao/.codex-chatgpt-web/versions/5.0.8-linux-x64/app/cli.js serve
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

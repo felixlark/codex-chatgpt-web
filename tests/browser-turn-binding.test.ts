@@ -1,7 +1,38 @@
 import { expect, test } from "bun:test";
 import { chromium, type Locator, type Page } from "playwright-core";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptMarkdownBuffer } from "../src/adapters/chatgpt-web/markdown";
 import { readFileSync } from "node:fs";
+
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("paragraph identity survives file preview movement in both response layouts", async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+  try {
+    for (const root of ['class="markdown"', 'data-markdown-text-style="assistant-message"']) {
+      const page = await browser.newPage();
+      await page.setContent(`<section id="turn"><div data-content-search-unit-key="answer">
+        <h4 data-conversation-role="assistant"></h4><div id="answer" ${root}>
+        <p>Report saved:</p><p id="file">report.md</p><p id="tail">Done.</p>
+      </div></div><button aria-label="Copy"></button></section>`);
+      const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+      const cache = {};
+      const observe = () => worker.responseDomSnapshot(page.locator("#turn"), cache);
+      const before = await observe();
+      const buffer = new ChatGptMarkdownBuffer(undefined, 0);
+      expect(buffer.observe(before.markdownSegments, 0)).toBe("Report saved:\n\nreport.md");
+      await page.locator("#file").evaluate(file => { file.parentElement!.parentElement!.appendChild(file); });
+      const moved = await observe();
+      expect(moved.markdownSegments.at(-1).key).toBe(before.markdownSegments.at(-1).key);
+      expect(buffer.observe(moved.markdownSegments, 1)).toBe("");
+      await page.locator("#answer").evaluate(answer => { answer.innerHTML = answer.innerHTML; });
+      buffer.observe((await observe()).markdownSegments, 2);
+      expect(buffer.finish().markdown).toBe("Report saved:\n\nreport.md\n\nDone.");
+      await page.locator("#tail").evaluate(tail => { tail.textContent = "A changed answer."; });
+      buffer.observe((await observe()).markdownSegments, 3);
+      expect(() => buffer.finish()).toThrow();
+      await page.close();
+    }
+  } finally { await browser.close(); }
+}, 15_000);
 
 test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("activity tone and collapsed content invalidate the response cache", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
@@ -86,20 +117,20 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("an exchange rekeys only with
       <div data-content-search-unit-key="${key}:assistant"><div data-conversation-role="assistant"></div>
       <div data-markdown-text-style="assistant-message"><p>Answer.</p></div></div>
       ${complete ? '<div class="turn-action-controls"><button>Copy</button></div>' : ""}</div>`;
-    for (const scenario of ["matching", "history", "foreign", "prefix-only", "changed-spaces", "changed-edges", "two-turns", "old-group-remains", "unfinished", "no-prompt", "same-key"] as const) {
+    for (const scenario of ["matching", "history", "history-two-turns", "history-foreign", "foreign", "prefix-only", "changed-spaces", "changed-edges", "two-turns", "old-group-remains", "unfinished", "no-prompt", "same-key"] as const) {
       const page = await browser.newPage();
-      const history = scenario === "history" ? group("earlier", prompt, true) : "";
+      const history = scenario.startsWith("history") ? group("earlier", prompt, true) : "";
       await page.setContent(`<main>${history}</main>`);
       const baseline = await worker.captureSubmissionBaseline(page, scenario === "no-prompt" ? undefined : prompt);
       await page.locator("main").evaluate((node, html) => { node.innerHTML = html; }, history + group("optimistic"));
       const binding = await worker.waitForNewAssistantTurn(page, baseline, Date.now() + 5000);
       expect(binding.identity).toBe("group:assistant:optimistic");
-      const text = scenario === "foreign" ? "Different task."
+      const text = scenario === "foreign" || scenario === "history-foreign" ? "Different task."
         : scenario === "prefix-only" ? prompt + " Another request."
         : scenario === "changed-spaces" ? prompt.replace("  ", " ")
         : scenario === "changed-edges" ? " " + prompt : prompt;
       let html = history + group(scenario === "same-key" ? "optimistic" : "persisted", text, scenario !== "unfinished");
-      if (scenario === "two-turns") html += group("foreign", prompt, true);
+      if (scenario === "two-turns" || scenario === "history-two-turns") html += group("foreign", prompt, true);
       if (scenario === "old-group-remains") html += '<div data-turn-key="optimistic"><div data-user-message-bubble>Earlier</div></div>';
       await page.locator("main").evaluate((node, next) => { node.innerHTML = next; }, html);
       const result = worker.reconcileAssistantTurnBinding(page, baseline, binding);

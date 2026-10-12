@@ -1,10 +1,11 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { atomicWriteFile } from "../../config";
 import { getCodexHome } from "../../codex-integration-shared";
 import type { CodexParsedRequest } from "../../types";
 import {
   extractChatGptTurnEnvironment,
+  extractChatGptCurrentEnvironmentRestatement,
   extractChatGptTrailingEnvironmentUpdate,
   extractChatGptCompactionSourceRevision,
   extractChatGptContinuationEnvironmentClaim,
@@ -14,6 +15,7 @@ import {
   extractChatGptRootThreadMetadata,
   hasCurrentChatGptEnvironmentContext,
   hasChatGptCalendarEnvironmentDelta,
+  hasChatGptNativeCalendarRestatement,
   hasRawChatGptEnvironmentContext,
   unattributedChatGptEnvironmentMessages,
   isChatGptCompactionContinuation,
@@ -22,6 +24,7 @@ import {
   type ChatGptTurnEnvironment,
 } from "./environment";
 import { resolveCurrentCodexRolloutEnvironment } from "./codex-rollout-environment";
+import { ChatGptWebAdapterError } from "./adapter-error";
 
 interface StoredThreadEnvironment {
   cwd: string;
@@ -43,6 +46,43 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+/** Shape-only rejection evidence. Never returns prompt text, paths, IDs or authority values. */
+export function chatGptEnvironmentEnvelopeDiagnostics(parsed: CodexParsedRequest) {
+  const body = record(parsed._rawBody);
+  const input = Array.isArray(body?.input) ? body.input : [];
+  const turnId = extractChatGptTurnIdentity(parsed).turnId;
+  const envelopes = [];
+  for (let index = 0; index < input.length; index += 1) {
+    const item = record(input[index]);
+    if (item?.type !== "message" || item.role !== "user") continue;
+    const metadata = record(item.internal_chat_message_metadata_passthrough);
+    const kinds = Array.isArray(metadata?.content_item_kinds) ? metadata.content_item_kinds : [];
+    const textParts = typeof item.content === "string" ? [item.content]
+      : Array.isArray(item.content) ? item.content.map(part => record(part)?.text)
+        .filter((text): text is string => typeof text === "string") : [];
+    const text = textParts.join("\n").trim();
+    const nativeEnvironmentKind = kinds.includes("environments.environment_context");
+    if (!nativeEnvironmentKind && !textParts.some(part => /^<\/?environment_context\b/i.test(part.trimStart()))) continue;
+    envelopes.push({
+      index, chars: text.length, textParts: textParts.length,
+      contentForm: typeof item.content === "string" ? "string" : Array.isArray(item.content) ? "array" : "other",
+      hasItemId: typeof item.id === "string" && item.id.length > 0,
+      nativeEnvironmentKind,
+      nativeTurnRelation: typeof metadata?.turn_id !== "string" ? "missing"
+        : turnId && metadata.turn_id === turnId ? "current" : "other",
+      pureEnvelope: /^<environment_context>[\s\S]*<\/environment_context>$/.test(text),
+      envelopeOpenCount: (text.match(/<environment_context\b[^>]*>/gi) ?? []).length,
+      envelopeCloseCount: (text.match(/<\/environment_context\s*>/gi) ?? []).length,
+      cwdOpenCount: (text.match(/<cwd\b[^>]*>/gi) ?? []).length,
+      cwdCloseCount: (text.match(/<\/cwd\s*>/gi) ?? []).length,
+      rootPairCount: (text.match(/<root>[^<]+<\/root>/gi) ?? []).length,
+      environmentBlockCount: (text.match(/<environment\b[^>]*>/gi) ?? []).length,
+    });
+    if (envelopes.length > 4) envelopes.shift();
+  }
+  return { envelopes };
 }
 
 function pathIdentity(value: string): string {
@@ -145,14 +185,18 @@ function onlyAddsOwnVisualizationRoot(
   return added.length > 0 && added.every(root => isOwnVisualizationRoot(root, threadId));
 }
 
-function sameAuthority(left: ChatGptTurnEnvironment, right: ChatGptTurnEnvironment): boolean {
+function sameAuthority(left: ChatGptTurnEnvironment, right: ChatGptTurnEnvironment, steering = false): boolean {
   const samePaths = (a: string[], b: string[]): boolean => {
     const expected = new Set(b.map(pathIdentity));
     return a.length === expected.size && a.every(path => expected.has(pathIdentity(path)));
   };
   return pathIdentity(left.cwd) === pathIdentity(right.cwd)
     && samePaths(left.roots, right.roots)
-    && samePaths(left.writableRoots, right.writableRoots)
+    // Steering envelopes can omit Codex's extra output directories. The current
+    // native rollout remains the authority returned to the caller, never the claim.
+    && (steering
+      ? left.writableRoots.every(path => right.writableRoots.some(root => pathIdentity(root) === pathIdentity(path)))
+      : samePaths(left.writableRoots, right.writableRoots))
     && left.sandboxPolicy.type === right.sandboxPolicy.type
     && (left.sandboxPolicy.type === "dangerFullAccess" || (right.sandboxPolicy.type !== "dangerFullAccess"
       && left.sandboxPolicy.networkAccess === right.sandboxPolicy.networkAccess));
@@ -184,6 +228,19 @@ export class ChatGptThreadEnvironmentStore {
     } catch (error) {
       if (!(error instanceof MissingTrustedCodexEnvironmentError)) throw error;
       if (!identity.threadId) throw this.rejected(parsed, identity, { reason: "no-thread-id" }, error);
+      if (hasChatGptNativeCalendarRestatement(parsed)) {
+        const cached = this.get(identity.threadId);
+        const native = extractChatGptRootThreadMetadata(parsed);
+        if (cached?.sandboxPolicy.type === "dangerFullAccess" && native?.sandboxType === "dangerFullAccess"
+          && native.workspaceRoots.some(root => contains(root, cached.cwd))) {
+          return { ...cached, tools: parsed.context.tools ?? [] };
+        }
+      }
+      const restatement = extractChatGptCurrentEnvironmentRestatement(parsed);
+      const previous = restatement ? this.get(identity.threadId) : undefined;
+      if (restatement && previous && sameAuthority(restatement, { ...previous, tools: [] })) {
+        return { ...restatement, tools: parsed.context.tools ?? [] };
+      }
       const hasCurrentContext = hasCurrentChatGptEnvironmentContext(parsed);
       const lineage = extractChatGptThreadSpawnLineage(parsed);
       const currentCompaction = hasCurrentContext && isChatGptCompactionContinuation(parsed);
@@ -216,7 +273,12 @@ export class ChatGptThreadEnvironmentStore {
           this.set(identity.threadId, widened);
           return widened;
         }
-        throw this.rejected(parsed, identity, { reason: "current-envelope-unparsed", hasCurrentContext, currentCompaction }, error);
+        throw this.rejected(parsed, identity, {
+          reason: "current-envelope-unparsed", hasCurrentContext, currentCompaction,
+          currentRestatementParsed: restatement !== undefined,
+          trailingUpdateParsed: update !== undefined,
+          trailingUpdateCacheAvailable: cached !== undefined,
+        }, error);
       }
       const currentClaim = currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed) : steeringClaim;
       const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
@@ -238,7 +300,7 @@ export class ChatGptThreadEnvironmentStore {
           if (calendarDelta && rolloutEnvironment.sandboxPolicy.type !== "dangerFullAccess") {
             throw new Error("Calendar environment delta conflicts with its current Codex rollout");
           }
-          if (currentClaim && !sameAuthority(currentClaim, rolloutEnvironment)) {
+          if (currentClaim && !sameAuthority(currentClaim, rolloutEnvironment, steeringClaim !== undefined)) {
             throw new Error(`${currentCompaction ? "Compaction continuation" : "Steering"} environment conflicts with its current Codex rollout`);
           }
           this.set(rolloutIdentity.threadId, rolloutEnvironment);
@@ -313,6 +375,12 @@ export class ChatGptThreadEnvironmentStore {
         return {
           type: typeof item?.type === "string" ? item.type : "?",
           ...(typeof item?.role === "string" ? { role: item.role } : {}),
+          ...(item?.type === "function_call_output" ? {
+            name: item.name, namespace: item.namespace,
+            callIdType: typeof item.call_id, outputType: typeof item.output,
+          } : {}),
+          nativeTurnId: (item?.internal_chat_message_metadata_passthrough as Record<string, unknown> | undefined)?.turn_id,
+          hasItemId: typeof item?.id === "string" && item.id.length > 0,
           chars: text.length,
           ...(text.includes("<environment_context>") ? { envelope: true } : {}),
         };
@@ -325,6 +393,7 @@ export class ChatGptThreadEnvironmentStore {
         cachedThread: identity.threadId ? this.get(identity.threadId) !== undefined : false,
         inputItems: input.length,
         tail: shape,
+        envelopeShape: chatGptEnvironmentEnvelopeDiagnostics(parsed),
         detail: error instanceof Error ? error.message : String(error),
       })}`);
     } catch {
@@ -349,7 +418,9 @@ export class ChatGptThreadEnvironmentStore {
   }
 
   private set(threadId: string, environment: ChatGptTurnEnvironment): void {
-    this.load();
+    // Only this path has already verified authority from the current request, native
+    // rollout, or a successfully loaded parent. A cache read alone may never recover it.
+    this.load(true);
     this.threads.delete(threadId);
     this.threads.set(threadId, authority(environment, this.now()));
     while (this.threads.size > MAX_THREAD_ENVIRONMENTS) {
@@ -360,36 +431,60 @@ export class ChatGptThreadEnvironmentStore {
     this.persist();
   }
 
-  private load(): void {
+  private load(verifiedEnvironment = false): void {
     if (this.loaded) return;
+    if (!this.path || !existsSync(this.path)) { this.loaded = true; return; }
+    for (const [threadId, environment] of this.readDisk(verifiedEnvironment)) this.threads.set(threadId, environment);
     this.loaded = true;
-    if (!this.path || !existsSync(this.path)) return;
-    for (const [threadId, environment] of this.readDisk()) this.threads.set(threadId, environment);
   }
 
-  /** mtime alone misses two writes within one tick; a rename-based writer also changes the inode. */
   private signature(): string {
     const stat = statSync(this.path!);
     return `${stat.mtimeMs}:${stat.size}:${stat.ino}`;
   }
 
-  private readDisk(): Array<readonly [string, StoredThreadEnvironment]> {
-    const path = this.path!;
-    this.loadedSignature = this.signature();
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<StoredThreadEnvironmentFile>;
-    const rawThreads = record(parsed.threads);
-    if (parsed.version !== 1 || !rawThreads) {
-      throw new Error(`Invalid ChatGPT thread environment store: ${path}`);
+  private readDisk(verifiedEnvironment = false): Array<readonly [string, StoredThreadEnvironment]> {
+    if (!this.path || !existsSync(this.path)) {
+      return [];
     }
-    const cutoff = this.now() - THREAD_ENVIRONMENT_TTL_MS;
-    return Object.entries(rawThreads)
-      .map(([threadId, value]) => [threadId, validateStoredEnvironment(value)] as const)
-      .filter(([, environment]) => environment.updatedAt >= cutoff)
-      .sort((left, right) => left[1].updatedAt - right[1].updatedAt)
-      .slice(-MAX_THREAD_ENVIRONMENTS);
+    const invalidState = (reason: string) => new ChatGptWebAdapterError(
+      `The saved Codex task environment file (thread-environments.json) ${reason}. `
+      + "Its contents have not been overwritten. Start a fresh Codex task to supply its current workspace and permissions. "
+      + "If that also fails, export Activity > Export safe log; do not delete your launcher settings.",
+      { status: 409, errorType: "invalid_request_error", code: "thread_environment_state_invalid", retryable: false },
+    );
+    const source = readFileSync(this.path, "utf8");
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(source);
+    } catch {
+      if (!verifiedEnvironment) throw invalidState("contains invalid JSON");
+      // Preserve the original for diagnosis. Never infer permissions from a damaged cache,
+      // discard an unfamiliar schema, or turn a read/rename permission error into recovery.
+      if (readFileSync(this.path, "utf8") !== source) throw invalidState("changed during recovery");
+      const backup = `${this.path}.corrupt-${crypto.randomUUID()}`;
+      renameSync(this.path, backup);
+      console.warn("[chatgpt-web] preserved corrupt thread-environments.json beside the original; rebuilding from a verified current Codex environment");
+      return [];
+    }
+    const parsed = record(decoded);
+    const rawThreads = record(parsed?.threads);
+    if (parsed?.version !== 1 || !rawThreads) throw invalidState("has an unsupported or invalid format");
+    let entries: Array<readonly [string, StoredThreadEnvironment]>;
+    try {
+      const cutoff = this.now() - THREAD_ENVIRONMENT_TTL_MS;
+      entries = Object.entries(rawThreads)
+        .map(([threadId, value]) => [threadId, validateStoredEnvironment(value)] as const)
+        .filter(([, environment]) => environment.updatedAt >= cutoff)
+        .sort((left, right) => left[1].updatedAt - right[1].updatedAt)
+        .slice(-MAX_THREAD_ENVIRONMENTS);
+    } catch {
+      throw invalidState("contains invalid workspace or permission records");
+    }
+    this.loadedSignature = this.signature();
+    return entries;
   }
 
-  /** Merge entries another writer added since this store last read or wrote the file. */
   private refresh(): void {
     if (!this.path || !existsSync(this.path) || this.signature() === this.loadedSignature) return;
     for (const [threadId, environment] of this.readDisk()) {
@@ -412,7 +507,7 @@ export class ChatGptThreadEnvironmentStore {
       version: 1,
       threads: Object.fromEntries(this.threads),
     };
-    atomicWriteFile(this.path, `${JSON.stringify(payload, null, 2)}\n`);
+    atomicWriteFile(this.path, `${JSON.stringify(payload, null, 2)}\n`, { durable: true });
     this.loadedSignature = this.signature();
   }
 }

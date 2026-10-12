@@ -2,10 +2,10 @@
 >
 > Upstream: **[miuuyy/codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web)** — if you want the original, go there. It is the one with installers, releases for every platform, and support.
 >
-> This fork exists for one deployment upstream explicitly does not support: **the bridge running on a different machine than Codex**, serving several launcher browsers at once. Everything here is built for that shape, and several patches were declined upstream for exactly that reason.
+> This fork exists for one deployment upstream explicitly does not support: **the bridge running on a different machine than Codex**, serving one launcher browser with five concurrent task tabs. Everything here is built for that shape, and several patches were declined upstream for exactly that reason.
 >
 > - **What is different:** [What this fork changes](#what-this-fork-changes)
-> - **Releases:** tagged `mars-vX.Y.Z` (upstream uses `vX.Y.Z`). Latest: **[mars-v1.0.0](https://github.com/longbiaochen/codex-chatgpt-web/releases/tag/mars-v1.0.0)**, based on upstream v5.0.8.
+> - **Releases:** tagged `mars-vX.Y.Z` (upstream uses `vX.Y.Z`). Historical release: **[mars-v1.0.0](https://github.com/longbiaochen/codex-chatgpt-web/releases/tag/mars-v1.0.0)**, based on upstream v5.0.8.
 > - **No installers here.** Releases ship only the two runtime bundles (`cli.js`, `browser-helper.cjs`). Install the app from upstream, then swap those two files in.
 > - Changes are offered upstream when they are not specific to this deployment; the rest stays on the `mars-5.0.8` branch.
 
@@ -14,13 +14,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.3/codex-web-gpt-6.1.3-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.3/codex-web-gpt-6.1.3-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.3/codex-web-gpt-6.1.3-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.6/codex-web-gpt-6.1.6-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.6/codex-web-gpt-6.1.6-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.6/codex-web-gpt-6.1.6-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.3/codex-web-gpt-6.1.3-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">All releases</a>
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.6/codex-web-gpt-6.1.6-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">All releases</a>
 </p>
 
 <p align="center">
@@ -43,16 +43,15 @@ Full harness mode connects ChatGPT to the current task’s files, terminal, tool
 
 ## What this fork changes
 
-Based on upstream **v5.0.8**. One bridge process serves several launcher browsers, each with its own ChatGPT connector and tunnel.
+Based on upstream **v6.1.4**. One bridge process serves one launcher browser and one ChatGPT connector. Both task-tab capacity and account-level concurrent admission are capped at **3**. Rate-limit cooldown and request budgets remain active.
 
 ### Architecture
 
 | Change | Why |
 | --- | --- |
-| **Browser host pool** — one bridge, several launcher browsers; turns go to the host with the fewest in flight, and a retained conversation stays on the launcher owning its tab | A renderer busy ingesting a large prompt used to stall CDP attach and rebinding for every other turn in the same Chromium |
-| **Per-host connector names** — each pool browser mentions its own connector, so each has its own tunnel | OpenAI dispatches one tool call at a time per tunnel; without this, concurrent turns queue behind each other |
-| **Host failover** — the primary launcher is validated like any pool member, and the browser helper starts from whichever launcher is alive | Stopping the primary used to fail every turn, even with live pool members |
-| **`CODEX_WEB_GPT_BROWSER_HOST_ONLY=1`** — a launcher that hosts the browser but hides the install step, the Codex restart notice and the MCP entry points | A pool host has no config of its own; the setup wizard it showed could only ever fail |
+| **Single browser host** — one descriptor, one connector and one tunnel; up to five concurrent task tabs, with excess requests queued and oldest completed automatic tabs reclaimed at capacity | Avoids pool selection, connector slot routing and multiple login states |
+| **Account admission** — queue beyond five active turns, with budget and cooldown control | Limits simultaneous work without replaying a prompt after Send |
+| **`CODEX_WEB_GPT_BROWSER_HOST_ONLY=1`** — a browser-only launcher alongside the independent bridge | Keeps browser ownership separate from the remote bridge configuration |
 
 ### Fixes
 
@@ -67,13 +66,13 @@ Commit-level detail is in the [release notes](https://github.com/longbiaochen/co
 
 ### Status
 
-Runs in production on one host: 3 rounds x 3 concurrent turns, 9/9, zero rebinds, zero rate limiting. `bun test`: 1050 pass, plus 2 launcher-localization flakes that also fail on a clean upstream checkout.
+The deployment uses one browser host. Multi-host pool/slot configuration and scheduling have been removed. Concurrent capacity is five; this does not change ChatGPT account usage limits. Long-term throughput depends on account limits and workload.
 
-Not packaged, not supported, and not tested on Windows or macOS — it is a Linux deployment that happens to be useful to publish. Issues and PRs about the pool are welcome; anything about the app itself belongs upstream.
+This fork targets its Linux remote deployment. Upstream remains the source for general app installers and support.
 
 ## Get started
 
-**Available models:** Free/Go → **Luna / Think**. Accounts with reasoning controls → **Instant–High**, plus **Extra High** and **Pro** when available. The launcher detects what your account can use.
+**Available models:** Free/Go → **Luna / Think**. Paid accounts → **GPT-6 Sol** and **GPT-5.6 Sol**, with **Instant–High**, plus **Extra High** and **Pro** when available. Each version has its own entry; existing GPT-5.6 chats keep GPT-5.6. Availability depends on your account and workspace.
 
 1. **Install the launcher** using the download for your system above.
 2. **Sign in to ChatGPT** in the embedded browser and run the browser smoke test.
@@ -131,9 +130,13 @@ The launcher's **MCP** page guides the complete setup. For the exact clicks, see
 >
 > See [Limits](https://github.com/miuuyy/codex-chatgpt-web/discussions/309) for the current
 > ChatGPT message allowances for **GPT-5.6 Sol Pro** and **GPT-6 Astra**. Context limits depend on
-> the account type and selected effort. Plus Medium/High uses a measured 90,000-token window, or
-> up to 270,000 tokens with experimental **3× context** enabled, with native Codex compaction
-> supported throughout.
+> the account type and selected effort. Plus Medium/High uses a measured 90,000-token window.
+> GPT-5.6 supports up to 270,000 tokens with experimental **3× context** enabled, with native
+> Codex compaction supported throughout.
+>
+> GPT-6 Sol supports **240,000 tokens** with Bigger Context on Pro at Medium, High and Extra High,
+> with compaction at **220,000**. Instant and other account plans use standard context.
+> GPT-5.6 and GPT-6 Pro keep their existing Bigger Context limits.
 
 1. Finish the required setup, open **MCP**, create the Tunnel and regular API key, then press
    **Connect harness**.

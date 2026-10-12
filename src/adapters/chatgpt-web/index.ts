@@ -1,7 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { chatGptRetainedConversationUsable } from "./retained-conversation-health";
 import { chatGptAnsweredWithoutTools } from "./toolless-turn";
-import { launcherHostForConversation, launcherSlotDescriptor } from "./launcher-host-pool";
 import { resolve } from "node:path";
 import { isChatGptWebZeroRiskBackendModel } from "../../chatgpt-web-models";
 import { defaultBrokerEndpoint, expandUserPath, resolveBrokerEndpoint } from "../../config";
@@ -23,7 +22,7 @@ import {
 import { namespacedToolName, type AdapterEvent, type CodexContentPart, type CodexParsedRequest, type CodexProviderConfig, type CodexToolResultMessage, type CodexUsage } from "../../types";
 import type { ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
-import { ChatGptWebAdapterError } from "./adapter-error";
+import { ChatGptWebAdapterError, chatGptToolTimeoutError } from "./adapter-error";
 import { ChatGptBrowserWorker } from "./browser-worker";
 import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity, priorChatGptAbortedTurnIds } from "./environment";
 import { CHATGPT_WEB_LUNA_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
@@ -41,8 +40,8 @@ import {
 import { ChatGptExternalTurnProgress } from "./turn-progress";
 import {
   canonicalizeCompactionHandoff,
+  compactionHandoffTimeoutMs,
   existingStructuredCompactionRun,
-  MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
   requestRetainedCompactionHandoff,
   runStructuredCompactionOnce,
   settleActiveCompactionSource,
@@ -73,9 +72,18 @@ function abortError(signal?: AbortSignal): Error {
   return new DOMException("ChatGPT web turn aborted", "AbortError");
 }
 
+class ChatGptObserverDisconnected extends DOMException {
+  constructor(readonly cause: unknown) {
+    super("The Codex response stream disconnected", "AbortError");
+  }
+}
+
 function withAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
   if (!signal) return promise;
-  if (signal.aborted) return Promise.reject(abortError(signal));
+  if (signal.aborted) {
+    void promise.catch(() => {});
+    return Promise.reject(abortError(signal));
+  }
   return new Promise<T>((resolveWait, rejectWait) => {
     const onAbort = () => rejectWait(abortError(signal));
     signal.addEventListener("abort", onAbort, { once: true });
@@ -452,7 +460,7 @@ export function createChatGptWebAdapter(
       ? async () => {
         await releaseLauncherRetainedConversation(
           // Affinity names a slot; the retained tab lives in that slot's browser.
-          launcherSlotDescriptor(launcherHostForConversation(conversationKey) ?? retainedLauncherDescriptor),
+          retainedLauncherDescriptor,
           conversationKey,
         );
       }
@@ -505,8 +513,10 @@ export function createChatGptWebAdapter(
       if (observedCapabilityTokens.has(turnToken)) return;
       observedCapabilityTokens.add(turnToken);
       void broker.waitForRetirement(turnToken).then(
-        () => {
-          const retirement = new Error("Codex Native retired the turn binding before its tool work completed");
+        failure => {
+          const retirement = failure
+            ? chatGptToolTimeoutError(failure.tool, failure.timeoutMs)
+            : new Error("Codex Native retired the turn binding before its tool work completed");
           externalProgress.retire(retirement);
           if (!browserOwnerSettled && !browserAbort.signal.aborted) browserAbort.abort(retirement);
         },
@@ -844,6 +854,25 @@ export function createChatGptWebAdapter(
   return {
     name: "chatgpt-web",
     async runTurn(parsed, incoming, emit) {
+      const observerAbort = new AbortController();
+      incoming = {
+        ...incoming,
+        abortSignal: incoming.abortSignal
+          ? AbortSignal.any([incoming.abortSignal, observerAbort.signal])
+          : observerAbort.signal,
+      };
+      const write = emit;
+      emit = event => {
+        if (observerAbort.signal.aborted) throw observerAbort.signal.reason;
+        try { write(event); }
+        catch (cause) {
+          // The response writer is an observer, not the owner of browser execution. Its
+          // failure must follow the existing disconnect path even before HTTP signals abort.
+          const error = new ChatGptObserverDisconnected(cause);
+          observerAbort.abort(error);
+          throw error;
+        }
+      };
       const runChatGptWebTurn = async (): Promise<void> => {
         const manualRequest = isChatGptWebZeroRiskBackendModel(parsed.modelId);
         if (manualRequest !== manualInteraction) {
@@ -956,10 +985,7 @@ export function createChatGptWebAdapter(
                     : {}),
                 },
                 async (operatorSignal, retainOwnershipUntil) => {
-                  const handoffTimeoutMs = Math.min(
-                    timeoutMs ?? MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
-                    MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
-                  );
+                  const handoffTimeoutMs = compactionHandoffTimeoutMs(timeoutMs, "effort" in mode ? mode.effort : undefined);
                   const handoffDeadline = new AbortController();
                   const handoffTimeoutError = new ChatGptWebAdapterError(
                     `ChatGPT compaction did not fully settle within ${handoffTimeoutMs}ms`,
@@ -971,11 +997,17 @@ export function createChatGptWebAdapter(
                     },
                   );
                   let handoffTimer: ReturnType<typeof setTimeout> | undefined;
+                  let handoffPhase = "source_settlement";
                   const armHandoffDeadline = (): void => {
                     if (handoffDeadline.signal.aborted) return;
                     if (handoffTimer) clearTimeout(handoffTimer);
                     handoffTimer = setTimeout(
-                      () => handoffDeadline.abort(handoffTimeoutError),
+                      () => {
+                        console.warn(`[chatgpt-web] compaction_timeout ${JSON.stringify({
+                          traceId: compactionTraceId, phase: handoffPhase, timeoutMs: handoffTimeoutMs,
+                        })}`);
+                        handoffDeadline.abort(handoffTimeoutError);
+                      },
                       handoffTimeoutMs,
                     );
                     handoffTimer.unref?.();
@@ -984,10 +1016,20 @@ export function createChatGptWebAdapter(
                   const operationSignal = AbortSignal.any([operatorSignal, handoffDeadline.signal]);
                   const sourceConversationKey = chatGptConversationKey(parsed, executionNamespace);
                   const runFreshCompaction = async (reason: string): Promise<string> => {
+                    // A missing retained head does not mean the response owner has retired.
+                    // Release the exact source before opening another browser, including its
+                    // physical settlement; keep a final answer that already won the race.
+                    const previous = chatGptTurnSessions.find(compactedSourceExecutionKey);
+                    const settlement = previous?.settledOutcome()?.type === "final"
+                      ? previous.physicalSettlement
+                      : chatGptTurnSessions.retireAndWait(compactedSourceExecutionKey).then(() => {});
+                    retainOwnershipUntil(settlement);
+                    await withAbort(settlement, operationSignal);
+                    handoffPhase = "fresh_compaction";
                     if (freshConversationPerTurn) console.info("[chatgpt-web] compaction uses configured fresh conversation mode");
                     else console.warn(`[chatgpt-web] retained compaction fallback=${reason}`);
                     // Fresh compaction is a bounded phase. Each exact multipart acknowledgement
-                    // and the final accepted compact prompt re-arms the five-minute liveness budget;
+                    // and the final accepted compact prompt re-arms the model's bounded budget;
                     // transport time cannot consume the model-generation window.
                     armHandoffDeadline();
                     const fallbackRuntime = startRuntime(
@@ -1013,15 +1055,6 @@ export function createChatGptWebAdapter(
                   let preserveFinalResponse = false;
                   try {
                     if (freshConversationPerTurn) {
-                      // Full native history is the compaction input. Release an unfinished
-                      // browser/tool owner before rebuilding it, but keep a committed final
-                      // replayable if it won the native compaction race.
-                      const previous = chatGptTurnSessions.find(compactedSourceExecutionKey);
-                      const settlement = previous?.settledOutcome()?.type === "final"
-                        ? previous.physicalSettlement
-                        : chatGptTurnSessions.retireAndWait(compactedSourceExecutionKey).then(() => {});
-                      retainOwnershipUntil(settlement);
-                      await withAbort(settlement, operationSignal);
                       return await runFreshCompaction("configured_fresh_conversation");
                     }
                     // The previous compaction may already have detached the retained head while
@@ -1041,6 +1074,22 @@ export function createChatGptWebAdapter(
                     const retainedKey = source?.conversationKey();
                     if (!source || !retainedKey) {
                       return await runFreshCompaction("source_unavailable_before_handoff");
+                    }
+                    if (!chatGptRetainedConversationUsable(compactionNativeIdentity.threadId)) {
+                      // A prior unsent turn proved this thread's retained composer has no
+                      // connector. Retire its old browser epoch before rebuilding from canonical
+                      // history; a one-shot handoff on that composer would fail the same way.
+                      await withAbort(
+                        preserveFinalResponse
+                          ? chatGptTurnSessions.retireConversationPreservingFinalResponse(
+                            retainedKey,
+                            source,
+                            compactedSourceExecutionKey,
+                          )
+                          : chatGptTurnSessions.retireConversationAndWait(retainedKey),
+                        operationSignal,
+                      );
+                      return await runFreshCompaction("retained_connector_unavailable");
                     }
                     let rawSummary: string;
                     if (manualRequest && source.isActive() && source.runtime.mode === "tools") {
@@ -1072,6 +1121,10 @@ export function createChatGptWebAdapter(
                         operationSignal,
                       );
                       preserveFinalResponse = !settlement.compactionInstructionDelivered;
+                      // The previous response has physically settled. Its waiting time must not
+                      // consume the independent, bounded request for the retained checkpoint.
+                      handoffPhase = "retained_checkpoint";
+                      armHandoffDeadline();
                       rawSummary = await requestRetainedCompactionHandoff(
                         worker,
                         parsed,
@@ -1089,6 +1142,8 @@ export function createChatGptWebAdapter(
                         await withAbort(source.physicalSettlement, operationSignal);
                         preserveFinalResponse = true;
                       }
+                      handoffPhase = "retained_checkpoint";
+                      armHandoffDeadline();
                       rawSummary = await requestRetainedCompactionHandoff(
                         worker,
                         parsed,
@@ -1201,6 +1256,7 @@ export function createChatGptWebAdapter(
           nativeTurnId,
           nativeIdentity.threadId,
           chatGptInstructionLineage(parsed),
+          !manualRequest && worker.usesAdmissionQueue(),
         );
         const roundKey = chatGptTurnRoundKey(parsed);
         const emitRoundEvents = (events: readonly AdapterEvent[]): void => {
@@ -1218,6 +1274,7 @@ export function createChatGptWebAdapter(
           emitRoundEvents(events);
         };
         const emitRoundEvent = (event: AdapterEvent): void => emitRoundEvents([event]);
+        let awaitingRuntime = false;
         try {
           await session.runExclusive(async () => {
             const replay = session.roundEvents(roundKey);
@@ -1391,6 +1448,7 @@ export function createChatGptWebAdapter(
               let nextTrace = waitForTrace();
               let nextText = waitForText();
               for (;;) {
+                awaitingRuntime = true;
                 const next = await withAbort(
                   Promise.race([
                     ...(nextTools ? [nextTools] : []),
@@ -1400,6 +1458,7 @@ export function createChatGptWebAdapter(
                   ]),
                   incoming.abortSignal,
                 );
+                awaitingRuntime = false;
                 if (next.type === "trace") {
                   emitNewTrace(session.runtime.trace.drain());
                   nextTrace = waitForTrace();
@@ -1453,6 +1512,11 @@ export function createChatGptWebAdapter(
             // owned DOM observer can continue proving the same accepted ChatGPT submission.
             throw error;
           }
+          // Browser failure can retire tools before their next wait starts. Once that exact
+          // browser has failed, its cause takes precedence over the cleanup's token error.
+          // Validation and result-delivery failures never enter this branch.
+          const settled = awaitingRuntime ? session.settledOutcome() : undefined;
+          if (settled?.type === "error") error = settled.error;
           const turnError = submittedTurnFailure(session, error);
           const causeMessage = turnError.cause instanceof Error ? turnError.cause.message : "";
           const spendsBudget = chatGptWebFailureSpendsRetryBudget({ message: `${turnError.message} ${causeMessage}` });
@@ -1494,7 +1558,10 @@ export function createChatGptWebAdapter(
 
       // Arm this before any awaited work, including environment lookup and owner retirement.
       const heartbeat = setInterval(
-        () => emit({ type: "heartbeat" }),
+        () => {
+          try { emit({ type: "heartbeat" }); }
+          catch { /* emit detached the observer and wakes its pending awaits. */ }
+        },
         CHATGPT_WEB_ADAPTER_HEARTBEAT_MS,
       );
       try {

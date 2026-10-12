@@ -1,0 +1,18 @@
+[Unit]
+Description=Mars console: status page for the ChatGPT Web bridge, browser and connector slots (chatgpt.crowdverse.ai)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=120
+User=longbiao
+# Reads everything locally on Mars; actions use sudo -n systemctl.
+ExecStart=/usr/bin/python3 /home/longbiao/.local/share/mars-console/mars_console.py --mars local --port 17900
+Restart=on-failure
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,5 @@
+#!/bin/sh
+# Route Codex to Mars Codex Web GPT over the tailnet:
+# https://mars.tailbbe133.ts.net:17841 is `tailscale serve --tls-terminated-tcp` straight to the
+# bridge on Mars 127.0.0.1:17841 (tailnet-only, P2P direct). Profile: ~/.codex/mars-ts.config.toml.
+exec codex --profile mars-ts "$@"

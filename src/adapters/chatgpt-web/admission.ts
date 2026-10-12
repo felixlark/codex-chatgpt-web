@@ -1,11 +1,12 @@
 import { existsSync, readFileSync } from "node:fs";
+import { ChatGptWebAdapterError } from "./adapter-error";
 import { atomicWriteFile } from "../../config";
 
 /**
  * Account-level admission for ChatGPT Web turns.
  *
- * Every browser host in the launcher pool drives the same ChatGPT account, and ChatGPT throttles
- * that account on how many prompts it receives, whichever host or Codex task sent them. On Mars
+ * All task tabs share one ChatGPT account, and ChatGPT throttles that account on how many
+ * prompts it receives, whichever Codex task sent them. On Mars
  * two goals resumed together sent 109 requests in 18 minutes and both failed with
  * "too many requests"; one goal alone hit it at 33 requests in 10 minutes. Codex tasks, the
  * desktop app's own goal continuation and anything else a user starts all arrive here, so this is
@@ -47,8 +48,6 @@ const SIXTY_MINUTES = 60 * 60_000;
 const WINDOWS: Array<[keyof AdmissionBudget, number]> = [
   ["req10", TEN_MINUTES], ["req30", THIRTY_MINUTES], ["req60", SIXTY_MINUTES],
 ];
-export /** A browser turn that has not finished in this long is not going to; its slot goes back. */
-const STALE_SLOT_MS = 20 * 60_000;
 export const COOLDOWN_MS = 3 * 60_000;
 export const PROBES_TO_REOPEN = 3;
 const COOLDOWN_CAP_MS = 60 * 60_000;
@@ -100,8 +99,10 @@ interface Waiter {
 
 export interface AdmissionOptions {
   statePath?: string;
-  /** A function is re-read on every decision, so the gate follows hosts that come and go. */
+  /** A function is re-read on every decision, so a caller can supply a changing capacity. */
   maxConcurrent: number | (() => number);
+  /** Bound pending observers; ordinary capacity saturation still queues. */
+  maxQueued?: number;
   now?: () => number;
   log?: (message: string) => void;
   setTimer?: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
@@ -110,11 +111,8 @@ export interface AdmissionOptions {
 
 export class ChatGptAdmission {
   private state: AdmissionState;
-  /**
-   * Turns holding a slot right now. A slot that is never released blocks the whole gate: on Mars
-   * the queue sat still for thirteen hours behind one such slot while nothing ran. Keep enough per
-   * slot to reclaim it, and count the set rather than a number that can drift.
-   */
+  // Physical browser ownership, not elapsed wall time, determines occupancy.
+  // The helper releases on settlement; restart recovery handles orphaned records.
   private readonly runningTurns = new Map<string, { admittedAt: number; record: AdmissionTurnRecord }>();
   /** The current probe, admitted but not yet accepted by ChatGPT; nothing else is admitted meanwhile. */
   private probeTraceId?: string;
@@ -158,11 +156,16 @@ export class ChatGptAdmission {
     info?: AdmissionTurnInfo,
   ): Promise<(error?: string, refund?: boolean) => void> {
     if (signal?.aborted) return Promise.reject(new DOMException("ChatGPT web turn aborted", "AbortError"));
+    if (this.snapshot().queued >= (this.options.maxQueued ?? 256)) {
+      return Promise.reject(new ChatGptWebAdapterError("ChatGPT admission queue is full; retry after pending tasks finish", { status: 503, errorType: "server_error", code: "chatgpt_queue_full", retryable: true }));
+    }
     return new Promise((resolve, reject) => {
       const waiter: Waiter = { key, traceId, enqueuedAt: this.now(), info, admit: resolve, reject, signal };
       if (signal) {
         waiter.onAbort = () => {
           this.remove(waiter);
+          this.write();
+          this.pump();
           reject(new DOMException("ChatGPT web turn aborted", "AbortError"));
         };
         signal.addEventListener("abort", waiter.onAbort, { once: true });
@@ -226,11 +229,18 @@ export class ChatGptAdmission {
 
   snapshot(): {
     budget: AdmissionBudget; running: number; queued: number; cooldownUntil: number;
+    maxConcurrent: number; oldestQueuedMs: number; queueWaitP50Ms: number; queueWaitP95Ms: number;
     recent10: number; recent30: number; recent60: number;
   } {
     const now = this.now();
     this.prune(now);
+    const waiters = [...this.queues.values()].flat();
+    const waits = this.state.recent.map(record => record.startedAt - record.queuedAt).sort((a, b) => a - b);
+    const percentile = (p: number) => waits.length ? waits[Math.ceil(waits.length * p) - 1]! : 0;
     return {
+      maxConcurrent: this.maxConcurrent,
+      oldestQueuedMs: waiters.length ? now - Math.min(...waiters.map(waiter => waiter.enqueuedAt)) : 0,
+      queueWaitP50Ms: percentile(0.5), queueWaitP95Ms: percentile(0.95),
       budget: { ...this.state.budget },
       running: this.runningTurns.size,
       queued: [...this.queues.values()].reduce((sum, queue) => sum + queue.length, 0),
@@ -243,7 +253,6 @@ export class ChatGptAdmission {
 
   private pump(): void {
     const now = this.now();
-    this.reapStaleSlots(now);
     this.prune(now);
     this.loosen(now);
     while (this.canAdmit(now)) {
@@ -288,24 +297,6 @@ export class ChatGptAdmission {
       });
     }
     this.schedule();
-  }
-
-  /**
-   * A turn whose release never arrives (a hung browser turn, a client that vanished mid-flight)
-   * would otherwise hold its slot forever. Reclaiming it only allows one more turn to start; the
-   * budget windows still bound the rate, so the cost of being wrong here is small and the cost of
-   * not doing it is a gate that stops for hours.
-   */
-  private reapStaleSlots(now: number): void {
-    for (const [traceId, slot] of this.runningTurns) {
-      if (now - slot.admittedAt < STALE_SLOT_MS) continue;
-      this.runningTurns.delete(traceId);
-      slot.record.endedAt = now;
-      slot.record.error ??= `slot reclaimed after ${Math.round(STALE_SLOT_MS / 60_000)} minutes without a result`;
-      this.log(`[chatgpt-web] admission reclaimed the slot of turn ${traceId}: no result in `
-        + `${Math.round((now - slot.admittedAt) / 60_000)} minutes`);
-      this.write();
-    }
   }
 
   private findRecord(traceId: string): AdmissionTurnRecord | undefined {
@@ -359,14 +350,9 @@ export class ChatGptAdmission {
     if (this.timer) this.clearTimer(this.timer);
     this.timer = undefined;
     if (!this.queues.size) return;
-    if (this.runningTurns.size >= this.maxConcurrent) {
-      // Every slot is taken. Normally a release pumps us again, but a turn that never returns would
-      // otherwise stop the gate for good, so wake when the oldest slot becomes reclaimable.
-      const oldest = Math.min(...[...this.runningTurns.values()].map(slot => slot.admittedAt));
-      const at = oldest + STALE_SLOT_MS;
-      this.timer = this.setTimer(() => this.pump(), Math.max(50, at - this.now() + 50));
-      return;
-    }
+    // A queued turn must wait for actual release. Reclaiming by age would admit
+    // an extra browser while the old one still owns tools and its physical page.
+    if (this.runningTurns.size >= this.maxConcurrent) return;
     if (this.state.probesNeeded > 0 && this.probeTraceId !== undefined) return;   // acceptance or release pumps
     const now = this.now();
     const candidates: number[] = [];
@@ -464,6 +450,9 @@ export class ChatGptAdmission {
       maxConcurrent: this.maxConcurrent,
       queued: [...this.queues.values()].flat().map(waiter => ({
         key: waiter.key, traceId: waiter.traceId, since: waiter.enqueuedAt,
+        reason: this.runningTurns.size >= this.maxConcurrent ? "capacity"
+          : this.now() < this.state.cooldownUntil ? "rate_limit_cooldown"
+          : this.state.probesNeeded > 0 ? "rate_limit_probe" : "request_budget",
       })),
       updatedAt: this.now(),
     };

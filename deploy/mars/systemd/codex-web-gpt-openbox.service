@@ -1,0 +1,14 @@
+[Unit]
+Description=Openbox for Codex Web GPT virtual display
+After=codex-web-gpt-xvfb.service
+Requires=codex-web-gpt-xvfb.service
+
+[Service]
+User=longbiao
+Environment=DISPLAY=:99
+ExecStart=/usr/bin/openbox
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

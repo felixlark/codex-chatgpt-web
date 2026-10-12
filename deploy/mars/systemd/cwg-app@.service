@@ -1,0 +1,32 @@
+[Unit]
+Description=Codex Web GPT single browser-host-only launcher (%i)
+After=network-online.target cwg-xvfb@%i.service cwg-openbox@%i.service
+Wants=network-online.target
+Requires=cwg-xvfb@%i.service cwg-openbox@%i.service
+# Restarting or stopping the bridge takes the Alpha browser host with it: after a bridge restart the
+# the browser's connector catalog go stale and their turns fail with "connector menu ... exposed no row
+# named". PartOf only propagates stop/restart; ordering stays as is (the bridge waits for alpha),
+# so no After=cwg-bridge here -- that would be a cycle.
+PartOf=cwg-bridge.service
+
+[Service]
+Type=simple
+# Same user as the primary launcher: the bridge only accepts launcher descriptors owned by its uid.
+User=longbiao
+EnvironmentFile=/etc/codex-web-gpt/%i.env
+# No config.json in this core home, so the launcher hosts browser tabs but never starts a bridge.
+Environment=CODEX_WEB_GPT_BROWSER_HOST_ONLY=1
+Environment=CODEX_CHATGPT_WEB_HOME=/home/longbiao/.local/share/cwg-%i/core
+Environment=CODEX_WEB_GPT_LAUNCHER_DATA_DIR=/home/longbiao/.local/share/cwg-%i/launcher
+Environment=CODEX_HOME=/home/longbiao/.local/share/cwg-%i/codex-home
+Environment=XDG_RUNTIME_DIR=/run/cwg-%i
+RuntimeDirectory=cwg-%i
+RuntimeDirectoryMode=0700
+# Alpha owns the ChatGPT sign-in; no profile cloning.
+ExecStartPre=/bin/mkdir -p /home/longbiao/.local/share/cwg-%i/launcher /home/longbiao/.local/share/cwg-%i/core /home/longbiao/.local/share/cwg-%i/codex-home
+ExecStart=/usr/bin/env DISPLAY=:${CWG_DISPLAY} /home/longbiao/.local/lib/codex-web-gpt/5.0.8/unpacked/AppRun --no-sandbox --disable-gpu
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

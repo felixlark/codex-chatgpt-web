@@ -344,34 +344,6 @@ test("skill attachments config defaults off, reaches the adapter, and rejects in
   expect(() => loadConfig()).toThrow("Zero Risk does not support Skills as files");
 });
 
-test("browserHostSlots let several connectors share one launcher, and must be distinct absolute pairs", () => {
-  const root = join(tmpdir(), `codex-chatgpt-web-slots-${process.pid}-${Date.now()}`);
-  roots.push(root);
-  process.env.CODEX_CHATGPT_WEB_HOME = root;
-  mkdirSync(root, { recursive: true });
-  const write = (slots: unknown) => {
-    const config: Record<string, unknown> = {
-      ...defaultConfig("browser-only"), browserHost: "launcher", browserHostDescriptorPath: "/hosts/alpha.json",
-      browserHostSlots: slots,
-    };
-    writeFileSync(join(root, "config.json"), `${JSON.stringify(config)}\n`);
-  };
-  write(["Codex Mars Alpha", "Codex Mars Beta"].map(appName => ({ descriptor: "/hosts/alpha.json", appName })));
-  const loaded = loadConfig()!;
-  expect(resolveBrowserConfig(providerConfig(loaded)).browserHostSlots)
-    .toEqual(["/hosts/alpha.json#Codex Mars Alpha", "/hosts/alpha.json#Codex Mars Beta"]);
-  for (const invalid of [
-    [{ descriptor: "/hosts/alpha.json", appName: "A" }, { descriptor: "/hosts/alpha.json", appName: "A" }],
-    [{ descriptor: "hosts/alpha.json", appName: "A" }],
-    [{ descriptor: "/hosts/al#pha.json", appName: "A" }],
-    [{ descriptor: "/hosts/alpha.json", appName: " " }],
-    [],
-  ]) {
-    write(invalid);
-    expect(() => loadConfig()).toThrow("browserHostSlots");
-  }
-});
-
 test("the whole name after Codex is editable and only the selected mode changes", () => {
   for (const suffix of ["Native2", "Work", "DEV", "研究_2", "a".repeat(74)]) {
     expect(validateConnectorNameSuffix(suffix)).toBe(suffix);

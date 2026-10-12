@@ -1,0 +1,19 @@
+[Unit]
+Description=Codex Web GPT v5.0.8 launcher
+After=network-online.target codex-web-gpt-xvfb.service codex-web-gpt-openbox.service
+Wants=network-online.target
+Requires=codex-web-gpt-xvfb.service codex-web-gpt-openbox.service
+
+[Service]
+Type=simple
+User=longbiao
+Environment=DISPLAY=:99
+Environment=XDG_RUNTIME_DIR=/run/codex-web-gpt
+RuntimeDirectory=codex-web-gpt
+RuntimeDirectoryMode=0700
+ExecStart=/home/longbiao/.local/lib/codex-web-gpt/5.0.8/unpacked/AppRun --no-sandbox --disable-gpu
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
