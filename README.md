@@ -5,7 +5,7 @@
 > This fork exists for one deployment upstream explicitly does not support: **the bridge running on a different machine than Codex**, serving several launcher browsers at once. Everything here is built for that shape, and several patches were declined upstream for exactly that reason.
 >
 > - **What is different:** [What this fork changes](#what-this-fork-changes)
-> - **Releases:** tagged `mars-vX.Y.Z` (upstream uses `vX.Y.Z`). Latest: **[mars-v1.0.0](https://github.com/longbiaochen/codex-chatgpt-web/releases/tag/mars-v1.0.0)**, based on upstream v5.0.8.
+> - **Releases:** tagged `mars-vX.Y.Z` (upstream uses `vX.Y.Z`). Latest: **[mars-v1.0.0](https://github.com/felixlark/codex-chatgpt-web/releases/tag/mars-v1.0.0)**, based on upstream v5.0.8.
 > - **No installers here.** Releases ship only the two runtime bundles (`cli.js`, `browser-helper.cjs`). Install the app from upstream, then swap those two files in.
 > - Changes are offered upstream when they are not specific to this deployment; the rest stays on the `mars-5.0.8` branch.
 
@@ -63,7 +63,7 @@ Based on upstream **v5.0.8**. One bridge process serves several launcher browser
 - **Abandoned turns** — retire browser turns whose tool batch Codex never answered instead of heartbeating forever.
 - **Diagnostics** — a structured `environment_rejected` line naming which branch refused a turn, plus launcher connect timings and renderer CPU before a rebind. The compaction bugs above were only findable because of it.
 
-Commit-level detail is in the [release notes](https://github.com/longbiaochen/codex-chatgpt-web/releases/tag/mars-v1.0.0).
+Commit-level detail is in the [release notes](https://github.com/felixlark/codex-chatgpt-web/releases/tag/mars-v1.0.0).
 
 ### Status
 

@@ -5,7 +5,7 @@
 > 这个 fork 只为一种上游明确不支持的部署而存在：**桥跑在与 Codex 不同的机器上**，并且同时驱动多个启动器浏览器。这里的改动都是为这个形态做的，其中几个补丁正是因此被上游拒绝。
 >
 > - **差异说明：**[这个 fork 改了什么](#这个-fork-改了什么)
-> - **发布：** 标签形如 `mars-vX.Y.Z`（上游是 `vX.Y.Z`）。最新：**[mars-v1.0.0](https://github.com/longbiaochen/codex-chatgpt-web/releases/tag/mars-v1.0.0)**，基于上游 v5.0.8。
+> - **发布：** 标签形如 `mars-vX.Y.Z`（上游是 `vX.Y.Z`）。最新：**[mars-v1.0.0](https://github.com/felixlark/codex-chatgpt-web/releases/tag/mars-v1.0.0)**，基于上游 v5.0.8。
 > - **这里没有安装包。** 发布里只有两个运行时产物（`cli.js`、`browser-helper.cjs`）：先从上游装好应用，再把这两个文件换进去。
 > - 与该部署无关的通用修复会提给上游，其余留在 `mars-5.0.8` 分支。
 
@@ -63,7 +63,7 @@
 - **卡死回合** —— Codex 从未交回工具结果的回合会被回收，而不是无限心跳。
 - **诊断** —— 结构化的 `environment_rejected` 日志写明是哪条分支拒绝了回合，另有启动器连接耗时与重绑前的渲染进程 CPU。上面那两个压缩 bug 就是靠它才定位到的。
 
-逐条提交见[发布说明](https://github.com/longbiaochen/codex-chatgpt-web/releases/tag/mars-v1.0.0)。
+逐条提交见[发布说明](https://github.com/felixlark/codex-chatgpt-web/releases/tag/mars-v1.0.0)。
 
 ### 状态
 
